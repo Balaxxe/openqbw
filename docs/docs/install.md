@@ -27,7 +27,7 @@ Wheels are published for Python 3.9+ on Linux, macOS, and Windows.
 openqbw = "0.1"
 ```
 
-MSRV: Rust 1.87.
+MSRV: Rust 1.95.
 
 ## From source
 

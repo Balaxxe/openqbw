@@ -1,22 +1,21 @@
 # Use cases
 
-OpenQBW exists to keep QuickBooks Desktop data accessible after
-Intuit's end-of-life announcement. This document walks through the
-four most common scenarios.
+OpenQBW exists to provide long-term access to locally owned QuickBooks Desktop
+data. This document walks through the four most common scenarios.
 
 ## 1. Data liberation: leaving the QuickBooks ecosystem
 
-You have a `.qbw` file, an expiring desktop license, and you want
-your data out in a portable format so you can move to another
-accounting product or just archive it.
+You have a local `.qbw` copy and need an independently runnable accounting
+extract. For a supported Enterprise 24 R21 layout, first create a reconciled
+accrual Trial Balance and retain the source copy and native report separately.
 
 ```console
-# Get a SQL database you can query with any tool
-$ openqbw export mybooks.qbw --out books.sqlite
-
-# Inspect from sqlite3 or DB Browser
-$ sqlite3 books.sqlite "SELECT COUNT(*) FROM lineitem;"
-$ sqlite3 books.sqlite "SELECT SUM(amount_cents)/100.0 FROM lineitem;"
+$ openqbw accounting-report SAMPLE_COMPANY.qbw --report trial-balance \
+    --as-of 2026-12-31 --fiscal-year-start 2026-01-01 \
+    --retained-earnings-account-id ACCOUNT_ID \
+    --entity-id SAMPLE_ENTITY --source-label local-copy \
+    --generated-at 2026-12-31T00:00:00Z --snapshot-id SNAPSHOT_ID \
+    --format sqlite --out trial-balance.sqlite
 ```
 
 See [migration-guide.md](migration-guide.md) for the
@@ -37,8 +36,10 @@ financial data. You still get:
 - Schema and index metadata
 - File-level metadata that can support timeline analysis
 
-For files without a QuickBooks-level password, you get the full
-parsed business data: invoices, transactions, customer/vendor lists.
+For supported local Enterprise 24 R21 copies, OpenQBW can also produce a
+normalized General Ledger and accrual Trial Balance without QuickBooks at
+runtime. Preserve the original and reconcile against a native report before
+relying on a new source file. Unknown schemas and layouts are rejected.
 
 ## 3. Audit and discovery
 
@@ -55,21 +56,24 @@ $ openqbw indexes mybooks.qbw --fk-only
 # Per-table null-flag histogram (suggests defaults / deletions)
 $ openqbw nulls mybooks.qbw
 
-# Cross-validate that the on-disk indexes match attribution
+# Run legacy attribution diagnostics
 $ openqbw verify mybooks.qbw
 ```
 
 ## 4. Long-term archival
 
 QuickBooks files are sometimes the only complete record of a
-business's books for the years before a SaaS migration. OpenQBW
-gives you a deterministic, open-format snapshot you can keep
-alongside the original file:
+business's books for the years before a SaaS migration. Supported files can
+be preserved with an accounting export alongside the original:
 
 ```console
-$ openqbw export mybooks.qbw --out archive/books-2024.sqlite
-$ sha256sum archive/books-2024.sqlite > archive/books-2024.sqlite.sha256
+$ openqbw accounting-report SAMPLE_COMPANY.qbw --report general-ledger \
+    --as-of 2026-12-31 --entity-id SAMPLE_ENTITY --source-label archival-copy \
+    --generated-at 2026-12-31T00:00:00Z --snapshot-id SNAPSHOT_ID \
+    --format sqlite --out archive/general-ledger.sqlite
 ```
 
-A SQLite file is bit-stable across decades and readable by every
-mainstream programming language and analytics tool.
+A SQLite file is broadly portable, but preserve its tool version, report
+policy, snapshot identifier, and source QBW copy with it. Cash-basis reports,
+automatic company-preference discovery, VSS/snapshot orchestration, and
+cross-company consolidation remain future work.

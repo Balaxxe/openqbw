@@ -71,6 +71,12 @@ const config: Config = {
             },
             items: [
                 {
+                    type: 'docSidebar',
+                    sidebarId: 'docsSidebar',
+                    label: 'Docs',
+                    position: 'left',
+                },
+                {
                     type: 'dropdown',
                     label: 'Projects',
                     position: 'left',

@@ -11,8 +11,8 @@ A `.qbw` file is an onion:
 ```
 +-------------------------------------------+
 |  QuickBooks business layer                |
-|  (invoices, transactions, customers, ...) |
-|  -- parsed by `openqbw` crate             |
+|  Accounts + five R21 posting families     |
+|  -> normalized Ledger -> TB / GL          |
 +-------------------------------------------+
 |  SA17 page-store catalog                  |
 |  (SYSTABLE, SYSCOLUMN, SYSINDEX, ...)     |
@@ -39,32 +39,45 @@ per-block additive table from the known-plaintext trailer.
 ## Layer 2: SA17 catalog
 
 SQL Anywhere uses on-page system tables (SYSTABLE, SYSCOLUMN,
-SYSINDEX, SYSOBJECT) instead of a separate metadata file. OpenQBW
-parses these to enumerate user tables and their columns.
+SYSINDEX, SYSOBJECT) instead of a separate metadata file. OpenQBW recovers
+bounded physical catalog rows and uses their verified table/object joins as
+diagnostic metadata.
 
-Empirical finding (C.57): all index root pages cluster in a
-separate dbspace extent at file end, not adjacent to their owning
-tables. This means SYSINDEX can validate index ownership at the
-row level but **not** page-to-table attribution at the page level.
+Enterprise 24 revalidation showed that the SYSINDEX page-shaped field can
+target allocation pages and can be confused with bytes inside QBID values. It
+is exposed only as a `catalog_page_candidate`; it does not validate index
+ownership, page attribution, or B-tree navigation.
 
 ## Layer 3: QuickBooks business layer
 
-QuickBooks stores each business object (invoice, line item, ...)
-as a row in an `abmc_*` table. OpenQBW's `lineitem.rs` and
-`transaction_header.rs` modules know the row layouts for the
-key tables.
+QuickBooks business rows are materialized and then checked against the
+Enterprise 24 R21 catalog manifest. OpenQBW supports Account rows and five
+physical posting families: Bill (which also carries the VendorCredit view),
+Bill-Payment Check, Check, Deposit, and General Journal. Validated rows enter
+a normalized, balanced Ledger; it produces an accrual Trial Balance with an
+explicit fiscal-year/Retained-Earnings policy, or a General Ledger through an
+ISO as-of date.
 
-Page-to-table attribution is handled by `page_attribution.rs`
-(SYSTABLE-driven) with `attribution_schema.rs` and
-`attribution_content.rs` as schema-driven and content-signature
-validators respectively. The combined width-band attribution is
-the production answer (see WP-6Z.2).
+This is deliberately a narrow compatibility contract. A non-matching catalog,
+unattested row layout, unrecognized row lifecycle, or unknown posting family
+is an error, not a best-effort accounting result. Account-number presentation
+uses inherited display semantics. Cash basis and automatic discovery of
+company preferences or a native Retained Earnings report label remain future
+work.
+
+Each normalized account carries two classifications: `account_type` is the
+reporting group (asset, liability, equity, income, COGS, or expense), while
+`quickbooks_classification` retains the calibrated QuickBooks source class
+(such as `Bank`, `AccountsPayable`, `OtherAsset`, or `OtherExpense`). This
+source class is emitted in CSV, JSON, and SQLite and supports strict native
+General Ledger section resolution without name or amount guessing.
 
 ## Where to read the code
 
 - `crates/openqbw/src/lib.rs` -- top-level re-exports
-- `crates/openqbw/src/lineitem.rs` -- invoice line-item record
-- `crates/openqbw/src/transaction_header.rs` -- transaction header
-- `crates/openqbw/src/page_attribution.rs` -- page-to-table map
+- `crates/openqbw/src/accounting.rs` -- normalized accounting/reporting core
+- `crates/openqbw/src/opaque_page_tuples.rs` -- bounded diagnostic scanner for
+  an unproven page-like tuple relation; it does not attribute table pages
+- `crates/openqbw/src/row_scan.rs` -- provenance-preserving row discovery
 - `crates/openqbw/src/sysindex.rs` -- index catalog
 - `crates/openqbw-cli/src/main.rs` -- the CLI front-end

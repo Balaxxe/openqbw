@@ -1,9 +1,26 @@
 # QBW File Format Specification (Draft)
 
-**Status:** incomplete, in-progress reverse engineering. Every numeric
-claim in this document is backed by a reproducible observation in
-[`re/NOTES.md`](https://github.com/Sigilweaver/OpenQBW/blob/main/re/NOTES.md) against the corpus manifest
-`re/corpus_index.json` (112 `.QBW` files, ~1.87 GiB).
+**Status:** physical-format specification in progress. This document covers
+the SA17/QBW container observations; the production accounting compatibility
+contract is intentionally narrower: the validated QuickBooks Desktop
+Enterprise 24 R21 catalog manifest, Account rows, and five physical posting
+families (Bill/VendorCredit, Bill-Payment Check, Check, Deposit, and General
+Journal). OpenQBW materializes those rows into a normalized Ledger and emits
+an accrual Trial Balance or General Ledger only after all required evidence
+checks pass. Other schemas, layouts, versions, and families fail closed.
+
+Private acceptance reconciles the supported path exactly to native QuickBooks
+Trial Balance reports at three as-of dates, all visible accounts, zero-cent
+variance, and to General Ledger reports over three date ranges with no missing
+or extra dated movements. The input hash remains unchanged. The evidence is
+aggregate-only; no company data, dates, counts, paths, hashes, fixtures, or
+report values are published. Research artifacts are local-only and default-off
+behind the `research-tools` feature.
+
+Known boundaries: cash-basis reporting; automatic company-preference and
+Retained Earnings-label discovery; other QuickBooks versions; VSS/snapshot
+orchestration; and consolidation are future work. The direct extractor is
+read-only and has no runtime SDK, COM, GUI, or ODBC dependency.
 
 ## 0. Conventions
 
@@ -44,7 +61,7 @@ Whole-file facts (corpus-wide, 112/112 files):
 | % of files where `size % 8192 == 0`   | 51% |
 
 → **Page size is 4096 bytes (4 KiB)** and a file is exactly
-`page_count × 4096` bytes long. See [C.2](#c2-page-size).
+`page_count × 4096` bytes long.
 
 ### 2.1 Page-0 is the *superblock*
 
@@ -124,7 +141,7 @@ real data. The choice is deterministic by page type:
 | `'E'` extent  | 5..6 %              | nearly all 4080 body bytes |
 | `'@'` boot    | ~25..75 % (mixed)   | bootstrap pages 4..7 |
 
-(Measured on 10 772 data pages of Rock Castle Construction.)
+(Measured on a historical synthetic/sample corpus.)
 
 Consequences for a parser:
 
@@ -166,8 +183,8 @@ stored[i] = ( base(page, sector) + i * step(page, sector) + plaintext[i] ) mod 2
   closed-form expression for `(base, step)` as a function of
   `(page, sector)` is still open.
 
-Applying `plaintext[i] = (stored[i] − fill[i]) mod 256` to page 11
-of the Rock Castle sample recovers actual SA system procedure
+Applying `plaintext[i] = (stored[i] − fill[i]) mod 256` to a sample
+page recovers actual SA system procedure
 identifiers:
 
 ```
@@ -372,13 +389,15 @@ of table-local fields. On consecutive rows of the SA system schema
 the `u32_LE` at offset +21 past the name increments by one per
 table, matching the SA `object_id` space; the `u16_LE` at offset +6
 (`4e 3c`, `4e 3e`, `4e 40`, `4e 42` ...) also moves monotonically.
-The trailer's `col_count` (+6), `data_root_page` (+34, first/leftmost
-leaf of the table's B-tree), and `last_page` (+50, rightmost leaf) are
-now identified and extracted (`crates/openqbw/src/systable.rs`); actual
-B-tree traversal from `data_root_page` is not implemented, so these
-still only drive the position-heuristic attribution in
-`page_attribution.rs`, not a real leaf walk. The rest of the trailer's
-variable-field layout past `last_page` is still open.
+This historical interpretation is superseded for the Enterprise 24 dialect.
+The recognizable tag is 34 bytes after the physical row start, so reads at
+the former `col_count`, `data_root_page`, and `last_page` offsets can cross
+the declared row boundary into an adjacent record. Those values are not
+exposed as Enterprise 24 fields and must not drive B-tree traversal or
+page-to-table attribution. The separately recovered physical row fields
+(`table_id`, `dbspace_id`, `row_count`, `table_page_count`, and `object_id`)
+are bounded by the declared row length; they do not by themselves establish
+logical page ownership.
 
 Rows smaller than the SYSTABLE header padding, non-SYSTABLE tables,
 and rows in other system tables (SYSCOLUMN, SYSINDEX, ...) have not
@@ -401,7 +420,7 @@ Deobfuscated catalog pages follow the classic SAP SQL Anywhere
 **slot-directory** layout: variable-size rows live in the page body
 and a descending array of little-endian row offsets points at them.
 
-Observed structure on the Rock Castle sample:
+Observed structure on a historical sample:
 
 - **Page 2** (type `A`, index catalog): slot scan starts at `0x069`,
   the actual array starts at `0x06B` after a zero sentinel, there are
@@ -454,7 +473,7 @@ Evidence:
    (AES-ECB, XOR-with-fixed-keystream, ...) would destroy this
    signature. (C.11.)
 4. **Plaintext recovery.** Subtracting the per-sector AP fill from
-   page 11 of Rock Castle reveals ASCII strings `sp_columns`,
+   a sample page reveals ASCII strings `sp_columns`,
    `sp_password`, `sp_addmessage`, `sp_addlogin` and a monotonic-
    decreasing u16 slot directory - real SA catalog data. (C.14.)
 
@@ -615,9 +634,9 @@ at the cost of large values being silently absent from its output.
   the per-sector AP recovers SAP SQL Anywhere plaintext - ASCII
   procedure names (`sp_columns`, `sp_password`, `sp_addmessage`,
   `sp_addlogin`) and a monotonic u16 slot directory on page 11 of
-  Rock Castle. §7 rewritten; §2.2c added.
+  a historical sample. §7 rewritten; §2.2c added.
 - **2026-04-19 · C.15** - Bulk plaintext extraction. Deobfuscating
-  the first 500 type-`E` pages of Rock Castle and filtering for
+  the first 500 type-`E` pages of a historical sample and filtering for
   printable ASCII runs ≥ 6 chars yields **9 503 unique strings**,
   including the full SAP SQL Anywhere system catalog (`SYSCOLUMN`,
   `SYSINDEX`, `SYSPROCEDURE`, `SYSTABLE`-family, `SYSCATALOG`,
@@ -639,7 +658,7 @@ at the cost of large values being silently absent from its output.
 - **2026-04-19 · C.17** - Slotted-page directories parsed.
   `re/page_layout.py` now locates the descending u16 row-offset array
   on deobfuscated SAP catalog pages even when the array is odd-aligned
-  and preceded by a zero sentinel. Verified on Rock Castle:
+  and preceded by a zero sentinel. Verified on a historical sample:
   page 2 (`A`) has 39 slots, page 11 (`E`) has 124 slots, and page
   340 (`E`) has 44 slots with 2 deleted entries. The prelude bytes
   immediately before the array contain the minimum row offset and the

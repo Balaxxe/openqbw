@@ -6,38 +6,68 @@
 [![PyPI](https://img.shields.io/pypi/v/openqbw.svg)](https://pypi.org/project/openqbw/)
 [![docs.rs](https://img.shields.io/docsrs/openqbw)](https://docs.rs/openqbw)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust MSRV](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust MSRV](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](https://www.rust-lang.org)
 [![Docs](https://img.shields.io/badge/docs-sigilweaver.app-blue.svg)](https://sigilweaver.app/openqbw/docs/)
 
 > Open specification and open-source parser for the **QuickBooks Desktop company file** (`.qbw`) format.
 
-Intuit has announced end-of-life for QuickBooks Desktop, forcing small
-businesses either onto an expensive cloud subscription or to lose
-practical access to their own books. OpenQBW reverse engineers the
-on-disk file format from publicly available files, writes it up as
-a specification, and ships a Rust parser so that the accounting
-data a business has already paid for stays accessible.
+QuickBooks company files often need to remain accessible long after the
+original workstation, installation, or subscription changes. OpenQBW
+documents the on-disk format and ships a read-only Rust parser so lawful
+owners can keep independent access to accounting data they already own.
 
 ## Status
 
-OpenQBW is in active development. The current code can:
+OpenQBW now contains a direct, read-only accounting path for the validated
+QuickBooks Desktop Enterprise 24 R21 schema manifest. It extracts the Chart
+of Accounts and normalized posting ledger from a local QBW copy, then emits
+an accrual Trial Balance or General Ledger in CSV, JSON, or SQLite. The
+extractor fails closed when the catalog/schema, materialized-row layout, or
+posting family is outside its evidence-bound support.
 
-- Open a `.qbw` file and decode all pages (SA17 page-store + Intuit's
-  additive-progression obfuscation).
-- Enumerate user tables via the SA17 `SYSTABLE` catalog.
-- Parse `SYSCOLUMN`, `SYSINDEX`, `SYSOBJECT` system catalogs.
-- Extract invoice **line items** and **transaction headers** at row
-  granularity.
-- Attribute pages to tables using a width-band + content-signature
-  validator (Phase 6, WP-6Z).
-- Export the parsed catalog and lineitems to a SQLite database.
+The production path is:
 
-On the Rock Castle sample file the lineitem extractor reaches
-**13,375 / 13,375 invoices and a grand total of $399,914,792.78**,
-matching the value QuickBooks itself reports for the same file.
+```text
+OpenSQLAnywhere: SA17 page store and page materialization
+        -> OpenQBW: bounded SYSTABLE/SYSCOLUMN catalog + R21 manifest
+        -> Accounts + five physical posting families
+           (Bill / VendorCredit view, Bill-Payment Check, Check, Deposit,
+            General Journal)
+        -> normalized Ledger
+        -> accrual Trial Balance / General Ledger
+        -> CSV, JSON, SQLite, reconciliation, and parallel batch output
+```
 
-A full write-up of the format work lives in [SPECIFICATION.md](SPECIFICATION.md)
-and the empirical notebook in [re/NOTES.md](re/NOTES.md).
+Account display preserves QuickBooks' inherited account-number semantics; it
+does not invent a number for a child account. The accrued Trial Balance uses
+an explicitly supplied fiscal-year start and retained-earnings `AccountId`.
+An optional retained-earnings report name is presentation-only, for native
+report labels that differ from the chart name.
+
+Private acceptance has reconciled the supported path exactly to native
+QuickBooks reports at three as-of dates, with all visible accounts and
+zero-cent variance. That evidence is aggregate-only: no company names,
+dates, paths, row counts, report values, or hashes are published.
+The same release gate covers three General Ledger date ranges and verifies
+that the local QBW content hash is unchanged. See the
+[accounting acceptance protocol](docs/docs/accounting-acceptance.md).
+
+### Supported matrix
+
+| Input / capability | Status |
+| --- | --- |
+| Enterprise 24 R21 schema-manifest match | Supported, direct read-only extraction |
+| Accounts and five posting families above | Supported subject to row-level validation |
+| Accrual Trial Balance and General Ledger | Supported with explicit report policy inputs |
+| CSV, JSON, SQLite, exact TB reconciliation, batch TB | Supported |
+| Other QB versions, unknown schemas/layouts/families | Rejected fail-closed |
+| Cash-basis reports; automatic company-preference or RE-label discovery | Not yet supported |
+| Snapshot/VSS orchestration and consolidated operations | Future work |
+
+The detailed physical-format work remains in [SPECIFICATION.md](SPECIFICATION.md).
+Research-only commands are compiled only with `--features research-tools`; the
+feature is off by default and its local inputs and outputs are never part of
+the public repository.
 
 ## Non-goals
 
@@ -45,6 +75,7 @@ and the empirical notebook in [re/NOTES.md](re/NOTES.md).
 - Breaking passwords or DRM. OpenQBW targets the on-disk layout of
   company files that the lawful owner can already open.
 - Writing `.qbw` files. OpenQBW is **read-only**.
+- Requiring QuickBooks, its Desktop SDK, COM, ODBC, or a GUI session at runtime.
 
 ## Use cases
 
@@ -75,7 +106,7 @@ $ cargo build --release
 $ ./target/release/openqbw --help
 ```
 
-Rust 1.85+ is required (workspace uses edition 2024).
+Rust 1.95+ is required (workspace uses edition 2024).
 
 ### Python bindings
 
@@ -96,53 +127,66 @@ full Python API.
 ## CLI quickstart
 
 ```console
-# Inventory the user tables in a company file
-$ openqbw catalog mybooks.qbw
+# Write an accrual Trial Balance from a local copy. Outputs never overwrite.
+$ openqbw accounting-report SAMPLE_COMPANY.qbw \
+    --report trial-balance --as-of 2026-12-31 \
+    --fiscal-year-start 2026-01-01 \
+    --retained-earnings-account-id ACCOUNT_ID \
+    --retained-earnings-report-name "Retained Earnings" \
+    --entity-id SAMPLE_ENTITY --source-label local-copy \
+    --generated-at 2026-12-31T00:00:00Z --snapshot-id SNAPSHOT_ID \
+    --format csv --out trial-balance.csv
 
-# Cross-validate page-to-table attribution against SYSINDEX
-$ openqbw verify mybooks.qbw
+# Reconcile the direct QBW result with a native QuickBooks Trial Balance CSV.
+$ openqbw reconcile-qbw-trial-balance --qbw SAMPLE_COMPANY.qbw \
+    --native-tb native-trial-balance.csv --as-of 2026-12-31 \
+    --fiscal-year-start 2026-01-01 \
+    --retained-earnings-account-id ACCOUNT_ID --snapshot-id SNAPSHOT_ID
 
-# List indexes (FK indexes only, summary mode)
-$ openqbw indexes mybooks.qbw --fk-only --summary-only
+# Reconcile dated debit/credit movements in a General Ledger range.
+$ openqbw reconcile-qbw-general-ledger --qbw SAMPLE_COMPANY.qbw \
+    --native-gl native-general-ledger.csv --from 2026-01-01 \
+    --through 2026-12-31 --snapshot-id SNAPSHOT_ID
 
-# Export the catalog and lineitems to SQLite for inspection in any
-# SQL tool (DB Browser, Datasette, pandas, ...)
-$ openqbw export mybooks.qbw --out books.sqlite
-
-# Other introspection subcommands
-$ openqbw schema mybooks.qbw
-$ openqbw nulls mybooks.qbw
-$ openqbw validate-attribution mybooks.qbw
+# General Ledger and non-destructive catalog diagnostics are also available.
+$ openqbw accounting-report SAMPLE_COMPANY.qbw --report general-ledger \
+    --as-of 2026-12-31 --entity-id SAMPLE_ENTITY --source-label local-copy \
+    --generated-at 2026-12-31T00:00:00Z --snapshot-id SNAPSHOT_ID \
+    --format sqlite --out general-ledger.sqlite
+$ openqbw catalog SAMPLE_COMPANY.qbw
 ```
 
-See [docs/cli.md](docs/cli.md) for the full subcommand reference.
+See [docs/CLI reference](docs/docs/cli.md) for the full subcommand reference.
 
 ## Library usage
 
 ```rust,no_run
-use openqbw::{iter_lineitems_with_attribution, PageAttribution};
+use openqbw::iter_systable_entries;
 use opensqlany::{ApModel, PageStore};
 
 let store = PageStore::open("mybooks.qbw")?;
 let model = ApModel::learn(&store);
-let attrib = PageAttribution::build(&store, &model)?;
-
-let mut total_cents: i128 = 0;
-for li in iter_lineitems_with_attribution(&store, &model, &attrib) {
-    total_cents += li.amount_cents as i128;
+for table in iter_systable_entries(&store, &model) {
+    println!("{} {}", table.table_id, table.name);
 }
-println!("invoice grand total: ${:.2}", total_cents as f64 / 100.0);
 # Ok::<(), anyhow::Error>(())
 ```
 
 ## Documentation
 
-- [SPECIFICATION.md](SPECIFICATION.md) - format specification (work in progress)
+- [SPECIFICATION.md](SPECIFICATION.md) - physical format specification and scope
 - [docs/use-cases.md](docs/use-cases.md) - extended use-case walkthroughs
 - [docs/migration-guide.md](docs/migration-guide.md) - leaving the QuickBooks ecosystem
 - [docs/format-overview.md](docs/format-overview.md) - high-level pointer into the spec
 - [docs/cli.md](docs/cli.md) - full CLI reference
-- [re/NOTES.md](re/NOTES.md) - the reverse-engineering lab notebook (C.1...C.57)
+
+## Handoff
+
+The source projects remain separate under Balaxxe: OpenQBW owns QuickBooks
+schemas and accounting extraction, while OpenSQLAnywhere owns generic SQL
+Anywhere storage decoding. A future private operational repository,
+`Deen-Media/qbw-direct`, can pin and compose them for multi-entity workflows;
+it is not a replacement for either source project.
 
 ## Legal and ethical
 

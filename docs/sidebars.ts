@@ -20,6 +20,7 @@ const sidebars: SidebarsConfig = {
             items: [
                 'use-cases',
                 'migration-guide',
+                'accounting-acceptance',
                 'cli',
                 'python-api',
             ],
@@ -29,6 +30,7 @@ const sidebars: SidebarsConfig = {
             label: 'Reference',
             items: [
                 'format-overview',
+                'qbci32-drec-codec',
                 'specification',
             ],
         },

@@ -6,23 +6,22 @@ sidebar_label: Rust quickstart
 # Rust quickstart
 
 ```rust
-use openqbw::Company;
+use openqbw::iter_systable_entries;
+use opensqlany::{ApModel, PageStore};
 
-fn main() -> Result<(), openqbw::Error> {
-    let company = Company::open("Company.QBW")?;
+fn main() -> Result<(), opensqlany::Error> {
+    let store = PageStore::open("Company.QBW")?;
+    let model = ApModel::learn(&store);
 
-    for table in company.tables()? {
-        println!("{:>4} rows  {}", table.row_count(), table.name());
+    for table in iter_systable_entries(&store, &model) {
+        println!("{:>4} rows  {}", table.row_count, table.name);
     }
-
-    for inv in company.invoices()? {
-        println!("{}  {}  ${}", inv.txn_date, inv.customer, inv.total);
-    }
-
     Ok(())
 }
 ```
 
-`Company::open` peels the additive-progression obfuscation layer
+The example peels the additive-progression obfuscation layer
 (via `opensqlany::ApModel`), then walks the underlying SA17 page
-store, then layers the QuickBooks schema on top.
+store and exposes bounded catalog primitives. The production accounting API
+adds an evidence-bound Enterprise 24 R21 Account/posting pipeline; use the CLI
+for its complete report-policy, serialization, and reconciliation workflow.
