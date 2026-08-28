@@ -1,0 +1,518 @@
+//! Fail-closed parser for the bounded materialized Check posting-target row.
+//!
+//! The layout is calibrated only by the controlled two-split Check across its
+//! creation and voided current versions.  It accepts already-bounded
+//! materialized rows and does not resolve raw QBW pages, table ownership,
+//! continuation traversal, account names, document text, or other transaction
+//! families.
+
+use thiserror::Error;
+
+use crate::materialized_numeric::{MaterializedPostingCents, MaterializedPostingCentsError};
+use crate::{MaterializedPostingDate, MaterializedPostingDateError};
+
+/// Observed materialized target-row kind for the bounded Check posting witness.
+pub const MATERIALIZED_CHECK_POSTING_KIND: u8 = 0xe4;
+
+const EXPECTED_FLAGS: u8 = 0;
+const TARGET_OFFSET: usize = 0x0c;
+const MASTER_OFFSET: usize = 0x10;
+const ACCOUNT_OFFSET: usize = 0x14;
+const DATE_RAW_OFFSET: usize = 0x18;
+const VIEW_TYPE_OFFSET: usize = 0x1c;
+const NEXT_TARGET_OFFSET: usize = 0x1e;
+const SOURCE_ACCOUNT_OFFSET: usize = 0x22;
+const LINKED_EDIT_SEQUENCE_OFFSET: usize = 0x32;
+const TERMINAL_EDIT_SEQUENCE_OFFSET: usize = 0x2e;
+// The independently calibrated e4 carrier keeps its monetary token at this
+// fixed offset for both observed link shapes.  The earlier shape-relative
+// offsets pointed into relationship metadata and consequently rejected every
+// real target row as an unsupported numeric dialect.
+const AMOUNT_OFFSET: usize = 0x53;
+const MIN_SEGMENT_LEN: usize = AMOUNT_OFFSET + 2;
+
+/// The two independently witnessed Check target-row link shapes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaterializedCheckPostingShape {
+    /// `+0x1e` is a next-target candidate and `+0x22` is the source account.
+    Linked {
+        /// Bounded next target record number; traversal remains out of scope.
+        next_target_record_number: u32,
+    },
+    /// `+0x1e` is the source account and `+0x22` is an exact zero sentinel.
+    Terminal,
+}
+
+/// A validated, controlled-family Check posting-target row.
+///
+/// No getter assigns a calendar epoch to `date_raw`, a table/view meaning to
+/// `view_type`, or a current/deleted state to a zero amount.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedCheckPostingRow {
+    target_record_number: u32,
+    master_record_number: u32,
+    account_record_number: u32,
+    date_raw: u32,
+    view_type: u16,
+    shape: MaterializedCheckPostingShape,
+    source_account_record_number: u32,
+    edit_sequence: u32,
+    signed_cents: i64,
+    canonical_zero_amount: bool,
+}
+
+impl MaterializedCheckPostingRow {
+    /// Parses an exactly bounded materialized Check posting-target segment.
+    ///
+    /// The caller must provide a segment beginning at the returned materialized
+    /// record boundary.  This r1 parser rejects all flags/kinds/numeric
+    /// sign-scale forms outside the controlled Check witness.
+    pub fn parse(input: &[u8]) -> Result<Self, MaterializedCheckPostingRowError> {
+        if input.len() < MIN_SEGMENT_LEN {
+            return Err(MaterializedCheckPostingRowError::SegmentTooShort {
+                actual: input.len(),
+                minimum: MIN_SEGMENT_LEN,
+            });
+        }
+        let declared_len = usize::from(u16::from_le_bytes([input[0], input[1]]));
+        if declared_len != input.len() {
+            return Err(MaterializedCheckPostingRowError::DeclaredLengthMismatch {
+                declared: declared_len,
+                actual: input.len(),
+            });
+        }
+        if input[2] != EXPECTED_FLAGS {
+            return Err(MaterializedCheckPostingRowError::UnexpectedFlags { actual: input[2] });
+        }
+        if input[3] != MATERIALIZED_CHECK_POSTING_KIND {
+            return Err(MaterializedCheckPostingRowError::UnexpectedKind { actual: input[3] });
+        }
+
+        let (shape, source_account_record_number, edit_sequence_offset) =
+            if u32_at(input, SOURCE_ACCOUNT_OFFSET) != 0 {
+                (
+                    MaterializedCheckPostingShape::Linked {
+                        next_target_record_number: u32_at(input, NEXT_TARGET_OFFSET),
+                    },
+                    u32_at(input, SOURCE_ACCOUNT_OFFSET),
+                    LINKED_EDIT_SEQUENCE_OFFSET,
+                )
+            } else {
+                (
+                    MaterializedCheckPostingShape::Terminal,
+                    u32_at(input, NEXT_TARGET_OFFSET),
+                    TERMINAL_EDIT_SEQUENCE_OFFSET,
+                )
+            };
+        if source_account_record_number == 0 {
+            return Err(MaterializedCheckPostingRowError::MissingSourceAccount { shape });
+        }
+        let target_record_number = u32_at(input, TARGET_OFFSET);
+        let master_record_number = u32_at(input, MASTER_OFFSET);
+        let account_record_number = u32_at(input, ACCOUNT_OFFSET);
+        if target_record_number == 0 || master_record_number == 0 || account_record_number == 0 {
+            return Err(MaterializedCheckPostingRowError::MissingRequiredRecordReference);
+        }
+        let (signed_cents, canonical_zero_amount) =
+            decode_shape_amount(input, shape, AMOUNT_OFFSET)?;
+        Ok(Self {
+            target_record_number,
+            master_record_number,
+            account_record_number,
+            date_raw: u32_at(input, DATE_RAW_OFFSET),
+            view_type: u16_at(input, VIEW_TYPE_OFFSET),
+            shape,
+            source_account_record_number,
+            edit_sequence: u32_at(input, edit_sequence_offset),
+            signed_cents,
+            canonical_zero_amount,
+        })
+    }
+
+    /// Returns the controlled target-row record number at `+0x0c`.
+    #[must_use]
+    pub const fn target_record_number(&self) -> u32 {
+        self.target_record_number
+    }
+
+    /// Returns the controlled master record number at `+0x10`.
+    #[must_use]
+    pub const fn master_record_number(&self) -> u32 {
+        self.master_record_number
+    }
+
+    /// Returns the controlled posting-account record number at `+0x14`.
+    #[must_use]
+    pub const fn account_record_number(&self) -> u32 {
+        self.account_record_number
+    }
+
+    /// Returns the stable raw date token at `+0x18` without calendar decoding.
+    #[must_use]
+    pub const fn date_raw(&self) -> u32 {
+        self.date_raw
+    }
+
+    /// Returns the exact little-endian date field bits without interpreting
+    /// them as an unsigned quantity.
+    #[must_use]
+    pub const fn date_raw_bits(&self) -> u32 {
+        self.date_raw
+    }
+
+    /// Decodes the signed SQL Anywhere minute date into a calendar date.
+    pub fn posting_date(&self) -> Result<MaterializedPostingDate, MaterializedPostingDateError> {
+        MaterializedPostingDate::from_disk_bytes(self.date_raw.to_le_bytes())
+    }
+
+    /// Returns the opaque view/type value at `+0x1c`.
+    #[must_use]
+    pub const fn view_type(&self) -> u16 {
+        self.view_type
+    }
+
+    /// Returns the independently witnessed linked/terminal layout shape.
+    #[must_use]
+    pub const fn shape(&self) -> MaterializedCheckPostingShape {
+        self.shape
+    }
+
+    /// Returns the source account: `+0x22` when linked, `+0x1e` when terminal.
+    #[must_use]
+    pub const fn source_account_record_number(&self) -> u32 {
+        self.source_account_record_number
+    }
+
+    /// Returns the shape-specific Check edit-sequence value (`+0x32` linked, `+0x2e` terminal).
+    #[must_use]
+    pub const fn edit_sequence(&self) -> u32 {
+        self.edit_sequence
+    }
+
+    /// Returns the r1-calibrated signed monetary cents at the shape-specific field.
+    #[must_use]
+    pub const fn signed_cents(&self) -> i64 {
+        self.signed_cents
+    }
+
+    /// Returns whether the amount uses the exact controlled canonical zero token.
+    ///
+    /// This is not an `is_voided` or current-state flag.
+    #[must_use]
+    pub const fn has_canonical_zero_amount(&self) -> bool {
+        self.canonical_zero_amount
+    }
+}
+
+/// Errors returned by [`MaterializedCheckPostingRow::parse`].
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum MaterializedCheckPostingRowError {
+    /// The slice cannot contain every calibrated fixed field and numeric header.
+    #[error(
+        "materialized Check posting row is too short: {actual} bytes (need at least {minimum})"
+    )]
+    SegmentTooShort {
+        /// Number of bytes supplied by the caller.
+        actual: usize,
+        /// Minimum bytes required for the r1 grammar.
+        minimum: usize,
+    },
+    /// The leading u16 did not exactly bound the supplied segment.
+    #[error("materialized Check posting row length mismatch: declared {declared}, actual {actual}")]
+    DeclaredLengthMismatch {
+        /// Declared little-endian segment length.
+        declared: usize,
+        /// Actual input length.
+        actual: usize,
+    },
+    /// The flags byte was not the single calibrated target-row value.
+    #[error("unsupported materialized Check posting flags {actual:#04x}")]
+    UnexpectedFlags {
+        /// Observed flags byte.
+        actual: u8,
+    },
+    /// The row-kind byte was not the calibrated target-row kind.
+    #[error("unsupported materialized Check posting kind {actual:#04x}")]
+    UnexpectedKind {
+        /// Observed row-kind byte.
+        actual: u8,
+    },
+    /// The variable numeric token exceeded the exactly bounded segment.
+    #[error(
+        "materialized Check posting amount declares {digits} base-100 digits beyond a {segment_len}-byte segment"
+    )]
+    AmountOutsideSegment {
+        /// Number of base-100 digits declared by the token.
+        digits: usize,
+        /// Exact segment length.
+        segment_len: usize,
+    },
+    /// The r1 amount token had a zero digit count without its canonical zero marker.
+    #[error("unsupported zero-length materialized Check amount marker {marker:#04x}")]
+    UnsupportedZeroAmountMarker {
+        /// Observed sign/scale marker.
+        marker: u8,
+    },
+    /// The r1 amount token used a sign/scale marker outside the calibrated pair.
+    #[error("unsupported materialized Check amount sign/scale marker {marker:#04x}")]
+    UnsupportedAmountMarker {
+        /// Observed sign/scale marker.
+        marker: u8,
+    },
+    /// A declared base-100 digit exceeded 99.
+    #[error("invalid materialized Check base-100 digit {digit}")]
+    InvalidBase100Digit {
+        /// Invalid digit byte.
+        digit: u8,
+    },
+    /// The bounded base-100 amount did not fit signed cents.
+    #[error("materialized Check amount exceeded signed cents")]
+    AmountOverflow,
+    /// Neither controlled shape supplied a nonzero source account at its shape-specific offset.
+    #[error("materialized Check {shape:?} row lacks a source account")]
+    MissingSourceAccount {
+        /// Shape selected by the exact `+0x22` sentinel rule.
+        shape: MaterializedCheckPostingShape,
+    },
+    /// A required target, master, or posting-account record reference was zero.
+    #[error("materialized Check row lacks a target, master, or posting-account reference")]
+    MissingRequiredRecordReference,
+}
+
+fn decode_shape_amount(
+    input: &[u8],
+    shape: MaterializedCheckPostingShape,
+    offset: usize,
+) -> Result<(i64, bool), MaterializedCheckPostingRowError> {
+    let amount =
+        match shape {
+            MaterializedCheckPostingShape::Linked { .. } => input.get(offset..).ok_or(
+                MaterializedCheckPostingRowError::AmountOutsideSegment {
+                    digits: 0,
+                    segment_len: input.len(),
+                },
+            )?,
+            MaterializedCheckPostingShape::Terminal => {
+                let field = input.get(offset..).ok_or(
+                    MaterializedCheckPostingRowError::AmountOutsideSegment {
+                        digits: 0,
+                        segment_len: input.len(),
+                    },
+                )?;
+                // The terminal witness begins its count-prefixed numeric field
+                // directly at +0x3a. Bytes before that field are opaque.
+                field
+            }
+        };
+    decode_amount(amount, input.len())
+}
+
+fn decode_amount(
+    input: &[u8],
+    segment_len: usize,
+) -> Result<(i64, bool), MaterializedCheckPostingRowError> {
+    let amount = MaterializedPostingCents::parse(input).map_err(|error| match error {
+        MaterializedPostingCentsError::TokenTooShort { .. }
+        | MaterializedPostingCentsError::DigitsOutsideToken { digits: 0, .. } => {
+            MaterializedCheckPostingRowError::AmountOutsideSegment {
+                digits: 0,
+                segment_len,
+            }
+        }
+        MaterializedPostingCentsError::DigitsOutsideToken { digits, .. } => {
+            MaterializedCheckPostingRowError::AmountOutsideSegment {
+                digits,
+                segment_len,
+            }
+        }
+        MaterializedPostingCentsError::UnsupportedZeroMarker { marker } => {
+            MaterializedCheckPostingRowError::UnsupportedZeroAmountMarker { marker }
+        }
+        MaterializedPostingCentsError::UnsupportedMarker { marker } => {
+            MaterializedCheckPostingRowError::UnsupportedAmountMarker { marker }
+        }
+        MaterializedPostingCentsError::InvalidBase100Digit { digit } => {
+            MaterializedCheckPostingRowError::InvalidBase100Digit { digit }
+        }
+        MaterializedPostingCentsError::CentsOverflow => {
+            MaterializedCheckPostingRowError::AmountOverflow
+        }
+    })?;
+    Ok((amount.signed_cents(), amount.is_canonical_zero()))
+}
+
+fn u16_at(input: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(input[offset..offset + 2].try_into().expect("fixed bounds"))
+}
+
+fn u32_at(input: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(input[offset..offset + 4].try_into().expect("fixed bounds"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_MASTER: u32 = 0x0012_3456;
+    const SAMPLE_EXPENSE_TARGET: u32 = 0x0012_3457;
+    const SAMPLE_ASSET_TARGET: u32 = 0x0012_3458;
+    const SAMPLE_BANK_ACCOUNT: u32 = 500;
+    const SAMPLE_EXPENSE_ACCOUNT: u32 = 501;
+    const SAMPLE_ASSET_ACCOUNT: u32 = 502;
+    const SAMPLE_DATE_RAW: u32 = 0x0102_0304;
+    const SAMPLE_EDIT_BEFORE: u32 = 42;
+    const SAMPLE_EDIT_AFTER: u32 = 43;
+
+    fn row(target: u32, account: u32, next: Option<u32>, amount: &[u8], edit: u32) -> Vec<u8> {
+        let amount_offset = AMOUNT_OFFSET;
+        let mut row = vec![0_u8; amount_offset + amount.len()];
+        let length = row.len() as u16;
+        row[..2].copy_from_slice(&length.to_le_bytes());
+        row[3] = MATERIALIZED_CHECK_POSTING_KIND;
+        row[TARGET_OFFSET..TARGET_OFFSET + 4].copy_from_slice(&target.to_le_bytes());
+        row[MASTER_OFFSET..MASTER_OFFSET + 4].copy_from_slice(&SAMPLE_MASTER.to_le_bytes());
+        row[ACCOUNT_OFFSET..ACCOUNT_OFFSET + 4].copy_from_slice(&account.to_le_bytes());
+        row[DATE_RAW_OFFSET..DATE_RAW_OFFSET + 4].copy_from_slice(&SAMPLE_DATE_RAW.to_le_bytes());
+        row[VIEW_TYPE_OFFSET..VIEW_TYPE_OFFSET + 2].copy_from_slice(&3_u16.to_le_bytes());
+        if let Some(next) = next {
+            row[NEXT_TARGET_OFFSET..NEXT_TARGET_OFFSET + 4].copy_from_slice(&next.to_le_bytes());
+            row[SOURCE_ACCOUNT_OFFSET..SOURCE_ACCOUNT_OFFSET + 4]
+                .copy_from_slice(&SAMPLE_BANK_ACCOUNT.to_le_bytes());
+        } else {
+            row[NEXT_TARGET_OFFSET..NEXT_TARGET_OFFSET + 4]
+                .copy_from_slice(&SAMPLE_BANK_ACCOUNT.to_le_bytes());
+        }
+        let edit_offset = if next.is_some() {
+            LINKED_EDIT_SEQUENCE_OFFSET
+        } else {
+            TERMINAL_EDIT_SEQUENCE_OFFSET
+        };
+        row[edit_offset..edit_offset + 4].copy_from_slice(&edit.to_le_bytes());
+        row[amount_offset..].copy_from_slice(amount);
+        row
+    }
+
+    #[test]
+    fn parses_prevoid_split_targets_and_their_chain() {
+        let expense = MaterializedCheckPostingRow::parse(&row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            Some(SAMPLE_ASSET_TARGET),
+            &[2, 0xbf, 41, 37],
+            SAMPLE_EDIT_BEFORE,
+        ))
+        .unwrap();
+        assert_eq!(expense.master_record_number(), SAMPLE_MASTER);
+        assert_eq!(expense.account_record_number(), SAMPLE_EXPENSE_ACCOUNT);
+        assert_eq!(
+            expense.shape(),
+            MaterializedCheckPostingShape::Linked {
+                next_target_record_number: SAMPLE_ASSET_TARGET,
+            }
+        );
+        assert_eq!(expense.source_account_record_number(), SAMPLE_BANK_ACCOUNT);
+        assert_eq!(expense.date_raw(), SAMPLE_DATE_RAW);
+        assert_eq!(expense.view_type(), 3);
+        assert_eq!(expense.signed_cents(), 3741);
+        assert!(!expense.has_canonical_zero_amount());
+
+        let asset = MaterializedCheckPostingRow::parse(&row(
+            SAMPLE_ASSET_TARGET,
+            SAMPLE_ASSET_ACCOUNT,
+            None,
+            &[3, 0xbf, 5, 0, 10],
+            SAMPLE_EDIT_BEFORE,
+        ))
+        .unwrap();
+        assert_eq!(asset.signed_cents(), 100_005);
+        assert_eq!(asset.shape(), MaterializedCheckPostingShape::Terminal);
+        assert_eq!(asset.source_account_record_number(), SAMPLE_BANK_ACCOUNT);
+        assert_eq!(asset.edit_sequence(), SAMPLE_EDIT_BEFORE);
+    }
+
+    #[test]
+    fn parses_negative_header_and_canonical_void_zero() {
+        let header = MaterializedCheckPostingRow::parse(&row(
+            SAMPLE_MASTER + 1,
+            SAMPLE_BANK_ACCOUNT,
+            Some(SAMPLE_EXPENSE_TARGET),
+            &[3, 0x3f, 46, 37, 10],
+            SAMPLE_EDIT_BEFORE,
+        ))
+        .unwrap();
+        assert_eq!(header.signed_cents(), -103_746);
+
+        let voided = MaterializedCheckPostingRow::parse(&row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            Some(SAMPLE_ASSET_TARGET),
+            &[0, 0x81],
+            SAMPLE_EDIT_AFTER,
+        ))
+        .unwrap();
+        assert_eq!(voided.signed_cents(), 0);
+        assert!(voided.has_canonical_zero_amount());
+        assert_eq!(voided.edit_sequence(), SAMPLE_EDIT_AFTER);
+    }
+
+    #[test]
+    fn rejects_other_dialects_and_malformed_numeric_bounds() {
+        let mut malformed = row(1, 2, None, &[2, 0xbf, 1, 2], 3);
+        malformed[0] = 0;
+        assert!(matches!(
+            MaterializedCheckPostingRow::parse(&malformed),
+            Err(MaterializedCheckPostingRowError::DeclaredLengthMismatch { .. })
+        ));
+        let unsupported = row(1, 2, None, &[1, 0x99, 1], 3);
+        assert!(matches!(
+            MaterializedCheckPostingRow::parse(&unsupported),
+            Err(MaterializedCheckPostingRowError::UnsupportedAmountMarker { marker: 0x99 })
+        ));
+        let truncated = row(1, 2, None, &[3, 0xbf], 3);
+        assert!(matches!(
+            MaterializedCheckPostingRow::parse(&truncated),
+            Err(MaterializedCheckPostingRowError::AmountOutsideSegment { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_required_references_and_exposes_signed_date_bits() {
+        let mut missing_target = row(0, SAMPLE_EXPENSE_ACCOUNT, None, &[2, 0xbf, 1, 1], 3);
+        assert!(matches!(
+            MaterializedCheckPostingRow::parse(&missing_target),
+            Err(MaterializedCheckPostingRowError::MissingRequiredRecordReference)
+        ));
+        missing_target = row(1, SAMPLE_EXPENSE_ACCOUNT, None, &[2, 0xbf, 1, 1], 3);
+        missing_target[MASTER_OFFSET..MASTER_OFFSET + 4].fill(0);
+        assert!(matches!(
+            MaterializedCheckPostingRow::parse(&missing_target),
+            Err(MaterializedCheckPostingRowError::MissingRequiredRecordReference)
+        ));
+        missing_target = row(1, 0, None, &[2, 0xbf, 1, 1], 3);
+        assert!(matches!(
+            MaterializedCheckPostingRow::parse(&missing_target),
+            Err(MaterializedCheckPostingRowError::MissingRequiredRecordReference)
+        ));
+        let parsed = MaterializedCheckPostingRow::parse(&row(
+            1,
+            SAMPLE_EXPENSE_ACCOUNT,
+            None,
+            &[2, 0xbf, 1, 1],
+            3,
+        ))
+        .unwrap();
+        assert_eq!(parsed.date_raw_bits(), SAMPLE_DATE_RAW);
+
+        let expected_date = MaterializedPostingDate::from_ymd(2024, 2, 29).unwrap();
+        let mut dated = row(1, SAMPLE_EXPENSE_ACCOUNT, None, &[2, 0xbf, 1, 1], 3);
+        dated[DATE_RAW_OFFSET..DATE_RAW_OFFSET + 4]
+            .copy_from_slice(&expected_date.raw_minutes().to_le_bytes());
+        assert_eq!(
+            MaterializedCheckPostingRow::parse(&dated)
+                .unwrap()
+                .posting_date()
+                .unwrap(),
+            expected_date
+        );
+    }
+}

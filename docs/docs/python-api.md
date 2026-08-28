@@ -1,9 +1,10 @@
 # Python API reference
 
 The `openqbw` wheel is a PyO3 extension built from the same Rust core
-that backs the CLI. It exposes a small, read-only surface: open a file,
-then pull the catalog, indexes, line items, and transaction headers as
-lists of dicts.
+that backs the CLI. It exposes a small, read-only diagnostic surface: open a
+file, then pull recovered catalog/index rows and legacy discovery results as
+lists of dicts. The supported Enterprise 24 R21 Trial Balance and General
+Ledger workflow is currently CLI-only.
 
 ```python
 import openqbw
@@ -14,9 +15,8 @@ print(r.page_count, "pages,", r.file_size, "bytes")
 
 ## `openqbw.open(path) -> Reader`
 
-Opens a `.qbw` file, decodes the page store, and learns the additive
-progression model needed to attribute pages to tables. Raises
-`OSError` if the file cannot be opened.
+Opens a `.qbw` file, decodes the page store, and learns the additive-
+progression model. Raises `OSError` if the file cannot be opened.
 
 ## `Reader`
 
@@ -27,13 +27,16 @@ progression model needed to attribute pages to tables. Raises
 | `file_size` | `int` | File size in bytes. |
 | `tables()` | `list[dict]` | SYSTABLE catalog rows. |
 | `indexes()` | `list[dict]` | SYSINDEX entries. |
-| `line_items()` | `list[dict]` | Invoice line items, attributed to their source table. |
-| `transactions()` | `list[dict]` | Transaction headers. |
+| `line_items()` | `list[dict]` | Legacy invoice-line discovery results; not Enterprise 24 accounting output. |
+| `transactions()` | `list[dict]` | Legacy transaction-header discovery results; not Enterprise 24 accounting output. |
 
 ### `tables()`
 
-Each dict has `table_id`, `name`, `col_count`, `data_root_page`,
-`last_page`, `page_number`.
+Each dict has `table_id`, `object_id`, `name`, `row_count`,
+`table_page_count`, `ext_page_count`, `row_length`, `row_flags`, and
+`page_number`. Legacy compatibility keys `col_count`, `data_root_page`, and
+`last_page` may also be present, but are not decoded Enterprise 24 fields and
+must not be used as roots or page-navigation pointers.
 
 ```python
 for t in r.tables()[:5]:
@@ -42,7 +45,10 @@ for t in r.tables()[:5]:
 
 ### `indexes()`
 
-Each dict has `name`, `table_id`, `root_page`, `page_number`.
+Each dict has `name`, `owner_object_id`, optionally resolved `table_id` and
+`table_name`, `catalog_page_candidate`, and `page_number`. The page candidate
+is diagnostic metadata only: it is not a proven index root, ownership pointer,
+or navigation target.
 
 ```python
 for idx in r.indexes()[:5]:

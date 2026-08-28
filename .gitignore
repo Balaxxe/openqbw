@@ -1,6 +1,73 @@
 # Sandbox
 re/
+/research/
+/RESEARCH.md
+/private-artifacts/
+**/private-artifacts/
+/.codex-temp/
+/.test-tmp/
+/.tmp-codex/
+/.tmp-gj/
+/.tmp/
+# One-off local reverse-engineering probes; some can reveal company data.
+crates/openqbw/examples/probe_*.rs
+crates/openqbw/examples/analyze_materialized_page_v1.rs
+crates/openqbw/examples/physical_carrier_census_probe.rs
+crates/openqbw/examples/row_scan_census.rs
+crates/openqbw/examples/scan_target_record_ids_v1.rs
+crates/openqbw/examples/sentinel_decode_scan.rs
 
 # Rust build artifacts
 /target/
+/target-*/
 **/Cargo.lock
+/.cargo/config.toml
+
+# Private QuickBooks company data and sidecars
+*.[Qq][Bb][Ww]
+*.[Qq][Bb][Bb]
+*.[Qq][Bb][Mm]
+*.[Tt][Ll][Gg]
+*.[Qq][Bb][Aa]
+*.[Qq][Bb][Xx]
+*.[Qq][Bb][Ww].*
+*.[Qq][Bb][Ww]~
+*.[Nn][Dd]
+*.[Dd][Ss][Nn]
+*.qbw.SearchIndex/
+* Advanced Reporting/
+*.[Qq][Vv][Dd]
+*.[Qq][Vv][Tt]
+
+# Private native-report references and derived accounting data
+/private-fixtures/
+/private-data/
+/validation-reports/
+/sdk-oracle/
+**/SDK Oracle/
+**/Synthetic Fixtures/
+*.qbxml
+*.QBXML
+*.sdk-oracle.json
+*.private.tsv
+*.sdk-oracle.tsv
+**/Validation Reports/
+trial-balance_*.csv
+trial-balance_*.xlsx
+general-ledger_*.csv
+general-ledger_*.xlsx
+journal_*.csv
+journal_*.xlsx
+account-listing_*.csv
+account-listing_*.xlsx
+voided-deleted-transactions*.csv
+voided-deleted-transactions*.xlsx
+*.sqlite
+*.sqlite3
+
+# Local debugger traces and raw/materialized page dumps
+*.etl
+*.raw-page.bin
+*.materialized-page.bin
+*.qbw-page.bin
+*.qbw-page.json

@@ -12,7 +12,7 @@
 //! This module adds an orthogonal *validation* signal derived from the
 //! SYSCOLUMN catalog (Phase 6 WP-6A). For each table we precompute a
 //! plausible **row-width band** from the declared column widths and
-//! domain codes, then check each candidate page against that band
+//! domain identifiers, then check each candidate page against that band
 //! using the median row body length from its slot directory.
 //!
 //! ## What it is and is not
@@ -36,12 +36,12 @@ use std::collections::BTreeMap;
 use opensqlany::{ApModel, Page, PageStore, PageType, SlottedPage};
 
 use crate::bv_recovery::{deobfuscate_with_bv, recover_bv_qb_data};
-use crate::syscolumn::{SysColumn, iter_syscolumns};
-use crate::sysobject::bridge_owners_to_tables;
-use crate::systable::iter_systable_entries;
+use crate::syscolumn::{SysColumn, collect_unique};
+use crate::systable::collect_unique as collect_unique_systables;
 
 /// Per-column variable-width allowance (bytes) added to the upper bound
-/// when the column's domain is variable-length (`Y`, `V`, `C`, `A`).
+/// when the column's domain is variable-length.  No Enterprise 24 domain
+/// has yet been proven fixed or variable for physical row decoding.
 pub const VARIABLE_COLUMN_UPPER_ALLOWANCE: u32 = 64;
 
 /// Minimum row body length any plausible row must clear, regardless of
@@ -52,15 +52,16 @@ pub const MIN_ROW_BODY_BYTES: u32 = 4;
 /// A row-width band derived from a table's SYSCOLUMN schema.
 #[derive(Debug, Clone, Copy)]
 pub struct WidthBand {
-    /// SYSCOLUMN owner identifier (bridged to the table via the
-    /// `SYSOBJECT` catalog; see [`crate::sysobject`]).
-    pub owner_object_id: u32,
+    /// Physical `SYSTABLE.table_id` that owns these recovered columns.
+    pub table_id: u32,
     /// Lower bound on plausible row body length.
     pub low: u32,
     /// Upper bound on plausible row body length.
     pub high: u32,
-    /// Number of columns counted in the band.
-    pub column_count: u32,
+    /// Number of recovered catalog columns counted in the band.
+    ///
+    /// This is not a claim that every physical table column was recovered.
+    pub recovered_column_count: u32,
 }
 
 /// Schema-aware width-validator built from SYSCOLUMN + SYSTABLE.
@@ -90,60 +91,54 @@ impl ValidationStats {
     }
 }
 
-/// Domain characters known to be fixed-width in SA17. All other
-/// alphabetic domain characters are treated as variable-width.
-fn is_fixed_width_domain(d: u8) -> bool {
-    matches!(d, b'N' | b'F' | b'I' | b'D' | b'T' | b'B')
+/// Whether an Enterprise 24 raw catalog domain has a proven fixed physical
+/// width.  None do yet: direct catalog observations show `N` and `Y` beside
+/// semantically different columns, and the width byte's units are not
+/// established.  Returning false keeps schema attribution diagnostic-only
+/// instead of turning a partial catalog into an unsafe row decoder.
+fn is_fixed_width_domain(_domain_id: u16) -> bool {
+    false
 }
 
 impl SchemaAttribution {
     /// Build the width-band index by scanning SYSTABLE + SYSCOLUMN.
     pub fn build(store: &PageStore, model: &ApModel) -> Self {
-        let entries = iter_systable_entries(store, model).collect::<Vec<_>>();
-        let columns: Vec<SysColumn> = iter_syscolumns(store, model).collect();
+        let entries = collect_unique_systables(store, model);
+        let columns: Vec<SysColumn> = collect_unique(store, model);
 
-        // Bridge SYSCOLUMN.owner_object_id -> SYSTABLE.name via the
-        // SYSOBJECT catalog (Phase 6, WP-6Z.2). The prior
-        // assumption that owner_object_id == data_root_page was wrong;
-        // it matched coincidentally on a small subset.
-        let owner_to_table = bridge_owners_to_tables(store, model, &columns, &entries);
-
-        // Group columns by owner.
-        let mut cols_by_owner: BTreeMap<u32, Vec<SysColumn>> = BTreeMap::new();
+        // SYSCOLUMN.table_id joins directly to SYSTABLE.table_id. Do not use
+        // SYSOBJECT as a primary identity bridge: that heuristic can attach
+        // a recovered column to the wrong physical table.
+        let mut cols_by_table_id: BTreeMap<u32, Vec<SysColumn>> = BTreeMap::new();
         for c in columns {
-            cols_by_owner.entry(c.owner_object_id).or_default().push(c);
+            cols_by_table_id.entry(c.table_id).or_default().push(c);
         }
-        // Index SYSTABLE entries by name.
-        let mut tables_by_name: BTreeMap<String, &crate::SysTableEntry> = BTreeMap::new();
+        let mut tables_by_id: BTreeMap<u32, &crate::SysTableEntry> = BTreeMap::new();
         for e in &entries {
-            tables_by_name.entry(e.name.clone()).or_insert(e);
+            tables_by_id.entry(e.table_id).or_insert(e);
         }
 
         let mut bands = BTreeMap::new();
-        for (owner, cols) in &cols_by_owner {
-            let Some(table_name) = owner_to_table.get(owner) else {
-                continue;
-            };
-            let Some(table) = tables_by_name.get(table_name) else {
+        for (table_id, cols) in &cols_by_table_id {
+            let Some(table) = tables_by_id.get(table_id) else {
                 continue;
             };
             if cols.is_empty() {
                 continue;
             }
-            // Confidence gate: if SYSTABLE declares N columns but we
-            // parsed fewer than half of them via SYSCOLUMN, skip rather
-            // than emit a degenerate band no real page can satisfy.
+            // A row-width band is only meaningful when the recovered catalog
+            // set is complete. Do not turn a partial set of columns into an
+            // apparently authoritative table schema.
             if let Some(declared) = table.col_count
-                && declared >= 2
-                && (cols.len() as u32) * 2 < declared as u32
+                && cols.len() != declared as usize
             {
                 continue;
             }
             let mut low: u32 = MIN_ROW_BODY_BYTES;
             let mut high: u32 = MIN_ROW_BODY_BYTES;
             for c in cols {
-                let w = c.width as u32;
-                if is_fixed_width_domain(c.domain_char) {
+                let w = c.width;
+                if is_fixed_width_domain(c.domain_id) {
                     low = low.saturating_add(w);
                     high = high.saturating_add(w);
                 } else {
@@ -152,12 +147,12 @@ impl SchemaAttribution {
                 }
             }
             bands.insert(
-                table_name.clone(),
+                table.name.clone(),
                 WidthBand {
-                    owner_object_id: *owner,
+                    table_id: *table_id,
                     low,
                     high,
-                    column_count: cols.len() as u32,
+                    recovered_column_count: cols.len() as u32,
                 },
             );
         }
@@ -278,11 +273,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_width_domains_recognized() {
-        for d in *b"NFIDTB" {
-            assert!(is_fixed_width_domain(d));
-        }
-        for d in *b"YVCAX" {
+    fn unproven_catalog_domains_do_not_claim_fixed_width() {
+        for d in [1, 2, 3, 4, 6, 8, 9, 10, 11, 13, 19, 20, 21, 23] {
             assert!(!is_fixed_width_domain(d));
         }
     }
@@ -302,10 +294,10 @@ mod tests {
         bands.insert(
             "t".to_string(),
             WidthBand {
-                owner_object_id: 1,
+                table_id: 1,
                 low: 16,
                 high: 64,
-                column_count: 3,
+                recovered_column_count: 3,
             },
         );
         let sa = SchemaAttribution { bands };

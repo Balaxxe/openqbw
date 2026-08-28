@@ -16,27 +16,35 @@ code or binaries.
 
 ## Why
 
-Intuit has announced end-of-life dates for QuickBooks Desktop.
+QuickBooks company files may need to remain accessible independently of a
+particular workstation, installation, subscription, or product lifecycle.
 Companies that have kept books in QuickBooks Desktop for decades
 need a way to migrate that data to other accounting products, or
 just to preserve it in an open format, **without** depending on
 the QuickBooks Desktop application continuing to install and run.
 
-OpenQBW reads the `.QBW` file directly and exports to CSV, SQLite,
-or IIF.
+OpenQBW reads the `.QBW` file directly. It is read-only and its production
+architecture does not require QuickBooks, the Desktop SDK, COM, ODBC, or a GUI
+session.
 
 ## What you can do today
 
 - Open a `.QBW` file with no QuickBooks installed.
 - Enumerate user tables via the `SYSTABLE` catalog.
 - Parse `SYSCOLUMN`, `SYSINDEX`, `SYSOBJECT`.
-- Extract invoice line items, transaction headers, and width-band
-  attribution metadata.
-- Export to CSV, SQLite, or Intuit's own IIF interchange format.
+- Inspect bounded physical catalog rows and legacy discovery diagnostics.
+- Directly extract validated Accounts and normalized postings from a local
+  Enterprise 24 R21 QBW copy.
+- Produce a General Ledger or an accrual Trial Balance as CSV, JSON, or
+  SQLite, and reconcile the latter to a native QuickBooks CSV exactly.
+- Process independent local copies in parallel through a private batch
+  manifest.
 
-Validated on the Rock Castle Construction sample file:
-**13,375 / 13,375** invoices recovered, grand total
-**$399,914,792.78**.
+The production decoder is version- and layout-bound. It supports only the
+validated Enterprise 24 R21 catalog manifest and five physical posting
+families: Bill (including the VendorCredit view), Bill-Payment Check, Check,
+Deposit, and General Journal. Any unknown schema, row layout, or family is
+rejected rather than guessed.
 
 ## How it stacks
 
@@ -44,7 +52,7 @@ Validated on the Rock Castle Construction sample file:
 .QBW file
    |
    v
- OpenQBW                 (QuickBooks schema, invoice extraction, migrate)
+ OpenQBW                 (catalog + R21 accounts/postings + Ledger/reports)
    |
    v
  OpenSQLAnywhere         (SA17 page store + AP deobfuscation primitive)
@@ -52,6 +60,9 @@ Validated on the Rock Castle Construction sample file:
 
 `OpenSQLAnywhere` is the companion project; see
 [https://sigilweaver.app/opensqlanywhere/docs/](https://sigilweaver.app/opensqlanywhere/docs/).
+
+The direct path is read-only and has no runtime QuickBooks, Desktop SDK, COM,
+ODBC, or GUI dependency. Use only local copies of company files.
 
 ## Get started
 

@@ -1,11 +1,13 @@
 # openqbw (Python)
 
 Python bindings for [OpenQBW](https://github.com/Sigilweaver/OpenQBW), a
-read-only parser for QuickBooks `.qbw` files. Targets data-liberation
-and forensic workflows.
+read-only parser for QuickBooks `.qbw` files. Its Python API currently exposes
+catalog and legacy discovery diagnostics for forensic/research workflows. The
+supported Enterprise 24 R21 accounting extractor is available through the
+parent project's CLI; it is not yet exposed as a Python API.
 
-> Prototype quality. See the parent repository's `README.md` and
-> `SPECIFICATION.md` for what is and is not yet supported.
+> Prototype-quality Python surface. See the parent repository's `README.md`
+> and `SPECIFICATION.md` for the supported CLI compatibility boundary.
 
 ## Install (from source)
 
@@ -46,5 +48,5 @@ for h in r.transactions()[:3]:
 `Reader` methods (each returns a list of dicts):
 - `tables()` - SYSTABLE catalog rows
 - `indexes()` - SYSINDEX entries
-- `line_items()` - invoice line items, attributed to source tables
-- `transactions()` - transaction headers
+- `line_items()` - legacy invoice-line discovery results (not accounting output)
+- `transactions()` - legacy transaction-header discovery results (not accounting output)

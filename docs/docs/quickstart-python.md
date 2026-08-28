@@ -8,23 +8,13 @@ sidebar_label: Python quickstart
 ```python
 import openqbw
 
-company = openqbw.Company("Company.QBW")
+company = openqbw.open("Company.QBW")
 
 for table in company.tables():
-    print(f"{table.row_count:>4} rows  {table.name}")
-
-for inv in company.invoices():
-    print(inv.txn_date, inv.customer, inv.total)
-```
-
-## Migrate to SQLite
-
-```python
-import openqbw
-
-openqbw.migrate_sqlite("Company.QBW", "company.sqlite")
+    print(table["table_id"], table["name"], table["row_count"])
 ```
 
 The Python wheel is an `abi3-py39` build of the same Rust code that
-backs the CLI - same parser, same correctness guarantees, same
-performance.
+backs the CLI. Its currently exposed Python surface remains catalog and legacy
+discovery diagnostics. Use the CLI for the supported Enterprise 24 R21 Trial
+Balance and General Ledger workflow.
