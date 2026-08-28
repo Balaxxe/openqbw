@@ -17,6 +17,91 @@ const TRAILER_START: usize = 0xFF0;
 const D5: u8 = 0xD5;
 const ZB: u8 = 0x0B;
 
+/// One exact known-plaintext witness for the AP transform.
+///
+/// The values are derived only from a plaintext sequence which was verified
+/// byte-for-byte against the raw ciphertext.  `sector_base` is normalized to
+/// byte zero of the 512-byte sector; it is therefore suitable for deriving
+/// the page `bv` without relying on a zero-density or page-header heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AffineKnownPlaintextWitness {
+    /// Absolute byte offset of the plaintext sequence in the page body.
+    pub offset: usize,
+    /// Zero-based 512-byte sector containing the sequence.
+    pub sector: usize,
+    /// Offset of the sequence within `sector`.
+    pub sector_offset: usize,
+    /// AP additive base at byte zero of `sector`.
+    pub sector_base: u8,
+    /// AP additive increment for each byte in `sector`.
+    pub step: u8,
+    /// Page-level AP base value implied by this witness.
+    pub bv: u8,
+}
+
+/// Find exact AP affine witnesses for `plain` wholly contained in one sector.
+///
+/// Unlike [`recover_bv_any`], this does not infer page data from byte
+/// frequency, a conventional page header, or a QuickBooks trailer anchor.
+/// For every raw occurrence it solves the sector step from the first two
+/// bytes, verifies *every* known plaintext byte, normalizes the resulting
+/// base to the sector start, and algebraically inverts the AP base formula to
+/// obtain `bv`.
+///
+/// Only bytes before the physical trailer (`0xFF0`) are searched.  Empty and
+/// one-byte needles are rejected because they cannot establish an affine step.
+pub fn affine_known_plaintext_witnesses(
+    pn: u64,
+    raw: &[u8],
+    plain: &[u8],
+) -> Vec<AffineKnownPlaintextWitness> {
+    if raw.len() != PAGE || plain.len() < 2 || plain.len() > SECTOR {
+        return Vec::new();
+    }
+    let p16 = (pn % 16) as u8;
+    let bias = p16 / 2 * 4;
+    let mut out = Vec::new();
+    for sector in 0..SECTORS {
+        let sector_start = sector * SECTOR;
+        let sector_end = if sector == SECTORS - 1 {
+            TRAILER_START
+        } else {
+            sector_start + SECTOR
+        };
+        if sector_end - sector_start < plain.len() {
+            continue;
+        }
+        for offset in sector_start..=sector_end - plain.len() {
+            let step = raw[offset + 1]
+                .wrapping_sub(raw[offset])
+                .wrapping_sub(plain[1].wrapping_sub(plain[0]));
+            if !(2..plain.len()).all(|i| {
+                raw[offset + i].wrapping_sub(raw[offset + i - 1])
+                    == plain[i].wrapping_sub(plain[i - 1]).wrapping_add(step)
+            }) {
+                continue;
+            }
+            let sector_offset = offset - sector_start;
+            let sector_base = raw[offset]
+                .wrapping_sub(plain[0])
+                .wrapping_sub((sector_offset as u8).wrapping_mul(step));
+            let bv = sector_base
+                .wrapping_sub(pn as u8)
+                .wrapping_sub(sector as u8)
+                .wrapping_add(bias);
+            out.push(AffineKnownPlaintextWitness {
+                offset,
+                sector,
+                sector_offset,
+                sector_base,
+                step,
+                bv,
+            });
+        }
+    }
+    out
+}
+
 /// Compute the E-page oracle bv assuming `plain[0] == 0x00`.
 ///
 /// All SA17 E-pages start with a null byte (the page header begins with the
@@ -428,7 +513,6 @@ mod tests {
         }
         (stored, plain)
     }
-
     #[test]
     fn brute_recovers_known_bv_zero_dominant() {
         let pn = 1234u64;
@@ -439,6 +523,60 @@ mod tests {
         assert_eq!(recovered, bv, "brute should recover the true bv");
         let decoded = deobfuscate_with_bv(&raw, pn, recovered);
         assert_eq!(&decoded[..TRAILER_START], &plain[..TRAILER_START]);
+    }
+
+    #[test]
+    fn exact_known_plaintext_witness_recovers_sector_base_and_bv() {
+        let pn = 1_234u64;
+        let bv = 0x5au8;
+        let steps = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let (mut raw, mut plain) = synth_page(pn, bv, steps);
+        let offset = 2 * SECTOR + 173;
+        let needle = [0x01, 0x52, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+        plain[offset..offset + needle.len()].copy_from_slice(&needle);
+        let p16 = (pn % 16) as u8;
+        let bias = p16 / 2 * 4;
+        let sector = offset / SECTOR;
+        let sector_offset = offset % SECTOR;
+        let base = bv
+            .wrapping_add(pn as u8)
+            .wrapping_add(sector as u8)
+            .wrapping_sub(bias);
+        for (i, byte) in needle.iter().copied().enumerate() {
+            raw[offset + i] = byte
+                .wrapping_add(base)
+                .wrapping_add(((sector_offset + i) as u8).wrapping_mul(steps[sector]));
+        }
+
+        let hits = affine_known_plaintext_witnesses(pn, &raw, &needle);
+        let hit = hits
+            .iter()
+            .find(|hit| hit.offset == offset)
+            .expect("exact hit");
+        assert_eq!(hit.sector, sector);
+        assert_eq!(hit.sector_offset, sector_offset);
+        assert_eq!(hit.step, steps[sector]);
+        assert_eq!(hit.sector_base, base);
+        assert_eq!(hit.bv, bv);
+    }
+
+    #[test]
+    fn exact_known_plaintext_witness_rejects_cross_sector_needles() {
+        let pn = 44;
+        let bv = 9;
+        let (mut raw, mut plain) = synth_page(pn, bv, [0; SECTORS]);
+        let needle = [1, 2, 3, 4, 5, 6, 7, 8];
+        let offset = SECTOR - 4;
+        plain[offset..offset + needle.len()].copy_from_slice(&needle);
+        // The raw page is irrelevant to the contract here: a single sector
+        // affine witness must never claim a cross-sector sequence.
+        raw[offset..offset + needle.len()].copy_from_slice(&needle);
+        assert!(
+            !affine_known_plaintext_witnesses(pn, &raw, &needle)
+                .iter()
+                .any(|hit| hit.offset == offset),
+            "the cross-sector placement itself must never be reported as a one-sector witness"
+        );
     }
 
     #[test]

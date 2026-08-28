@@ -16,6 +16,11 @@ description = "Command-line exporter for QuickBooks .qbw files."
 name = "openqbw"
 path = "src/main.rs"
 
+[features]
+# Controlled fixture/oracle tooling is deliberately opt-in.  The production
+# CLI has no SDK-oracle, QBXML, or synthetic-fixture command surface.
+research-tools = []
+
 [dependencies]
 openqbw = { workspace = true }
 opensqlany = { workspace = true }

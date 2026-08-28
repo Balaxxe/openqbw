@@ -1,30 +1,28 @@
 //! `SYSOBJECT` catalog row parser (Phase 6, WP-6Z.2).
 //!
-//! Phase 6 (WP-6A, WP-6Z) assumed [`crate::SysColumn::owner_object_id`] joined to
-//! [`crate::SysTableEntry::data_root_page`]. That assumption is wrong:
-//! the two fields are independent integer namespaces and match only
-//! by coincidence on a small subset of tables (18 of 535 owners on
-//! Rock Castle, 14-26 of 400-430 owners on B18/B21/B22).
+//! An earlier Phase 6 experiment assumed that the identifier now exposed as
+//! [`crate::SysColumn::table_id`] was an SA object identifier and used this
+//! catalog to bridge it to a table name. A live aggregate audit instead shows
+//! that it is the physical [`crate::SysTableEntry::table_id`]. Production
+//! code therefore joins the two catalogs directly; this module remains only
+//! for forensic comparison of the retired hypothesis.
 //!
-//! The correct bridge is the `SYSOBJECT` catalog, which stores rows of
-//! the form
+//! `SYSOBJECT` stores rows of the form
 //!
 //! ```text
 //! <object_id u32 LE> <20 bytes type/metadata> <name_len u8> <name>
 //! ```
 //!
-//! on `Extent` pages (a representative example is page 550 on Rock
-//! Castle, with 71 slotted rows visible). `object_id` is the same
-//! integer namespace as [`crate::SysColumn::owner_object_id`], so a
-//! scan that finds `<object_id><20 bytes><name_len><name>` where
-//! `name` is a known [`crate::SysTableEntry::name`] yields the bridge.
+//! on `Extent` pages. The scanner finds `<object_id><20 bytes><name_len><name>`
+//! where `name` is a known [`crate::SysTableEntry::name`], yielding a
+//! comparison map for the retired hypothesis.
 //!
 //! The scan is conservative: it requires a structural offset of
 //! exactly 24 bytes between the candidate `object_id` and the
 //! `<name_len><name>` tuple, and it only accepts names already present
 //! in the parsed `SYSTABLE` set. False positives are bounded by the
-//! probability that a random 4-byte sequence coincidentally equals a
-//! SYSCOLUMN owner and is exactly 24 bytes before a SYSTABLE name; in
+//! probability that a random 4-byte sequence coincidentally matches a
+//! recovered column table id and is exactly 24 bytes before a SYSTABLE name; in
 //! practice this is rare enough that majority-vote disambiguation
 //! suffices when an owner has multiple candidate names.
 
@@ -53,12 +51,14 @@ fn looks_like_identifier(s: &[u8]) -> bool {
     s.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// Scan all `Extent` pages for `SYSOBJECT`-style rows and return a map
-/// from [`SysColumn::owner_object_id`] to [`SysTableEntry::name`].
+/// Scan all `Extent` pages for `SYSOBJECT`-style rows and return a heuristic
+/// map from a historical SYSCOLUMN identifier to [`SysTableEntry::name`].
 ///
 /// `columns` and `tables` should come from
 /// [`crate::iter_syscolumns`] and [`crate::iter_systable_entries`]
-/// respectively (or their deduplicated forms). The scan is conservative
+/// respectively (or their deduplicated forms). This is retained for forensic
+/// comparison only; production schema lookup joins `SYSCOLUMN.table_id`
+/// directly to `SYSTABLE.table_id`. The scan is conservative
 /// (see module docs); when an owner has multiple candidate names the
 /// one with the highest sighting count is chosen.
 pub fn bridge_owners_to_tables(
@@ -67,7 +67,7 @@ pub fn bridge_owners_to_tables(
     columns: &[SysColumn],
     tables: &[SysTableEntry],
 ) -> HashMap<u32, String> {
-    let owner_set: HashSet<u32> = columns.iter().map(|c| c.owner_object_id).collect();
+    let owner_set: HashSet<u32> = columns.iter().map(|c| c.table_id).collect();
     let mut name_set: HashSet<&str> = HashSet::new();
     for t in tables {
         name_set.insert(t.name.as_str());

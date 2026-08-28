@@ -1,54 +1,38 @@
-//! Nullability / default-marker byte from `SYSCOLUMN` (Phase 6, WP-6D).
+//! Nullability metadata from Enterprise 24 `SYSCOLUMN` rows.
 //!
-//! Each `SYSCOLUMN` row exposes a single byte (`nulls_flag` on
-//! [`crate::SysColumn`]) that conflates SA17's nullability, default
-//! presence, and "computed/identity" markers. Without access to the
-//! authoritative SA17 catalog spec, we ship a histogram-level decoder
-//! that tallies observed values and provides one representative column
-//! per value, so downstream callers can audit the data themselves.
-//!
-//! ## Observed pattern on Rock Castle (informational only)
-//!
-//! ```text
-//!   byte    typical context
-//!   0x01    simple boolean (is_*)
-//!   0x02    required scalar / foreign key (account_id, amount_amt)
-//!   0x03    short text scalar (po_num)
-//!   0x06    optional foreign key (doc_num_h)
-//!   0x09    nullable text (memo, address fields)
-//!   0x0d    timestamps and enum-like (delivery_date)
-//!   0x13    extended identity (user_dn)
-//!   0x15    audit columns (creator)
-//!   0x17    procedure metadata (proc_name)
-//!   0x18    boolean fields with default (is_build, is_receipt)
-//! ```
-//!
-//! These groupings are heuristic and should NOT be treated as
-//! authoritative until the bit layout is reverse-engineered.
+//! The compact recovered tail is `[domain_id u16][marker][nulls][width]`.
+//! `nulls` is an ASCII `N`/`Y` flag, matching SQL Anywhere 17's documented
+//! `SYSTABCOL.nulls` field. The preceding numeric value was formerly called
+//! `nulls_flag`; it is the low byte of `domain_id`, not a null/default bitmap.
 
 use std::collections::BTreeMap;
 
 use opensqlany::{ApModel, PageStore};
 
-use crate::iter_syscolumns;
+use crate::collect_unique_syscolumns;
 
-/// One bucket in the [`histogram`] output.
+/// One nullability code in the recovered catalog.
 #[derive(Debug, Clone)]
-pub struct NullsFlagBucket {
-    /// The raw `nulls_flag` byte.
-    pub flag: u8,
-    /// How many SYSCOLUMN rows share this byte value.
+pub struct NullabilityBucket {
+    /// ASCII `N` (not nullable) or `Y` (nullable).
+    pub nulls: u8,
+    /// Number of uniquely recovered catalog rows with this code.
     pub count: usize,
     /// Up to four column names that share this byte, for context.
     pub sample_columns: Vec<String>,
 }
 
-/// Build a histogram of the `nulls_flag` byte across every
-/// `SYSCOLUMN` row in `store`, sorted ascending by byte value.
-pub fn histogram(store: &PageStore, model: &ApModel) -> Vec<NullsFlagBucket> {
+/// Historical type name retained for source compatibility.
+#[deprecated(note = "use NullabilityBucket")]
+pub type NullsFlagBucket = NullabilityBucket;
+
+/// Build an `N`/`Y` nullability histogram across uniquely recovered catalog
+/// rows. Counts describe recovery coverage only; they do not prove that every
+/// physical column was recovered.
+pub fn histogram(store: &PageStore, model: &ApModel) -> Vec<NullabilityBucket> {
     let mut counts: BTreeMap<u8, (usize, Vec<String>)> = BTreeMap::new();
-    for c in iter_syscolumns(store, model) {
-        let entry = counts.entry(c.nulls_flag).or_insert((0, Vec::new()));
+    for c in collect_unique_syscolumns(store, model) {
+        let entry = counts.entry(c.nulls).or_insert((0, Vec::new()));
         entry.0 += 1;
         if entry.1.len() < 4 && !entry.1.contains(&c.name) {
             entry.1.push(c.name);
@@ -56,28 +40,34 @@ pub fn histogram(store: &PageStore, model: &ApModel) -> Vec<NullsFlagBucket> {
     }
     counts
         .into_iter()
-        .map(|(flag, (count, sample_columns))| NullsFlagBucket {
-            flag,
+        .map(|(nulls, (count, sample_columns))| NullabilityBucket {
+            nulls,
             count,
             sample_columns,
         })
         .collect()
 }
 
+/// Historical function name retained for source compatibility.
+#[deprecated(note = "use histogram; it now reports actual N/Y nullability")]
+pub fn nulls_flag_histogram(store: &PageStore, model: &ApModel) -> Vec<NullabilityBucket> {
+    histogram(store, model)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `NullsFlagBucket` is purely a value type; the only real test we
+    /// `NullabilityBucket` is purely a value type; the only real test we
     /// can run here is that the field destructuring is stable.
     #[test]
     fn bucket_fields_round_trip() {
-        let b = NullsFlagBucket {
-            flag: 0x18,
+        let b = NullabilityBucket {
+            nulls: b'Y',
             count: 42,
             sample_columns: vec!["is_build".into(), "is_receipt".into()],
         };
-        assert_eq!(b.flag, 0x18);
+        assert_eq!(b.nulls, b'Y');
         assert_eq!(b.count, 42);
         assert_eq!(b.sample_columns.len(), 2);
     }

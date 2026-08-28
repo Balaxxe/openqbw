@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use opensqlany::{ApModel, PageStore};
 
-use crate::{SysColumn, SysTableEntry, iter_syscolumns};
+use crate::{SysColumn, SysTableEntry, collect_unique_syscolumns};
 
 /// One inferred foreign-key edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,24 +82,23 @@ fn match_score(stem: &str, table: &str) -> u32 {
 /// catalogs. The list is sorted by (source_table, source_column_id).
 pub fn build(store: &PageStore, model: &ApModel) -> Vec<FkEdge> {
     let tables: Vec<SysTableEntry> = crate::collect_unique(store, model);
-    // Map data_root_page -> name so we can name each SYSCOLUMN owner.
-    let mut name_by_root: BTreeMap<u32, String> = BTreeMap::new();
+    // SYSCOLUMN.table_id is the physical SYSTABLE.table_id, not a page
+    // pointer or SYSOBJECT identifier.
+    let mut name_by_table_id: BTreeMap<u32, String> = BTreeMap::new();
     for t in &tables {
-        if let Some(root) = t.data_root_page {
-            name_by_root.entry(root).or_insert(t.name.clone());
-        }
+        name_by_table_id.entry(t.table_id).or_insert(t.name.clone());
     }
     let table_names: Vec<String> = tables.iter().map(|t| t.name.clone()).collect();
 
     let mut edges: Vec<FkEdge> = Vec::new();
-    for c in iter_syscolumns(store, model) {
+    for c in collect_unique_syscolumns(store, model) {
         let Some(stem) = strip_id_suffix(&c.name) else {
             continue;
         };
         if stem.is_empty() {
             continue;
         }
-        let Some(src) = name_by_root.get(&c.owner_object_id) else {
+        let Some(src) = name_by_table_id.get(&c.table_id) else {
             continue;
         };
         let (best, score) = pick_best(stem, &table_names);

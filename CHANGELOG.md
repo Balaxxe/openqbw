@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The normalized decoder contract now records source/link rows, deletion
+  tombstones, and proven canonical-zero void rows as explicit, auditable
+  exclusions. They count toward complete coverage without violating the
+  ledger's non-zero-posting invariant. Decoder examples and public changes
+  must use synthetic data only.
+
 ## [0.1.4] - 2026-08-12
 
 ### Added

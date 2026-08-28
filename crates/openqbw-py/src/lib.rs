@@ -14,6 +14,7 @@ use opensqlany::{ApModel, PageStore};
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -61,7 +62,13 @@ impl Reader {
         for e in entries {
             let d = PyDict::new(py);
             d.set_item("table_id", e.table_id)?;
+            d.set_item("object_id", e.object_id)?;
             d.set_item("name", e.name)?;
+            d.set_item("row_count", e.row_count)?;
+            d.set_item("table_page_count", e.table_page_count)?;
+            d.set_item("ext_page_count", e.ext_page_count)?;
+            d.set_item("row_length", e.row_length)?;
+            d.set_item("row_flags", e.row_flags)?;
             d.set_item("col_count", e.col_count)?;
             d.set_item("data_root_page", e.data_root_page)?;
             d.set_item("last_page", e.last_page)?;
@@ -71,16 +78,33 @@ impl Reader {
         Ok(out)
     }
 
-    /// Return SYSINDEX entries as a list of dicts.
+    /// Return SYSINDEX entries as a list of dicts. `catalog_page_candidate`
+    /// is diagnostic metadata only, not a proven root or navigation pointer.
     fn indexes<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let entries: Vec<SysIndexEntry> = collect_unique_sysindex(&self.store, &self.model);
+        let tables = collect_unique_systable(&self.store, &self.model);
+        let mut owners: BTreeMap<u64, BTreeSet<(u32, String)>> = BTreeMap::new();
+        for table in tables {
+            owners
+                .entry(table.object_id)
+                .or_default()
+                .insert((table.table_id, table.name));
+        }
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
             let d = PyDict::new(py);
             d.set_item("name", e.name)?;
-            d.set_item("table_id", e.table_id)?;
-            d.set_item("root_page", e.root_page)?;
+            d.set_item("owner_object_id", e.owner_object_id)?;
+            let resolved = owners
+                .get(&e.owner_object_id)
+                .filter(|matches| matches.len() == 1)
+                .and_then(|matches| matches.iter().next());
+            d.set_item("table_id", resolved.map(|(table_id, _)| *table_id))?;
+            d.set_item("table_name", resolved.map(|(_, name)| name.as_str()))?;
+            d.set_item("catalog_page_candidate", e.catalog_page_candidate)?;
             d.set_item("page_number", e.page_number)?;
+            d.set_item("row_length", e.row_length)?;
+            d.set_item("row_flags", e.row_flags)?;
             out.push(d);
         }
         Ok(out)
