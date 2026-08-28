@@ -9,12 +9,12 @@
 //! construction of [`crate::DecodedAccounts`], [`crate::DecodedPostings`], and
 //! [`crate::Ledger`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use opensqlany::{
-    BooleanTailLayout, EnumLayout, NullBitmapCoverage, NullBitmapLayout, NumericLayout,
-    PartialDecodedRow, RowPrefixLayout, RowSchema, VariableLengthLayout, VariableOverflowLayout,
-    decode_row_prefix_and_boolean_tail,
+    BooleanTailLayout, ColumnType, EnumLayout, NullBitmapCoverage, NullBitmapLayout, NumericLayout,
+    PartialDecodedRow, RowPrefixLayout, RowSchema, Value, VariableLengthLayout,
+    VariableOverflowLayout, decode_row_prefix_and_boolean_tail,
 };
 use thiserror::Error;
 
@@ -28,8 +28,9 @@ use crate::{
     PostingExclusionReason, PostingId, PostingProvenance, RowStorageAttestation, SourceSnapshotId,
     SysColumn, SysTableEntry, TransactionId, adapt_enterprise_posting_row_partial,
     adapt_materialized_bill_posting_row, adapt_materialized_check_posting_row,
-    adapt_materialized_general_journal_posting_row, classify_materialized_check_void_companion,
-    classify_materialized_general_journal_rows, decode_schema_account_row_partial,
+    adapt_materialized_general_journal_posting_row, boolean_value_by_column_name,
+    classify_materialized_check_void_companion, classify_materialized_general_journal_rows,
+    decode_schema_account_row_partial, prefix_value_by_column_name,
     resolve_enterprise24_account_type18, validate_enterprise24_r21_schema_manifest,
 };
 
@@ -1237,6 +1238,101 @@ pub fn build_enterprise24_accounting_pipeline(
             );
             continue;
         };
+        if table == Enterprise24AccountingTable::DepositLine {
+            let headers = match deposit_nonposting_header_record_ids(&rows.records, schema) {
+                Ok(headers) => headers,
+                Err(()) => {
+                    diagnostics.blockers.push(
+                        Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
+                            table_id: table.id(),
+                            page: 0,
+                            record: 0,
+                        },
+                    );
+                    continue;
+                }
+            };
+            match validate_deposit_master_balances(&rows.records, schema, &headers) {
+                Ok(()) => {}
+                Err(DepositTableValidationError::Adaptation) => {
+                    diagnostics.blockers.push(
+                        Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
+                            table_id: table.id(),
+                            page: 0,
+                            record: 0,
+                        },
+                    );
+                    continue;
+                }
+                Err(DepositTableValidationError::Unbalanced) => {
+                    diagnostics.blockers.push(
+                        Enterprise24AccountingPipelineBlocker::UnbalancedPostingMasters {
+                            table_id: table.id(),
+                        },
+                    );
+                    continue;
+                }
+            }
+            for record in &rows.records {
+                diagnostics.posting_candidates += 1;
+                if headers.contains(&(record.raw_page_number, record.record_id)) {
+                    match deposit_nonposting_header_disposition(record, rows.policy.version) {
+                        Ok(disposition) => {
+                            diagnostics.excluded_postings += 1;
+                            dispositions.push(disposition);
+                        }
+                        Err(()) => diagnostics.blockers.push(
+                            Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
+                                table_id: table.id(),
+                                page: record.raw_page_number,
+                                record: record.record_id,
+                            },
+                        ),
+                    }
+                    continue;
+                }
+                match adapt_enterprise_posting_row_partial(table, schema, &record.partial) {
+                    Ok(adaptation) => match normalized_disposition(
+                        table,
+                        record,
+                        adaptation,
+                        &identity_map,
+                        rows.policy.version,
+                    ) {
+                        Ok(PostingDisposition::Posting(posting)) => {
+                            diagnostics.normalized_postings += 1;
+                            dispositions.push(PostingDisposition::Posting(posting));
+                        }
+                        Ok(PostingDisposition::Excluded(exclusion)) => {
+                            diagnostics.excluded_postings += 1;
+                            dispositions.push(PostingDisposition::Excluded(exclusion));
+                        }
+                        Err(NormalizationFailure::MissingAccountIdentity) => diagnostics.blockers.push(
+                            Enterprise24AccountingPipelineBlocker::PostingAccountIdentityUnavailable {
+                                table_id: table.id(),
+                                page: record.raw_page_number,
+                                record: record.record_id,
+                            },
+                        ),
+                        Err(NormalizationFailure::Other) => diagnostics.blockers.push(
+                            Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
+                                table_id: table.id(),
+                                page: record.raw_page_number,
+                                record: record.record_id,
+                            },
+                        ),
+                    },
+                    Err(_) => diagnostics.blockers.push(
+                        Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
+                            table_id: table.id(),
+                            page: record.raw_page_number,
+                            record: record.record_id,
+                        },
+                    ),
+                }
+            }
+            continue;
+        }
         for record in &rows.records {
             diagnostics.posting_candidates += 1;
             match adapt_enterprise_posting_row_partial(table, schema, &record.partial) {
@@ -1344,6 +1440,279 @@ fn check_companion_disposition(
         format!(
             "enterprise24:{}:{}:{}",
             Enterprise24AccountingTable::CheckLine.id(),
+            record.raw_page_number,
+            record.record_id
+        ),
+        u32::try_from(record.raw_page_number).ok(),
+        Some(record.record_id),
+        decoder,
+    )
+    .map_err(|_| ())?;
+    Ok(PostingExclusion::new(provenance, PostingExclusionReason::SourceOrLinkRow).into())
+}
+
+/// Identifies the two exact non-posting Deposit headers found by the complete
+/// table census.  A matching byte envelope alone is never enough: each header
+/// must occur once in its complete same-transaction topology, and every
+/// economic sibling must be independently adaptable and balanced.
+fn deposit_nonposting_header_record_ids(
+    rows: &[Enterprise24PartialRecord],
+    schema: &RowSchema,
+) -> Result<BTreeSet<(u64, u16)>, ()> {
+    const HEADER_70_LEN: usize = 108;
+    const HEADER_71_LEN: usize = 112;
+    const HEADER_70_KIND: u8 = 0x70;
+    const HEADER_71_KIND: u8 = 0x71;
+    const LINKED_KIND: u8 = 0xe1;
+    const COUNTERPART_F1_KIND: u8 = 0xf1;
+
+    let mut by_transaction = BTreeMap::<u64, Vec<&Enterprise24PartialRecord>>::new();
+    let mut all_targets = BTreeSet::new();
+    for record in rows {
+        if !all_targets.insert(deposit_partial_id(record, schema, "target_id")?) {
+            return Err(());
+        }
+        by_transaction
+            .entry(deposit_partial_id(record, schema, "transaction_id")?)
+            .or_default()
+            .push(record);
+    }
+    let mut headers = BTreeSet::new();
+    for group in by_transaction.values() {
+        let header_candidates = group
+            .iter()
+            .copied()
+            .filter(|record| deposit_header_envelope(&record.bytes).is_some())
+            .collect::<Vec<_>>();
+        if header_candidates.is_empty() {
+            continue;
+        }
+        if header_candidates.len() != 1 {
+            return Err(());
+        }
+        let header = header_candidates[0];
+        let Some(kind) = deposit_header_envelope(&header.bytes) else {
+            return Err(());
+        };
+        let expected_split = match kind {
+            HEADER_70_KIND => true,
+            HEADER_71_KIND => false,
+            _ => return Err(()),
+        };
+        if !deposit_header_fields_match(header, schema, expected_split)? {
+            return Err(());
+        }
+        match kind {
+            HEADER_70_KIND if header.bytes.len() == HEADER_70_LEN => {
+                if group.len() != 4 {
+                    return Err(());
+                }
+                let siblings = group
+                    .iter()
+                    .copied()
+                    .filter(|record| !std::ptr::eq(*record, header))
+                    .collect::<Vec<_>>();
+                let mut adapted = Vec::new();
+                for sibling in siblings {
+                    let EnterprisePostingAdaptation::Posting(posting) =
+                        adapt_enterprise_posting_row_partial(
+                            Enterprise24AccountingTable::DepositLine,
+                            schema,
+                            &sibling.partial,
+                        )
+                        .map_err(|_| ())?
+                    else {
+                        return Err(());
+                    };
+                    adapted.push((sibling, posting));
+                }
+                let linked_sources = adapted
+                    .iter()
+                    .filter(|(record, posting)| {
+                        record.bytes.get(3) == Some(&LINKED_KIND)
+                            && posting.is_source == Some(true)
+                            && posting.is_split == Some(true)
+                    })
+                    .count();
+                let counterparts = adapted
+                    .iter()
+                    .filter(|(record, posting)| {
+                        record.bytes.get(3) == Some(&COUNTERPART_F1_KIND)
+                            && posting.is_source == Some(false)
+                            && posting.is_split == Some(true)
+                    })
+                    .count();
+                if linked_sources != 1
+                    || counterparts != 2
+                    || adapted
+                        .iter()
+                        .map(|(_, posting)| i128::from(posting.amount_cents))
+                        .sum::<i128>()
+                        != 0
+                {
+                    return Err(());
+                }
+            }
+            HEADER_71_KIND if header.bytes.len() == HEADER_71_LEN => {
+                if group.len() != 2 {
+                    return Err(());
+                }
+                let sibling = group
+                    .iter()
+                    .copied()
+                    .find(|record| !std::ptr::eq(*record, header))
+                    .ok_or(())?;
+                if sibling.bytes.get(3) != Some(&LINKED_KIND)
+                    || !deposit_partial_bool(sibling, schema, "is_source_bool")?
+                    || deposit_partial_bool(sibling, schema, "is_split_bool")?
+                    || !deposit_partial_is_null(sibling, schema, "amount_amt")?
+                    || deposit_partial_is_null(sibling, schema, "account_id")?
+                    || !matches!(
+                        adapt_enterprise_posting_row_partial(
+                            Enterprise24AccountingTable::DepositLine,
+                            schema,
+                            &sibling.partial,
+                        ),
+                        Ok(EnterprisePostingAdaptation::Excluded(
+                            EnterprisePostingExclusion::SourceOrLink { .. }
+                        ))
+                    )
+                {
+                    return Err(());
+                }
+            }
+            _ => return Err(()),
+        }
+        headers.insert((header.raw_page_number, header.record_id));
+    }
+    Ok(headers)
+}
+
+fn deposit_header_envelope(bytes: &[u8]) -> Option<u8> {
+    let [first, second, flags, kind, ..] = bytes else {
+        return None;
+    };
+    let declared = usize::from(u16::from_le_bytes([*first, *second]));
+    (declared == bytes.len() && *flags == 0 && matches!(*kind, 0x70 | 0x71)).then_some(*kind)
+}
+
+fn deposit_header_fields_match(
+    record: &Enterprise24PartialRecord,
+    schema: &RowSchema,
+    expected_split: bool,
+) -> Result<bool, ()> {
+    Ok(deposit_partial_is_null(record, schema, "account_id")?
+        && deposit_partial_is_null(record, schema, "amount_amt")?
+        && !deposit_partial_bool(record, schema, "is_source_bool")?
+        && !deposit_partial_bool(record, schema, "is_no_post_bool")?
+        && !deposit_partial_bool(record, schema, "is_memorized_transaction_bool")?
+        && deposit_partial_bool(record, schema, "is_split_bool")? == expected_split)
+}
+
+fn deposit_partial_value<'a>(
+    record: &'a Enterprise24PartialRecord,
+    schema: &'a RowSchema,
+    name: &str,
+) -> Result<&'a Value, ()> {
+    prefix_value_by_column_name(schema, &record.partial, name)
+        .map_err(|_| ())?
+        .ok_or(())
+}
+
+fn deposit_partial_id(
+    record: &Enterprise24PartialRecord,
+    schema: &RowSchema,
+    name: &str,
+) -> Result<u64, ()> {
+    let column = schema
+        .columns
+        .iter()
+        .find(|column| column.name == name)
+        .ok_or(())?;
+    if !matches!(
+        column.column_type,
+        ColumnType::Integer
+            | ColumnType::Integer2
+            | ColumnType::UInt32
+            | ColumnType::UInt64
+            | ColumnType::Int64
+    ) {
+        return Err(());
+    }
+    match deposit_partial_value(record, schema, name)? {
+        Value::Unsigned(value) if *value != 0 => Ok(*value),
+        Value::Integer(value) if *value > 0 => u64::try_from(*value).map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
+fn deposit_partial_bool(
+    record: &Enterprise24PartialRecord,
+    schema: &RowSchema,
+    name: &str,
+) -> Result<bool, ()> {
+    match boolean_value_by_column_name(schema, &record.partial, name)
+        .map_err(|_| ())?
+        .ok_or(())?
+    {
+        Value::Boolean(value) => Ok(*value),
+        _ => Err(()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DepositTableValidationError {
+    Adaptation,
+    Unbalanced,
+}
+
+fn validate_deposit_master_balances(
+    rows: &[Enterprise24PartialRecord],
+    schema: &RowSchema,
+    headers: &BTreeSet<(u64, u16)>,
+) -> Result<(), DepositTableValidationError> {
+    let mut balances = BTreeMap::<u64, i128>::new();
+    for record in rows {
+        if headers.contains(&(record.raw_page_number, record.record_id)) {
+            continue;
+        }
+        let adaptation = adapt_enterprise_posting_row_partial(
+            Enterprise24AccountingTable::DepositLine,
+            schema,
+            &record.partial,
+        )
+        .map_err(|_| DepositTableValidationError::Adaptation)?;
+        if let EnterprisePostingAdaptation::Posting(posting) = adaptation {
+            *balances.entry(posting.transaction_id).or_default() +=
+                i128::from(posting.amount_cents);
+        }
+    }
+    balances
+        .into_values()
+        .all(|balance| balance == 0)
+        .then_some(())
+        .ok_or(DepositTableValidationError::Unbalanced)
+}
+
+fn deposit_partial_is_null(
+    record: &Enterprise24PartialRecord,
+    schema: &RowSchema,
+    name: &str,
+) -> Result<bool, ()> {
+    Ok(matches!(
+        deposit_partial_value(record, schema, name)?,
+        Value::Null
+    ))
+}
+
+fn deposit_nonposting_header_disposition(
+    record: &Enterprise24PartialRecord,
+    decoder: &str,
+) -> Result<PostingDisposition, ()> {
+    let provenance = PostingProvenance::new(
+        format!(
+            "enterprise24:{}:{}:{}",
+            Enterprise24AccountingTable::DepositLine.id(),
             record.raw_page_number,
             record.record_id
         ),
@@ -1731,7 +2100,7 @@ pub enum Enterprise24AccountingPipelineError {
 mod tests {
     use super::*;
     use crate::{Account, AccountType};
-    use opensqlany::{PartialRowValue, Value};
+    use opensqlany::{ColumnDef, EnterpriseNumericToken, PartialRowValue, SaDate, Value};
 
     fn partial(integer: i64) -> PartialDecodedRow {
         PartialDecodedRow {
@@ -1805,6 +2174,180 @@ mod tests {
         }
     }
 
+    fn deposit_schema() -> RowSchema {
+        let mut schema = RowSchema::new(vec![
+            ColumnDef::new(1, "target_id", ColumnType::Integer, 4, false),
+            ColumnDef::new(2, "transaction_id", ColumnType::Integer, 4, false),
+            ColumnDef::new(3, "account_id", ColumnType::Integer, 4, true),
+            ColumnDef::new(4, "transaction_date", ColumnType::Date, 4, true),
+            ColumnDef::new(5, "amount_amt", ColumnType::Numeric, 20, true),
+            ColumnDef::new(6, "is_no_post_bool", ColumnType::Boolean, 1, false),
+            ColumnDef::new(
+                7,
+                "is_memorized_transaction_bool",
+                ColumnType::Boolean,
+                1,
+                false,
+            ),
+            ColumnDef::new(8, "is_source_bool", ColumnType::Boolean, 1, false),
+            ColumnDef::new(9, "is_split_bool", ColumnType::Boolean, 1, false),
+        ]);
+        schema.numeric_layout = NumericLayout::EnterpriseMaterializedRaw;
+        schema
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deposit_record(
+        record_id: u16,
+        target: i64,
+        transaction: i64,
+        kind: u8,
+        len: usize,
+        account: Option<i64>,
+        amount: Option<(u8, u8)>,
+        source: bool,
+        split: bool,
+    ) -> Enterprise24PartialRecord {
+        let mut bytes = vec![0_u8; len];
+        bytes[..2].copy_from_slice(&(len as u16).to_le_bytes());
+        bytes[3] = kind;
+        bytes[8..12].copy_from_slice(&(target as u32).to_le_bytes());
+        bytes[12..16].copy_from_slice(&(transaction as u32).to_le_bytes());
+        let values = vec![
+            Value::Integer(target),
+            Value::Integer(transaction),
+            account.map_or(Value::Null, Value::Integer),
+            Value::Date(SaDate {
+                raw_minutes: 194_516_640,
+            }),
+            amount.map_or(Value::Null, |(marker, digit)| {
+                Value::EnterpriseNumeric(EnterpriseNumericToken {
+                    marker,
+                    digits: vec![digit],
+                })
+            }),
+            Value::Boolean(false),
+            Value::Boolean(false),
+            Value::Boolean(source),
+            Value::Boolean(split),
+        ];
+        Enterprise24PartialRecord {
+            raw_page_number: 1,
+            record_id,
+            partial: PartialDecodedRow {
+                declared_size: len,
+                flags: 0,
+                through_ordinal: 5,
+                prefix_values: values
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .enumerate()
+                    .map(|(column_index, value)| PartialRowValue {
+                        column_index,
+                        column_id: (column_index + 1) as u32,
+                        value,
+                    })
+                    .collect(),
+                boolean_values: values
+                    .iter()
+                    .skip(5)
+                    .cloned()
+                    .enumerate()
+                    .map(|(offset, value)| PartialRowValue {
+                        column_index: offset + 5,
+                        column_id: (offset + 6) as u32,
+                        value,
+                    })
+                    .collect(),
+                opaque_middle_len: 0,
+            },
+            bytes,
+        }
+    }
+
+    fn deposit_header_70(
+        record_id: u16,
+        target: i64,
+        transaction: i64,
+    ) -> Enterprise24PartialRecord {
+        deposit_record(
+            record_id,
+            target,
+            transaction,
+            0x70,
+            108,
+            None,
+            None,
+            false,
+            true,
+        )
+    }
+
+    fn deposit_header_71(
+        record_id: u16,
+        target: i64,
+        transaction: i64,
+    ) -> Enterprise24PartialRecord {
+        deposit_record(
+            record_id,
+            target,
+            transaction,
+            0x71,
+            112,
+            None,
+            None,
+            false,
+            false,
+        )
+    }
+
+    fn valid_70_group(transaction: i64) -> Vec<Enterprise24PartialRecord> {
+        vec![
+            deposit_header_70(1, 101, transaction),
+            deposit_record(
+                2,
+                102,
+                transaction,
+                0xe1,
+                80,
+                Some(10),
+                Some((0xbf, 10)),
+                true,
+                true,
+            ),
+            deposit_record(
+                3,
+                103,
+                transaction,
+                0xf1,
+                80,
+                Some(11),
+                Some((0x3f, 5)),
+                false,
+                true,
+            ),
+            deposit_record(
+                4,
+                104,
+                transaction,
+                0xf1,
+                80,
+                Some(12),
+                Some((0x3f, 5)),
+                false,
+                true,
+            ),
+        ]
+    }
+
+    fn valid_71_group(transaction: i64) -> Vec<Enterprise24PartialRecord> {
+        vec![
+            deposit_header_71(5, 201, transaction),
+            deposit_record(6, 202, transaction, 0xe1, 80, Some(13), None, true, false),
+        ]
+    }
+
     #[test]
     fn policies_are_versioned_and_mark_general_journal_as_dedicated() {
         let check =
@@ -1824,6 +2367,131 @@ mod tests {
         );
         assert_eq!(general_journal.through_ordinal, None);
         assert_eq!(general_journal.storage, None);
+    }
+
+    #[test]
+    fn deposit_nonposting_headers_require_the_two_complete_proven_topologies() {
+        let schema = deposit_schema();
+        let mut records = valid_70_group(1000);
+        records.extend(valid_71_group(2000));
+        let headers = deposit_nonposting_header_record_ids(&records, &schema).unwrap();
+        assert_eq!(headers, BTreeSet::from([(1, 1), (1, 5)]));
+        assert_eq!(
+            validate_deposit_master_balances(&records, &schema, &headers),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn deposit_nonposting_header_classifier_rejects_every_missing_or_changed_evidence_gate() {
+        let schema = deposit_schema();
+
+        let mut missing_counterpart = valid_70_group(1000);
+        missing_counterpart.pop();
+        assert!(deposit_nonposting_header_record_ids(&missing_counterpart, &schema).is_err());
+
+        let mut unbalanced = valid_70_group(1000);
+        unbalanced[3] = deposit_record(
+            4,
+            104,
+            1000,
+            0xf1,
+            80,
+            Some(12),
+            Some((0x3f, 4)),
+            false,
+            true,
+        );
+        assert!(deposit_nonposting_header_record_ids(&unbalanced, &schema).is_err());
+
+        let mut wrong_split = valid_70_group(1000);
+        wrong_split[0] = deposit_record(1, 101, 1000, 0x70, 108, None, None, false, false);
+        assert!(deposit_nonposting_header_record_ids(&wrong_split, &schema).is_err());
+
+        let mut duplicate_target = valid_70_group(1000);
+        duplicate_target[1] = deposit_record(
+            2,
+            101,
+            1000,
+            0xe1,
+            80,
+            Some(10),
+            Some((0xbf, 10)),
+            true,
+            true,
+        );
+        assert!(deposit_nonposting_header_record_ids(&duplicate_target, &schema).is_err());
+
+        let mut cross_transaction_duplicate = valid_70_group(1000);
+        cross_transaction_duplicate.extend(valid_71_group(2000));
+        cross_transaction_duplicate[4] = deposit_header_71(5, 101, 2000);
+        assert!(
+            deposit_nonposting_header_record_ids(&cross_transaction_duplicate, &schema).is_err()
+        );
+
+        let mut nonnull_header_account = valid_71_group(2000);
+        nonnull_header_account[0] =
+            deposit_record(5, 201, 2000, 0x71, 112, Some(13), None, false, false);
+        assert!(deposit_nonposting_header_record_ids(&nonnull_header_account, &schema).is_err());
+
+        let mut header_71_with_posting = valid_71_group(2000);
+        header_71_with_posting[1] = deposit_record(
+            6,
+            202,
+            2000,
+            0xe1,
+            80,
+            Some(13),
+            Some((0xbf, 1)),
+            true,
+            false,
+        );
+        assert!(deposit_nonposting_header_record_ids(&header_71_with_posting, &schema).is_err());
+
+        let mut wrong_envelope = valid_70_group(1000);
+        wrong_envelope[0].bytes[0] = 0;
+        assert!(
+            deposit_nonposting_header_record_ids(&wrong_envelope, &schema)
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut bad_provenance = valid_70_group(1000);
+        bad_provenance[0].partial.prefix_values[0].column_id = 999;
+        assert!(deposit_nonposting_header_record_ids(&bad_provenance, &schema).is_err());
+    }
+
+    #[test]
+    fn deposit_master_balance_gate_rejects_cross_master_cancellation() {
+        let schema = deposit_schema();
+        let records = vec![
+            deposit_record(
+                10,
+                301,
+                3000,
+                0xe1,
+                80,
+                Some(10),
+                Some((0xbf, 1)),
+                true,
+                true,
+            ),
+            deposit_record(
+                11,
+                401,
+                4000,
+                0xe1,
+                80,
+                Some(11),
+                Some((0x3f, 1)),
+                true,
+                true,
+            ),
+        ];
+        assert_eq!(
+            validate_deposit_master_balances(&records, &schema, &BTreeSet::new()),
+            Err(DepositTableValidationError::Unbalanced)
+        );
     }
 
     #[test]

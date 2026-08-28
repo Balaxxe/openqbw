@@ -61,12 +61,14 @@ use general_ledger_reconciliation::{
 use openqbw::{
     AccountId, AmountType, AttributionGap, CatalogCoverageAttestation, CatalogDefaultAttestation,
     ContentAttribution, CrossValidation, ENTERPRISE24_R21_PARTIAL_TABLE_POLICIES,
-    ENTERPRISE24_R21_SCHEMA_MANIFEST, Enterprise24AccountingTable, LineItem,
+    ENTERPRISE24_R21_SCHEMA_MANIFEST, Enterprise24AccountingTable,
+    Enterprise24R21TransformKeyAttestation, Enterprise24R21TransformKeyResolutionError, LineItem,
     MaterializedPostingDate, PageAttribution, QuickBooksAccrualTrialBalancePolicy,
     SourceSnapshotId, SysIndexEntry, SysTableEntry, TransactionHeader, adapt_complete_schema,
     attest_enterprise24_r21_catalog, build_enterprise24_accounting_pipeline,
     collect_enterprise24_bill_table_rows, collect_enterprise24_check_prefix_table_rows,
     collect_enterprise24_general_journal_table_rows, collect_enterprise24_partial_table_rows,
+    discover_enterprise24_r21_accounting_transform_key_candidates_in_store,
     discover_enterprise24_r21_transform_key_in_store, iter_lineitems_with_attribution,
     iter_transaction_headers, scan_enterprise_table_store,
 };
@@ -1111,8 +1113,68 @@ fn build_local_enterprise24_ledger(
     snapshot_id: String,
 ) -> Result<openqbw::Ledger> {
     let store = PageStore::open(input).context("opening local QBW input")?;
-    let attestation = discover_enterprise24_r21_transform_key_in_store(&store)
-        .context("semantically resolving Enterprise 24 R21 page materialization key")?;
+    match discover_enterprise24_r21_transform_key_in_store(&store) {
+        Ok(attestation) => {
+            build_local_enterprise24_ledger_from_attestation(&store, &snapshot_id, attestation)
+        }
+        Err(
+            strict_error @ Enterprise24R21TransformKeyResolutionError::NoSemanticCandidate {
+                ..
+            },
+        ) => {
+            let candidates =
+                discover_enterprise24_r21_accounting_transform_key_candidates_in_store(&store)
+                    .map_err(|_| strict_error)
+                    .context("semantically resolving Enterprise 24 R21 page materialization key")?;
+            let ledgers = candidates.into_iter().filter_map(|attestation| {
+                build_local_enterprise24_ledger_from_attestation(&store, &snapshot_id, attestation)
+                    .ok()
+            });
+            match select_unique_balanced_accounting_readiness_ledger(ledgers) {
+                Ok(Some(ledger)) => Ok(ledger),
+                Ok(None) => Err(strict_error)
+                    .context("semantically resolving Enterprise 24 R21 page materialization key"),
+                Err(()) => anyhow::bail!(
+                    "multiple Enterprise 24 R21 accounting-readiness candidates produced complete balanced ledgers"
+                ),
+            }
+        }
+        Err(error) => {
+            Err(error).context("semantically resolving Enterprise 24 R21 page materialization key")
+        }
+    }
+}
+
+fn ledger_balances_through_latest_posting(ledger: &openqbw::Ledger) -> bool {
+    let latest_posting_date = ledger
+        .postings()
+        .map(|posting| posting.date)
+        .max()
+        .unwrap_or(0);
+    ledger.general_ledger_as_of(latest_posting_date).is_ok()
+}
+
+fn select_unique_balanced_accounting_readiness_ledger(
+    ledgers: impl IntoIterator<Item = openqbw::Ledger>,
+) -> std::result::Result<Option<openqbw::Ledger>, ()> {
+    let mut accepted = None;
+    for ledger in ledgers {
+        if !ledger_balances_through_latest_posting(&ledger) {
+            continue;
+        }
+        if accepted.is_some() {
+            return Err(());
+        }
+        accepted = Some(ledger);
+    }
+    Ok(accepted)
+}
+
+fn build_local_enterprise24_ledger_from_attestation(
+    store: &PageStore,
+    snapshot_id: &str,
+    attestation: Enterprise24R21TransformKeyAttestation,
+) -> Result<openqbw::Ledger> {
     let (transform_key, tables, catalog) = attestation.into_parts();
     // Validate the whole compatibility catalog before adapting any table. The
     // resulting envelope bytes remain opaque `SYSCOLUMN` metadata; this does
@@ -1126,7 +1188,7 @@ fn build_local_enterprise24_ledger(
     tables
         .require_unambiguous_tables(&required_table_ids)
         .context("attesting unambiguous materialized SYSTABLE expectations for required tables")?;
-    let scan = scan_enterprise_table_store(&store, transform_key)
+    let scan = scan_enterprise_table_store(store, transform_key)
         .context("scanning local QBW accounting table carriers")?;
     let mut schemas = BTreeMap::new();
     let mut account_rows = None;
@@ -2837,6 +2899,37 @@ fn run_forensics(input: PathBuf) -> Result<()> {
 mod accounting_routing_tests {
     use super::*;
 
+    fn synthetic_posting(posting_id: &str, side: openqbw::DebitCredit) -> openqbw::Posting {
+        openqbw::Posting::new(
+            openqbw::TransactionId::new("synthetic-transaction").unwrap(),
+            openqbw::PostingId::new(posting_id).unwrap(),
+            openqbw::AccountId::new("synthetic-account").unwrap(),
+            7,
+            openqbw::DebitCreditAmount::new(side, 1).unwrap(),
+            openqbw::CurrentState::Current,
+            openqbw::PostingProvenance::new(
+                format!("synthetic-row-{posting_id}"),
+                None,
+                None,
+                "synthetic-decoder",
+            )
+            .unwrap(),
+            None,
+            None,
+        )
+    }
+
+    fn synthetic_ledger(postings: impl IntoIterator<Item = openqbw::Posting>) -> openqbw::Ledger {
+        let account = openqbw::Account::new(
+            openqbw::AccountId::new("synthetic-account").unwrap(),
+            "Synthetic",
+            openqbw::AccountType::Asset,
+            true,
+        )
+        .unwrap();
+        openqbw::Ledger::new([account], postings, openqbw::LedgerCompleteness::Complete).unwrap()
+    }
+
     #[test]
     fn generic_collector_rejects_a_dedicated_general_journal_policy() {
         let policy = openqbw::enterprise24_r21_partial_table_policy(
@@ -2868,5 +2961,58 @@ mod accounting_routing_tests {
                 table_id: 3078
             }
         ));
+    }
+
+    #[test]
+    fn accounting_readiness_requires_balance_through_the_latest_posting_date() {
+        let unbalanced =
+            synthetic_ledger([synthetic_posting("debit", openqbw::DebitCredit::Debit)]);
+        assert!(!ledger_balances_through_latest_posting(&unbalanced));
+
+        let balanced = synthetic_ledger([
+            synthetic_posting("debit", openqbw::DebitCredit::Debit),
+            synthetic_posting("credit", openqbw::DebitCredit::Credit),
+        ]);
+        assert!(ledger_balances_through_latest_posting(&balanced));
+    }
+
+    #[test]
+    fn accounting_readiness_selection_requires_exactly_one_balanced_ledger() {
+        assert!(
+            select_unique_balanced_accounting_readiness_ledger(Vec::new())
+                .unwrap()
+                .is_none()
+        );
+
+        let unbalanced =
+            synthetic_ledger([synthetic_posting("debit", openqbw::DebitCredit::Debit)]);
+        assert!(
+            select_unique_balanced_accounting_readiness_ledger([unbalanced])
+                .unwrap()
+                .is_none()
+        );
+
+        // A complete empty accounting file is deliberately valid: its latest
+        // posting date defaults to zero and its empty General Ledger balances.
+        let empty = synthetic_ledger(Vec::new());
+        assert!(
+            select_unique_balanced_accounting_readiness_ledger([empty])
+                .unwrap()
+                .is_some()
+        );
+
+        let balanced = synthetic_ledger([
+            synthetic_posting("debit", openqbw::DebitCredit::Debit),
+            synthetic_posting("credit", openqbw::DebitCredit::Credit),
+        ]);
+        assert!(
+            select_unique_balanced_accounting_readiness_ledger([balanced.clone()])
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            select_unique_balanced_accounting_readiness_ledger([balanced.clone(), balanced])
+                .is_err()
+        );
     }
 }

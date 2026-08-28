@@ -93,14 +93,60 @@ pub fn discover_enterprise24_r21_transform_key_in_store(
     let structural_count = structural_candidates.len();
     let semantic_candidates = structural_candidates
         .into_iter()
-        .filter_map(|transform_key| attest_candidate(store, transform_key).ok())
+        .filter_map(|transform_key| {
+            attest_candidate(store, transform_key, CandidateAttestationProfile::Strict).ok()
+        })
         .collect::<Vec<_>>();
     require_unique_semantic_candidate(structural_count, semantic_candidates)
+}
+
+/// Return every transform-key candidate with an actual global SYSCOLUMN
+/// carrier-page deficit whose only relaxed semantic condition is that floor.
+///
+/// These attestations are not extraction-ready on their own. A caller must run
+/// the complete accounting collectors and pipeline for every returned
+/// candidate, prove current-state transaction balance through the latest
+/// decoded posting date, and accept only one uniquely successful ledger.
+pub fn discover_enterprise24_r21_accounting_transform_key_candidates_in_store(
+    store: &PageStore,
+) -> Result<Vec<Enterprise24R21TransformKeyAttestation>, Enterprise24R21TransformKeyResolutionError>
+{
+    let structural_candidates =
+        discover_enterprise_page_transform_key_candidates_in_store(store)
+            .map_err(|_| Enterprise24R21TransformKeyResolutionError::StructuralDiscoveryFailed)?;
+    let structural_count = structural_candidates.len();
+    let candidates = structural_candidates
+        .into_iter()
+        .filter_map(|transform_key| {
+            attest_candidate(
+                store,
+                transform_key,
+                CandidateAttestationProfile::AccountingReadinessPageFloor,
+            )
+            .ok()
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        Err(
+            Enterprise24R21TransformKeyResolutionError::NoSemanticCandidate {
+                structural_candidates: structural_count,
+            },
+        )
+    } else {
+        Ok(candidates)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateAttestationProfile {
+    Strict,
+    AccountingReadinessPageFloor,
 }
 
 fn attest_candidate(
     store: &PageStore,
     transform_key: EnterprisePageTransformKey,
+    profile: CandidateAttestationProfile,
 ) -> Result<Enterprise24R21TransformKeyAttestation, CandidateRejection> {
     let tables = collect_materialized_systables(store, transform_key)
         .map_err(|_| CandidateRejection::SysTableCollection)?;
@@ -132,9 +178,11 @@ fn attest_candidate(
         .table_page_count
         .checked_add(syscolumn_table.ext_page_count)
         .ok_or(CandidateRejection::PageCountOverflow)?;
-    if columns.carrier_pages < u64::from(expected_syscolumn_pages) {
-        return Err(CandidateRejection::SysColumnCrossAttestation);
-    }
+    attest_syscolumn_page_profile(
+        profile,
+        columns.carrier_pages,
+        u64::from(expected_syscolumn_pages),
+    )?;
     attest_enterprise24_r21_catalog(&columns.columns)
         .map_err(|_| CandidateRejection::SchemaManifest)?;
 
@@ -184,6 +232,7 @@ enum CandidateRejection {
     SysColumnUnboundedCarrier,
     SysColumnDuplicateRows,
     SysColumnCrossAttestation,
+    SysColumnPageFloorNotRelaxed,
     SchemaManifest,
     TableScan,
     RequiredTableIdConflict,
@@ -234,6 +283,22 @@ fn attest_supported_syscolumn_conflicts(
         }
     }
     Ok(())
+}
+
+fn attest_syscolumn_page_profile(
+    profile: CandidateAttestationProfile,
+    actual: u64,
+    expected: u64,
+) -> Result<(), CandidateRejection> {
+    match profile {
+        CandidateAttestationProfile::Strict if actual < expected => {
+            Err(CandidateRejection::SysColumnCrossAttestation)
+        }
+        CandidateAttestationProfile::AccountingReadinessPageFloor if actual >= expected => {
+            Err(CandidateRejection::SysColumnPageFloorNotRelaxed)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn require_unique_semantic_candidate<T>(
@@ -413,6 +478,34 @@ mod tests {
         assert_eq!(
             attest_supported_syscolumn_conflicts(&columns),
             Err(CandidateRejection::SysColumnDuplicateRows)
+        );
+    }
+
+    #[test]
+    fn accounting_readiness_profile_relaxes_only_an_actual_page_floor_deficit() {
+        assert_eq!(
+            attest_syscolumn_page_profile(CandidateAttestationProfile::Strict, 4, 5),
+            Err(CandidateRejection::SysColumnCrossAttestation)
+        );
+        assert_eq!(
+            attest_syscolumn_page_profile(
+                CandidateAttestationProfile::AccountingReadinessPageFloor,
+                4,
+                5,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            attest_syscolumn_page_profile(
+                CandidateAttestationProfile::AccountingReadinessPageFloor,
+                5,
+                5,
+            ),
+            Err(CandidateRejection::SysColumnPageFloorNotRelaxed)
+        );
+        assert_eq!(
+            attest_syscolumn_page_profile(CandidateAttestationProfile::Strict, 5, 5),
+            Ok(())
         );
     }
 }

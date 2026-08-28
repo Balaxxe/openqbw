@@ -134,6 +134,7 @@ pub use enterprise24_schema_manifest::{
 };
 pub use enterprise24_transform_key::{
     Enterprise24R21TransformKeyAttestation, Enterprise24R21TransformKeyResolutionError,
+    discover_enterprise24_r21_accounting_transform_key_candidates_in_store,
     discover_enterprise24_r21_transform_key_in_store,
 };
 pub use fkgraph::{FkEdge, FkGraphStats, build as build_fk_graph, stats as fk_graph_stats};
