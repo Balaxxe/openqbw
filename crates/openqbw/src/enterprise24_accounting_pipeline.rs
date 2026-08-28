@@ -1010,7 +1010,17 @@ pub fn build_enterprise24_accounting_pipeline(
                     .collect::<Vec<_>>(),
             ) {
                 Ok(carriers) if carriers.len() == rows.records.len() => carriers,
-                _ => {
+                Err(_) => {
+                    diagnostics.blockers.push(
+                        Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
+                            table_id: table.id(),
+                            page: 0,
+                            record: 0,
+                        },
+                    );
+                    continue;
+                }
+                Ok(_) => {
                     diagnostics.blockers.push(
                         Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
                             table_id: table.id(),
@@ -1044,6 +1054,7 @@ pub fn build_enterprise24_accounting_pipeline(
                     }
                     MaterializedGeneralJournalDisposition::SourceOrLink(_)
                     | MaterializedGeneralJournalDisposition::AuxiliaryLinkChain { .. }
+                    | MaterializedGeneralJournalDisposition::TerminalMetadataCarrier { .. }
                     | MaterializedGeneralJournalDisposition::CanonicalZeroAmount(_) => {
                         let provenance = match PostingProvenance::new(
                             format!(
@@ -1107,134 +1118,29 @@ pub fn build_enterprise24_accounting_pipeline(
             continue;
         }
         if table == Enterprise24AccountingTable::CheckLine {
-            let Some(schema) = schemas.get(&table.id()) else {
-                diagnostics.blockers.push(
-                    Enterprise24AccountingPipelineBlocker::IncompleteTableCoverage {
-                        table_id: table.id(),
-                    },
-                );
-                continue;
-            };
-            if validate_check_master_balances_partial(&rows.records, schema).is_err() {
-                diagnostics.blockers.push(
-                    Enterprise24AccountingPipelineBlocker::UnbalancedPostingMasters {
-                        table_id: table.id(),
-                    },
-                );
-            }
-            let evidence = match check_void_evidence_for_partial_rows(&rows.records, schema) {
-                Ok(evidence) => evidence,
-                Err(()) => {
-                    for record in &rows.records {
-                        diagnostics.blockers.push(
-                            Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
-                                table_id: table.id(),
-                                page: record.raw_page_number,
-                                record: record.record_id,
-                            },
-                        );
+            let selected = try_materialized_check_dispositions(rows, &identity_map).or_else(|_| {
+                schemas
+                    .get(&table.id())
+                    .ok_or(())
+                    .and_then(|schema| try_partial_check_dispositions(rows, schema, &identity_map))
+            });
+            diagnostics.posting_candidates += rows.records.len() as u64;
+            match selected {
+                Ok(selected) => {
+                    for disposition in selected {
+                        match &disposition {
+                            PostingDisposition::Posting(_) => diagnostics.normalized_postings += 1,
+                            PostingDisposition::Excluded(_) => diagnostics.excluded_postings += 1,
+                        }
+                        dispositions.push(disposition);
                     }
-                    continue;
                 }
-            };
-            for record in &rows.records {
-                diagnostics.posting_candidates += 1;
-                if let Ok(carrier) = MaterializedCheckVoidCompanionCarrier::parse(&record.bytes) {
-                    let master_evidence = evidence
-                        .get(&u64::from(carrier.master_record_number()))
-                        .copied()
-                        .unwrap_or(CheckVoidCompanionMasterEvidence {
-                            canonical_zero_e4_row_count: 0,
-                            nonzero_posting_row_count: 0,
-                        });
-                    if classify_materialized_check_void_companion(carrier, master_evidence).is_ok()
-                    {
-                        let provenance = match PostingProvenance::new(
-                            format!(
-                                "enterprise24:{}:{}:{}",
-                                table.id(),
-                                record.raw_page_number,
-                                record.record_id
-                            ),
-                            u32::try_from(record.raw_page_number).ok(),
-                            Some(record.record_id),
-                            rows.policy.version,
-                        ) {
-                            Ok(value) => value,
-                            Err(_) => {
-                                diagnostics.blockers.push(
-                                    Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
-                                        table_id: table.id(), page: record.raw_page_number, record: record.record_id,
-                                    },
-                                );
-                                continue;
-                            }
-                        };
-                        diagnostics.excluded_postings += 1;
-                        dispositions.push(
-                            PostingExclusion::new(
-                                provenance,
-                                PostingExclusionReason::SourceOrLinkRow,
-                            )
-                            .into(),
-                        );
-                        continue;
-                    }
+                Err(()) => {
                     diagnostics.blockers.push(
-                        Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
+                        Enterprise24AccountingPipelineBlocker::UnbalancedPostingMasters {
                             table_id: table.id(),
-                            page: record.raw_page_number,
-                            record: record.record_id,
                         },
                     );
-                    continue;
-                }
-                match adapt_enterprise_posting_row_partial(table, schema, &record.partial).and_then(
-                    |adaptation| {
-                        normalized_disposition(
-                            table,
-                            record,
-                            adaptation,
-                            &identity_map,
-                            rows.policy.version,
-                        )
-                        .map_err(|_| {
-                            crate::EnterprisePostingAdapterError::InvalidPostingAmount {
-                                name: "normalization".to_owned(),
-                            }
-                        })
-                    },
-                ) {
-                    Ok(PostingDisposition::Posting(posting)) => {
-                        diagnostics.normalized_postings += 1;
-                        dispositions.push(PostingDisposition::Posting(posting));
-                    }
-                    Ok(PostingDisposition::Excluded(exclusion)) => {
-                        diagnostics.excluded_postings += 1;
-                        dispositions.push(PostingDisposition::Excluded(exclusion));
-                    }
-                    Err(_) => diagnostics.blockers.push(
-                        Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
-                            table_id: table.id(),
-                            page: record.raw_page_number,
-                            record: record.record_id,
-                        },
-                    ),
-                }
-            }
-            continue;
-        }
-        if table == Enterprise24AccountingTable::CheckLine {
-            if validate_check_master_balances(&rows.records).is_err() {
-                diagnostics.blockers.push(
-                    Enterprise24AccountingPipelineBlocker::UnbalancedPostingMasters {
-                        table_id: table.id(),
-                    },
-                );
-            }
-            let evidence = match check_void_evidence_for_rows(&rows.records) {
-                Ok(evidence) => evidence,
-                Err(()) => {
                     for record in &rows.records {
                         diagnostics.blockers.push(
                             Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
@@ -1244,105 +1150,6 @@ pub fn build_enterprise24_accounting_pipeline(
                             },
                         );
                     }
-                    continue;
-                }
-            };
-            for record in &rows.records {
-                diagnostics.posting_candidates += 1;
-                let adaptation = if let Ok(carrier) =
-                    MaterializedCheckVoidCompanionCarrier::parse(&record.bytes)
-                {
-                    let master_evidence = evidence
-                        .get(&u64::from(carrier.master_record_number()))
-                        .copied()
-                        .unwrap_or(CheckVoidCompanionMasterEvidence {
-                            canonical_zero_e4_row_count: 0,
-                            nonzero_posting_row_count: 0,
-                        });
-                    if classify_materialized_check_void_companion(carrier, master_evidence).is_ok()
-                    {
-                        // The fixed carrier is a proven lifecycle sidecar,
-                        // not an accounting line.  Keep only sanitized
-                        // provenance as an explicit exclusion.
-                        let provenance = match PostingProvenance::new(
-                            format!(
-                                "enterprise24:{}:{}:{}",
-                                table.id(),
-                                record.raw_page_number,
-                                record.record_id
-                            ),
-                            u32::try_from(record.raw_page_number).ok(),
-                            Some(record.record_id),
-                            rows.policy.version,
-                        ) {
-                            Ok(provenance) => provenance,
-                            Err(_) => {
-                                diagnostics.blockers.push(
-                                    Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
-                                        table_id: table.id(),
-                                        page: record.raw_page_number,
-                                        record: record.record_id,
-                                    },
-                                );
-                                continue;
-                            }
-                        };
-                        diagnostics.excluded_postings += 1;
-                        dispositions.push(
-                            PostingExclusion::new(
-                                provenance,
-                                PostingExclusionReason::SourceOrLinkRow,
-                            )
-                            .into(),
-                        );
-                        continue;
-                    }
-                    Err(())
-                } else {
-                    MaterializedCheckPostingRow::parse(&record.bytes)
-                        .map_err(|_| ())
-                        .and_then(|row| adapt_materialized_check_posting_row(&row).map_err(|_| ()))
-                };
-                match adaptation {
-                    Ok(adaptation) => match normalized_disposition(
-                        table,
-                        record,
-                        adaptation,
-                        &identity_map,
-                        rows.policy.version,
-                    ) {
-                        Ok(PostingDisposition::Posting(posting)) => {
-                            diagnostics.normalized_postings += 1;
-                            dispositions.push(PostingDisposition::Posting(posting));
-                        }
-                        Ok(PostingDisposition::Excluded(exclusion)) => {
-                            diagnostics.excluded_postings += 1;
-                            dispositions.push(PostingDisposition::Excluded(exclusion));
-                        }
-                        Err(NormalizationFailure::MissingAccountIdentity) => diagnostics
-                            .blockers
-                            .push(
-                                Enterprise24AccountingPipelineBlocker::PostingAccountIdentityUnavailable {
-                                    table_id: table.id(),
-                                    page: record.raw_page_number,
-                                    record: record.record_id,
-                                },
-                            ),
-                        Err(NormalizationFailure::Other) => diagnostics.blockers.push(
-                            Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
-                                table_id: table.id(),
-                                page: record.raw_page_number,
-                                record: record.record_id,
-                            },
-                        ),
-                    },
-                    Err(()) => diagnostics.blockers.push(
-                        Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
-                            table_id: table.id(),
-                            page: record.raw_page_number,
-                            record: record.record_id,
-                        },
-                    ),
                 }
             }
             continue;
@@ -1519,6 +1326,145 @@ pub fn build_enterprise24_accounting_pipeline(
     }
 }
 
+fn check_companion_disposition(
+    record: &Enterprise24PartialRecord,
+    carrier: MaterializedCheckVoidCompanionCarrier,
+    evidence: &BTreeMap<u64, CheckVoidCompanionMasterEvidence>,
+    decoder: &str,
+) -> Result<PostingDisposition, ()> {
+    let master_evidence = evidence
+        .get(&u64::from(carrier.master_record_number()))
+        .copied()
+        .unwrap_or(CheckVoidCompanionMasterEvidence {
+            canonical_zero_e4_row_count: 0,
+            nonzero_posting_row_count: 0,
+        });
+    classify_materialized_check_void_companion(carrier, master_evidence).map_err(|_| ())?;
+    let provenance = PostingProvenance::new(
+        format!(
+            "enterprise24:{}:{}:{}",
+            Enterprise24AccountingTable::CheckLine.id(),
+            record.raw_page_number,
+            record.record_id
+        ),
+        u32::try_from(record.raw_page_number).ok(),
+        Some(record.record_id),
+        decoder,
+    )
+    .map_err(|_| ())?;
+    Ok(PostingExclusion::new(provenance, PostingExclusionReason::SourceOrLinkRow).into())
+}
+
+fn try_materialized_check_dispositions(
+    rows: &Enterprise24PartialTableRows,
+    identity_map: &BTreeMap<u32, AccountId>,
+) -> Result<Vec<PostingDisposition>, ()> {
+    validate_check_master_balances(&rows.records)?;
+    let evidence = check_void_evidence_for_rows(&rows.records)?;
+    let carriers = rows
+        .records
+        .iter()
+        .filter_map(|record| MaterializedCheckVoidCompanionCarrier::parse(&record.bytes).ok())
+        .collect::<Vec<_>>();
+    let mut carrier_counts = BTreeMap::<u32, usize>::new();
+    let mut carrier_targets = std::collections::BTreeSet::new();
+    for carrier in &carriers {
+        *carrier_counts
+            .entry(carrier.master_record_number())
+            .or_default() += 1;
+        if carrier.target_record_number() == carrier.master_record_number()
+            || !carrier_targets.insert(carrier.target_record_number())
+        {
+            return Err(());
+        }
+    }
+    if carrier_counts.values().any(|count| *count != 1) {
+        return Err(());
+    }
+    let posting_targets = rows
+        .records
+        .iter()
+        .filter(|record| MaterializedCheckVoidCompanionCarrier::parse(&record.bytes).is_err())
+        .map(|record| MaterializedCheckPostingRow::parse(&record.bytes).map_err(|_| ()))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|row| row.target_record_number())
+        .collect::<std::collections::BTreeSet<_>>();
+    if !carrier_targets.is_disjoint(&posting_targets) {
+        return Err(());
+    }
+    let mut selected = Vec::with_capacity(rows.records.len());
+    for record in &rows.records {
+        if let Ok(carrier) = MaterializedCheckVoidCompanionCarrier::parse(&record.bytes) {
+            selected.push(check_companion_disposition(
+                record,
+                carrier,
+                &evidence,
+                rows.policy.version,
+            )?);
+            continue;
+        }
+        let row = MaterializedCheckPostingRow::parse(&record.bytes).map_err(|_| ())?;
+        let adaptation = adapt_materialized_check_posting_row(&row).map_err(|_| ())?;
+        selected.push(
+            normalized_disposition(
+                Enterprise24AccountingTable::CheckLine,
+                record,
+                adaptation,
+                identity_map,
+                rows.policy.version,
+            )
+            .map_err(|_| ())?,
+        );
+    }
+    Ok(selected)
+}
+
+fn try_partial_check_dispositions(
+    rows: &Enterprise24PartialTableRows,
+    schema: &RowSchema,
+    identity_map: &BTreeMap<u32, AccountId>,
+) -> Result<Vec<PostingDisposition>, ()> {
+    if rows.records.iter().any(|record| {
+        MaterializedCheckVoidCompanionCarrier::parse(&record.bytes)
+            .is_ok_and(MaterializedCheckVoidCompanionCarrier::is_long_envelope)
+    }) {
+        return Err(());
+    }
+    validate_check_master_balances_partial(&rows.records, schema)?;
+    let evidence = check_void_evidence_for_partial_rows(&rows.records, schema)?;
+    let mut selected = Vec::with_capacity(rows.records.len());
+    for record in &rows.records {
+        if let Ok(carrier) = MaterializedCheckVoidCompanionCarrier::parse(&record.bytes) {
+            selected.push(check_companion_disposition(
+                record,
+                carrier,
+                &evidence,
+                rows.policy.version,
+            )?);
+            continue;
+        }
+        match adapt_enterprise_posting_row_partial(
+            Enterprise24AccountingTable::CheckLine,
+            schema,
+            &record.partial,
+        ) {
+            Ok(adaptation) => selected.push(
+                normalized_disposition(
+                    Enterprise24AccountingTable::CheckLine,
+                    record,
+                    adaptation,
+                    identity_map,
+                    rows.policy.version,
+                )
+                .map_err(|_| ())?,
+            ),
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(selected)
+}
+
 fn check_void_evidence_for_rows(
     rows: &[Enterprise24PartialRecord],
 ) -> Result<BTreeMap<u64, CheckVoidCompanionMasterEvidence>, ()> {
@@ -1560,7 +1506,6 @@ fn check_void_evidence_for_rows(
         .collect())
 }
 
-/// Derive exact void-companion evidence from the schema-attested e4 prefix.
 fn check_void_evidence_for_partial_rows(
     rows: &[Enterprise24PartialRecord],
     schema: &RowSchema,
@@ -1570,18 +1515,20 @@ fn check_void_evidence_for_partial_rows(
         if MaterializedCheckVoidCompanionCarrier::parse(&record.bytes).is_ok() {
             continue;
         }
-        let adaptation = adapt_enterprise_posting_row_partial(
+        let adaptation = match adapt_enterprise_posting_row_partial(
             Enterprise24AccountingTable::CheckLine,
             schema,
             &record.partial,
-        )
-        .map_err(|_| ())?;
+        ) {
+            Ok(adaptation) => adaptation,
+            Err(_) => return Err(()),
+        };
         let (transaction_id, canonical_zero, nonzero) = match adaptation {
             EnterprisePostingAdaptation::Posting(row) => (row.transaction_id, false, true),
             EnterprisePostingAdaptation::Excluded(
                 EnterprisePostingExclusion::CanonicalZeroVoided { transaction_id, .. },
             ) => (transaction_id, true, false),
-            EnterprisePostingAdaptation::Excluded(_) => return Err(()),
+            EnterprisePostingAdaptation::Excluded(_) => continue,
         };
         let entry = counts.entry(transaction_id).or_default();
         if canonical_zero {
@@ -1607,35 +1554,30 @@ fn check_void_evidence_for_partial_rows(
         .collect())
 }
 
-/// Require every non-void Check master to balance under the schema prefix.
 fn validate_check_master_balances_partial(
     rows: &[Enterprise24PartialRecord],
     schema: &RowSchema,
 ) -> Result<(), ()> {
-    let mut totals = BTreeMap::<u64, i128>::new();
+    let mut balances = BTreeMap::<u64, i128>::new();
     for record in rows {
         if MaterializedCheckVoidCompanionCarrier::parse(&record.bytes).is_ok() {
             continue;
         }
-        match adapt_enterprise_posting_row_partial(
+        let adaptation = match adapt_enterprise_posting_row_partial(
             Enterprise24AccountingTable::CheckLine,
             schema,
             &record.partial,
-        )
-        .map_err(|_| ())?
-        {
-            EnterprisePostingAdaptation::Posting(row) => {
-                *totals.entry(row.transaction_id).or_default() += i128::from(row.amount_cents);
-            }
-            EnterprisePostingAdaptation::Excluded(
-                EnterprisePostingExclusion::CanonicalZeroVoided { .. },
-            ) => {}
-            EnterprisePostingAdaptation::Excluded(_) => return Err(()),
+        ) {
+            Ok(adaptation) => adaptation,
+            Err(_) => return Err(()),
+        };
+        if let EnterprisePostingAdaptation::Posting(row) = adaptation {
+            *balances.entry(row.transaction_id).or_default() += i128::from(row.amount_cents);
         }
     }
-    totals
-        .values()
-        .all(|total| *total == 0)
+    balances
+        .into_values()
+        .all(|balance| balance == 0)
         .then_some(())
         .ok_or(())
 }
@@ -1838,6 +1780,31 @@ mod tests {
         }
     }
 
+    fn check_companion_record(
+        target: u32,
+        master: u32,
+        length: usize,
+    ) -> Enterprise24PartialRecord {
+        let mut bytes = vec![0_u8; length];
+        bytes[..2].copy_from_slice(&(length as u16).to_le_bytes());
+        bytes[3] = crate::MATERIALIZED_CHECK_VOID_COMPANION_KIND;
+        bytes[0x0c..0x10].copy_from_slice(&target.to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&master.to_le_bytes());
+        Enterprise24PartialRecord {
+            raw_page_number: 1,
+            record_id: target as u16,
+            partial: PartialDecodedRow {
+                declared_size: bytes.len(),
+                flags: 0,
+                through_ordinal: 0,
+                prefix_values: Vec::new(),
+                boolean_values: Vec::new(),
+                opaque_middle_len: bytes.len(),
+            },
+            bytes,
+        }
+    }
+
     #[test]
     fn policies_are_versioned_and_mark_general_journal_as_dedicated() {
         let check =
@@ -1906,6 +1873,61 @@ mod tests {
 
         let unbalanced_credit = check_record(11, 100, 8, [2, 0x3f, 1, 24]);
         assert!(validate_check_master_balances(&[debit, unbalanced_credit]).is_err());
+    }
+
+    #[test]
+    fn materialized_check_strategy_requires_one_noncolliding_companion_per_master() {
+        let master = 100;
+        let records = vec![
+            check_companion_record(
+                103,
+                master,
+                crate::MATERIALIZED_CHECK_VOID_COMPANION_LONG_LEN,
+            ),
+            check_record(101, master, 7, [0, 0x81, 0, 0]),
+            check_record(102, master, 8, [0, 0x81, 0, 0]),
+        ];
+        let rows = Enterprise24PartialTableRows {
+            policy: enterprise24_r21_partial_table_policy(Enterprise24AccountingTable::CheckLine)
+                .unwrap(),
+            records: records.clone(),
+            coverage: Enterprise24PartialTableCoverage::default(),
+        };
+        let selected = try_materialized_check_dispositions(&rows, &BTreeMap::new()).unwrap();
+        assert_eq!(selected.len(), 3);
+        assert!(
+            selected
+                .iter()
+                .all(|row| matches!(row, PostingDisposition::Excluded(_)))
+        );
+
+        let mut duplicate = records.clone();
+        duplicate.push(check_companion_record(
+            104,
+            master,
+            crate::MATERIALIZED_CHECK_VOID_COMPANION_LONG_LEN,
+        ));
+        let duplicate_rows = Enterprise24PartialTableRows {
+            policy: rows.policy,
+            records: duplicate,
+            coverage: Enterprise24PartialTableCoverage::default(),
+        };
+        assert!(try_materialized_check_dispositions(&duplicate_rows, &BTreeMap::new()).is_err());
+
+        let collision_rows = Enterprise24PartialTableRows {
+            policy: rows.policy,
+            records: vec![
+                check_companion_record(
+                    101,
+                    master,
+                    crate::MATERIALIZED_CHECK_VOID_COMPANION_LONG_LEN,
+                ),
+                check_record(101, master, 7, [0, 0x81, 0, 0]),
+                check_record(102, master, 8, [0, 0x81, 0, 0]),
+            ],
+            coverage: Enterprise24PartialTableCoverage::default(),
+        };
+        assert!(try_materialized_check_dispositions(&collision_rows, &BTreeMap::new()).is_err());
     }
 
     #[test]

@@ -26,6 +26,7 @@ mod decoder_contract;
 mod enterprise24_accounting_pipeline;
 mod enterprise24_accounting_table;
 mod enterprise24_schema_manifest;
+mod enterprise24_transform_key;
 mod enterprise_page_materializer;
 mod enterprise_table_scan;
 mod fkgraph;
@@ -98,8 +99,10 @@ pub use decoder_contract::{
 pub use enterprise_page_materializer::{
     EnterpriseCandidateResolutionError, EnterpriseMaterializedTablePage,
     EnterprisePageMaterializationError, EnterprisePageTransformKey,
-    discover_enterprise_page_transform_key, discover_enterprise_page_transform_key_in_store,
-    materialize_enterprise_table_page, materialize_enterprise_table_page_candidates_with_key,
+    discover_enterprise_page_transform_key, discover_enterprise_page_transform_key_candidates,
+    discover_enterprise_page_transform_key_candidates_in_store,
+    discover_enterprise_page_transform_key_in_store, materialize_enterprise_table_page,
+    materialize_enterprise_table_page_candidates_with_key,
     materialize_enterprise_table_page_with_key, resolve_enterprise_table_page_candidates,
 };
 pub use enterprise_table_scan::{
@@ -128,6 +131,10 @@ pub use enterprise24_schema_manifest::{
     Enterprise24R21SchemaTableManifest, Enterprise24R21ValidatedCatalog,
     attest_enterprise24_r21_catalog, enterprise24_r21_schema_fingerprint,
     validate_enterprise24_r21_schema_manifest,
+};
+pub use enterprise24_transform_key::{
+    Enterprise24R21TransformKeyAttestation, Enterprise24R21TransformKeyResolutionError,
+    discover_enterprise24_r21_transform_key_in_store,
 };
 pub use fkgraph::{FkEdge, FkGraphStats, build as build_fk_graph, stats as fk_graph_stats};
 pub use index_root_map::{
@@ -168,10 +175,13 @@ pub use materialized_check_posting::{
 };
 pub use materialized_check_void_companion::{
     CheckVoidCompanionClassification, CheckVoidCompanionMasterEvidence,
-    MATERIALIZED_CHECK_VOID_COMPANION_FLAGS, MATERIALIZED_CHECK_VOID_COMPANION_KIND,
-    MATERIALIZED_CHECK_VOID_COMPANION_LEN, MATERIALIZED_CHECK_VOID_COMPANION_TABLE_ID,
-    MaterializedCheckVoidCompanionCarrier, MaterializedCheckVoidCompanionError,
-    classify_materialized_check_void_companion,
+    MATERIALIZED_CHECK_VOID_COMPANION_EXTENDED_LEN, MATERIALIZED_CHECK_VOID_COMPANION_FLAGS,
+    MATERIALIZED_CHECK_VOID_COMPANION_KIND, MATERIALIZED_CHECK_VOID_COMPANION_LEN,
+    MATERIALIZED_CHECK_VOID_COMPANION_LONG_LEN, MATERIALIZED_CHECK_VOID_COMPANION_TABLE_ID,
+    MATERIALIZED_CHECK_VOID_COMPANION_VARIABLE_219_LEN,
+    MATERIALIZED_CHECK_VOID_COMPANION_VARIABLE_222_LEN,
+    MATERIALIZED_CHECK_VOID_COMPANION_VARIABLE_223_LEN, MaterializedCheckVoidCompanionCarrier,
+    MaterializedCheckVoidCompanionError, classify_materialized_check_void_companion,
 };
 pub use materialized_deposit_posting::{
     MATERIALIZED_DEPOSIT_COUNTERPART_F0_KIND, MATERIALIZED_DEPOSIT_COUNTERPART_F1_KIND,

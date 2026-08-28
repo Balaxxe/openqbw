@@ -67,8 +67,7 @@ use openqbw::{
     attest_enterprise24_r21_catalog, build_enterprise24_accounting_pipeline,
     collect_enterprise24_bill_table_rows, collect_enterprise24_check_prefix_table_rows,
     collect_enterprise24_general_journal_table_rows, collect_enterprise24_partial_table_rows,
-    collect_materialized_syscolumns, collect_materialized_systables,
-    discover_enterprise_page_transform_key_in_store, iter_lineitems_with_attribution,
+    discover_enterprise24_r21_transform_key_in_store, iter_lineitems_with_attribution,
     iter_transaction_headers, scan_enterprise_table_store,
 };
 use opensqlany::{ApModel, PageStore};
@@ -1112,21 +1111,18 @@ fn build_local_enterprise24_ledger(
     snapshot_id: String,
 ) -> Result<openqbw::Ledger> {
     let store = PageStore::open(input).context("opening local QBW input")?;
-    let transform_key = discover_enterprise_page_transform_key_in_store(&store)
-        .context("discovering Enterprise page materialization key")?;
-    let catalog = collect_materialized_syscolumns(&store, transform_key)
-        .context("collecting bounded Enterprise SYSCOLUMN catalog")?;
+    let attestation = discover_enterprise24_r21_transform_key_in_store(&store)
+        .context("semantically resolving Enterprise 24 R21 page materialization key")?;
+    let (transform_key, tables, catalog) = attestation.into_parts();
     // Validate the whole compatibility catalog before adapting any table. The
     // resulting envelope bytes remain opaque `SYSCOLUMN` metadata; this does
     // not make any claim about application-row defaults or compression.
     let validated_catalog = attest_enterprise24_r21_catalog(&catalog.columns)
         .context("validating complete Enterprise 24 R21 SYSCOLUMN manifest")?;
-    let tables = collect_materialized_systables(&store, transform_key)
-        .context("collecting bounded Enterprise SYSTABLE catalog")?;
-    let required_table_ids: Vec<_> = ENTERPRISE24_R21_SCHEMA_MANIFEST
+    let required_table_ids = ENTERPRISE24_R21_SCHEMA_MANIFEST
         .iter()
         .map(|entry| entry.table_id)
-        .collect();
+        .collect::<Vec<_>>();
     tables
         .require_unambiguous_tables(&required_table_ids)
         .context("attesting unambiguous materialized SYSTABLE expectations for required tables")?;

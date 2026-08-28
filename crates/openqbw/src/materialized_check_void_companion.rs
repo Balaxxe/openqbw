@@ -15,6 +15,16 @@ pub const MATERIALIZED_CHECK_VOID_COMPANION_FLAGS: u8 = 0;
 pub const MATERIALIZED_CHECK_VOID_COMPANION_KIND: u8 = 0x64;
 /// Exact bounded byte length of the observed companion carrier.
 pub const MATERIALIZED_CHECK_VOID_COMPANION_LEN: usize = 185;
+/// Exact bounded byte length of the longer observed companion carrier.
+pub const MATERIALIZED_CHECK_VOID_COMPANION_LONG_LEN: usize = 212;
+/// Exact bounded byte length of the extended observed companion carrier.
+pub const MATERIALIZED_CHECK_VOID_COMPANION_EXTENDED_LEN: usize = 220;
+/// Exact bounded byte length of the first variable companion carrier.
+pub const MATERIALIZED_CHECK_VOID_COMPANION_VARIABLE_219_LEN: usize = 219;
+/// Exact bounded byte length of the second variable companion carrier.
+pub const MATERIALIZED_CHECK_VOID_COMPANION_VARIABLE_222_LEN: usize = 222;
+/// Exact bounded byte length of the third variable companion carrier.
+pub const MATERIALIZED_CHECK_VOID_COMPANION_VARIABLE_223_LEN: usize = 223;
 
 const TARGET_OFFSET: usize = 0x0c;
 const MASTER_OFFSET: usize = 0x10;
@@ -24,12 +34,21 @@ const MASTER_OFFSET: usize = 0x10;
 pub struct MaterializedCheckVoidCompanionCarrier {
     target_record_number: u32,
     master_record_number: u32,
+    envelope_len: usize,
 }
 
 impl MaterializedCheckVoidCompanionCarrier {
     /// Parse only the exact fixed-shape table-3047 companion carrier.
     pub fn parse(input: &[u8]) -> Result<Self, MaterializedCheckVoidCompanionError> {
-        if input.len() != MATERIALIZED_CHECK_VOID_COMPANION_LEN {
+        if !matches!(
+            input.len(),
+            MATERIALIZED_CHECK_VOID_COMPANION_LEN
+                | MATERIALIZED_CHECK_VOID_COMPANION_LONG_LEN
+                | MATERIALIZED_CHECK_VOID_COMPANION_EXTENDED_LEN
+                | MATERIALIZED_CHECK_VOID_COMPANION_VARIABLE_219_LEN
+                | MATERIALIZED_CHECK_VOID_COMPANION_VARIABLE_222_LEN
+                | MATERIALIZED_CHECK_VOID_COMPANION_VARIABLE_223_LEN
+        ) {
             return Err(MaterializedCheckVoidCompanionError::LengthMismatch {
                 actual: input.len(),
             });
@@ -64,6 +83,7 @@ impl MaterializedCheckVoidCompanionCarrier {
         Ok(Self {
             target_record_number,
             master_record_number,
+            envelope_len: input.len(),
         })
     }
 
@@ -77,6 +97,12 @@ impl MaterializedCheckVoidCompanionCarrier {
     #[must_use]
     pub const fn master_record_number(self) -> u32 {
         self.master_record_number
+    }
+
+    /// Whether this candidate uses either longer independently observed envelope.
+    #[must_use]
+    pub const fn is_long_envelope(self) -> bool {
+        self.envelope_len != MATERIALIZED_CHECK_VOID_COMPANION_LEN
     }
 }
 
@@ -128,9 +154,7 @@ pub fn classify_materialized_check_void_companion(
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum MaterializedCheckVoidCompanionError {
     /// The bounded carrier did not have the sole calibrated length.
-    #[error(
-        "Check void companion length was {actual}, expected {MATERIALIZED_CHECK_VOID_COMPANION_LEN}"
-    )]
+    #[error("Check void companion length {actual} is not one of the calibrated exact envelopes")]
     LengthMismatch {
         /// Actual bounded byte length.
         actual: usize,
@@ -202,6 +226,34 @@ mod tests {
             ),
             Ok(CheckVoidCompanionClassification::VoidCompanionCarrier)
         );
+    }
+
+    #[test]
+    fn parses_the_long_companion_envelope_with_the_same_fixed_identity() {
+        for envelope_len in [
+            MATERIALIZED_CHECK_VOID_COMPANION_LONG_LEN,
+            MATERIALIZED_CHECK_VOID_COMPANION_VARIABLE_219_LEN,
+            MATERIALIZED_CHECK_VOID_COMPANION_EXTENDED_LEN,
+            MATERIALIZED_CHECK_VOID_COMPANION_VARIABLE_222_LEN,
+            MATERIALIZED_CHECK_VOID_COMPANION_VARIABLE_223_LEN,
+        ] {
+            let mut long = sample();
+            long.resize(envelope_len, 0);
+            let length = long.len() as u16;
+            long[..2].copy_from_slice(&length.to_le_bytes());
+            let carrier = MaterializedCheckVoidCompanionCarrier::parse(&long).unwrap();
+            assert_eq!(carrier.target_record_number(), SAMPLE_TARGET);
+            assert_eq!(carrier.master_record_number(), SAMPLE_MASTER);
+            assert!(carrier.is_long_envelope());
+        }
+
+        let mut unsupported = sample();
+        unsupported.resize(221, 0);
+        unsupported[..2].copy_from_slice(&221_u16.to_le_bytes());
+        assert!(matches!(
+            MaterializedCheckVoidCompanionCarrier::parse(&unsupported),
+            Err(MaterializedCheckVoidCompanionError::LengthMismatch { actual: 221 })
+        ));
     }
 
     #[test]
