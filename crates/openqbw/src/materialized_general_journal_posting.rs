@@ -407,6 +407,7 @@ const PRODUCTION_PREFIX_OFFSET: usize = 0x04;
 const PRODUCTION_LINK_MARKER_OFFSET: usize = 0x05;
 const PRODUCTION_PREFIX_REQUIRED_BYTE: usize = 0x06;
 const PRODUCTION_PREFIX_REQUIRED_VALUE: u8 = 0xff;
+const PRODUCTION_SHORT_E4_PREFIX_VALUE: u8 = 0x9f;
 const PRODUCTION_TARGET: usize = 0x0b;
 const PRODUCTION_MASTER: usize = 0x0f;
 const PRODUCTION_ACCOUNT: usize = 0x13;
@@ -464,15 +465,23 @@ impl MaterializedGeneralJournalPostingRow {
                 );
             }
         };
-        if input[PRODUCTION_PREFIX_REQUIRED_BYTE] != PRODUCTION_PREFIX_REQUIRED_VALUE {
+        let link_marker = input[PRODUCTION_LINK_MARKER_OFFSET];
+        let link_class = link_marker & 0x7f;
+        let linked = link_marker & 0x80 != 0;
+        let is_short_e4_terminal = family == 0xe4
+            && !linked
+            && link_class == 0x13
+            && input.len() == 129
+            && input[PRODUCTION_PREFIX_REQUIRED_BYTE] == PRODUCTION_SHORT_E4_PREFIX_VALUE;
+        if input[PRODUCTION_PREFIX_REQUIRED_BYTE] != PRODUCTION_PREFIX_REQUIRED_VALUE
+            && !is_short_e4_terminal
+        {
             return Err(
                 MaterializedGeneralJournalProductionRowError::UnexpectedPrefixByte {
                     actual: input[PRODUCTION_PREFIX_REQUIRED_BYTE],
                 },
             );
         }
-        let link_marker = input[PRODUCTION_LINK_MARKER_OFFSET];
-        let link_class = link_marker & 0x7f;
         let is_e4_prebase_variant = family == 0xe4 && link_class == 0x03;
         if link_class != 0x13 && !(family == 0xe8 && link_class == 0x17) && !is_e4_prebase_variant {
             return Err(
@@ -481,7 +490,6 @@ impl MaterializedGeneralJournalPostingRow {
                 },
             );
         }
-        let linked = link_marker & 0x80 != 0;
         let target_record_number =
             production_required_reference(input, PRODUCTION_TARGET, "target")?;
         let master_record_number =
@@ -507,7 +515,9 @@ impl MaterializedGeneralJournalPostingRow {
             } else {
                 0
             };
-        let (amount_position, amount) = if is_e4_prebase_variant {
+        let (amount_position, amount) = if is_short_e4_terminal {
+            select_short_e4_terminal_amount(input, base)?
+        } else if is_e4_prebase_variant {
             select_fixed_prebase_amount(input, base, 8)?
         } else {
             select_main_amount(input, family, linked, base)?
@@ -1181,6 +1191,33 @@ fn select_fixed_prebase_amount(
     ))
 }
 
+fn select_short_e4_terminal_amount(
+    input: &[u8],
+    base: usize,
+) -> Result<
+    (
+        MaterializedGeneralJournalAmountPosition,
+        MaterializedPostingCents,
+    ),
+    MaterializedGeneralJournalProductionRowError,
+> {
+    let primary = base
+        .checked_sub(27)
+        .ok_or(MaterializedGeneralJournalProductionRowError::NoBoundedAmountToken { base })?;
+    let copy = base
+        .checked_add(17)
+        .ok_or(MaterializedGeneralJournalProductionRowError::NoBoundedAmountToken { base })?;
+    let (len, amount) = bounded_token(input, primary)
+        .ok_or(MaterializedGeneralJournalProductionRowError::NoBoundedAmountToken { base })?;
+    if len != 3 || input.get(copy..copy + len) != input.get(primary..primary + len) {
+        return Err(MaterializedGeneralJournalProductionRowError::MissingAmountCopy);
+    }
+    Ok((
+        MaterializedGeneralJournalAmountPosition::MainPrebase,
+        amount,
+    ))
+}
+
 /// Parses only the complete-coverage canonical-zero branch of an otherwise
 /// attested main-envelope row.  A nonzero amount is deliberately returned as
 /// `None`; it must pass the ordinary posting parser instead.
@@ -1535,7 +1572,7 @@ fn classify_auxiliary_link_chain(
                         && collision.signed_cents() != 0
                         && !has_later_copy(row, collision_offset, collision_len) => {}
                 None if indices.len() < 6
-                    && !(0..row.len().saturating_sub(1))
+                    && !(PRODUCTION_FIXED_END..row.len().saturating_sub(1))
                         .any(|offset| bounded_token(row, offset).is_some()) => {}
                 _ => {
                     return Err(
@@ -2090,6 +2127,50 @@ mod tests {
     }
 
     #[test]
+    fn short_e4_terminal_requires_its_exact_primary_and_copy_positions() {
+        let mut row = production_row(&[]);
+        row.resize(129, 0);
+        row[..2].copy_from_slice(&129_u16.to_le_bytes());
+        row[4..11].copy_from_slice(&[0xe4, 0x13, 0x9f, 0xc0, 0x60, 0x80, 0x20]);
+        let base = PRODUCTION_AMOUNT_BASE + 4;
+        row[base - 27..base - 24].copy_from_slice(&[1, 0xbf, 7]);
+        row[base + 17..base + 20].copy_from_slice(&[1, 0xbf, 7]);
+        let posting = MaterializedGeneralJournalPostingRow::parse(&row).unwrap();
+        assert_eq!(posting.signed_cents(), 7);
+
+        let mut changed_copy = row.clone();
+        changed_copy[base + 19] ^= 1;
+        assert!(MaterializedGeneralJournalPostingRow::parse(&changed_copy).is_err());
+
+        let mut shifted = row.clone();
+        shifted[base - 27..base - 24].fill(0);
+        shifted[base - 26..base - 23].copy_from_slice(&[1, 0xbf, 7]);
+        assert!(MaterializedGeneralJournalPostingRow::parse(&shifted).is_err());
+
+        let mut wrong_length = row.clone();
+        wrong_length.resize(130, 0);
+        wrong_length[..2].copy_from_slice(&130_u16.to_le_bytes());
+        assert!(MaterializedGeneralJournalPostingRow::parse(&wrong_length).is_err());
+
+        let mut ordinary_prefix = row.clone();
+        ordinary_prefix[PRODUCTION_PREFIX_REQUIRED_BYTE] = PRODUCTION_PREFIX_REQUIRED_VALUE;
+        assert!(MaterializedGeneralJournalPostingRow::parse(&ordinary_prefix).is_err());
+
+        assert!(
+            validate_materialized_general_journal_master_balances(std::slice::from_ref(&posting))
+                .is_err()
+        );
+        let mut opposite = production_row(&[1, 0x3f, 7]);
+        opposite[PRODUCTION_TARGET..PRODUCTION_TARGET + 4]
+            .copy_from_slice(&0x0100_0004_u32.to_le_bytes());
+        let opposite = MaterializedGeneralJournalPostingRow::parse(&opposite).unwrap();
+        assert_eq!(
+            validate_materialized_general_journal_master_balances(&[posting, opposite]),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn direct_e0_overlap_prefers_unique_copy_then_canonical_base() {
         let base = PRODUCTION_AMOUNT_BASE + PRODUCTION_AMOUNT_LINKED_SHIFT;
         let mut unique = vec![0_u8; base + 32];
@@ -2530,6 +2611,47 @@ mod tests {
             auxiliary_row(target_d, SAMPLE_ACCOUNT_A, false),
         ];
         assert!(classify_materialized_general_journal_rows(&four_node).is_ok());
+
+        let mut header_false_positive_linked =
+            auxiliary_row(SAMPLE_TARGET_A, SAMPLE_TARGET_B, true);
+        let mut header_false_positive_terminal =
+            auxiliary_row(SAMPLE_TARGET_B, SAMPLE_ACCOUNT_A, false);
+        for row in [
+            &mut header_false_positive_linked,
+            &mut header_false_positive_terminal,
+        ] {
+            row[18..20].copy_from_slice(&[0, 0x81]);
+        }
+        let corroborated_account = u32_at(&header_false_positive_linked, PRODUCTION_ACCOUNT);
+        header_false_positive_terminal[PRODUCTION_NEXT_TARGET..PRODUCTION_NEXT_TARGET + 4]
+            .copy_from_slice(&corroborated_account.to_le_bytes());
+        assert!(
+            classify_materialized_general_journal_rows(&[
+                header_false_positive_linked.clone(),
+                header_false_positive_terminal.clone(),
+            ])
+            .is_ok()
+        );
+
+        let mut boundary_payload = header_false_positive_terminal.clone();
+        boundary_payload[PRODUCTION_FIXED_END..PRODUCTION_FIXED_END + 3]
+            .copy_from_slice(&[1, 0x3f, 7]);
+        assert!(
+            classify_materialized_general_journal_rows(&[
+                header_false_positive_linked.clone(),
+                boundary_payload,
+            ])
+            .is_err()
+        );
+
+        header_false_positive_terminal[0x40..0x42].copy_from_slice(&[0, 0x81]);
+        assert!(
+            classify_materialized_general_journal_rows(&[
+                header_false_positive_linked,
+                header_false_positive_terminal,
+            ])
+            .is_err()
+        );
 
         let disconnected_cycle = [
             auxiliary_row(SAMPLE_TARGET_A, SAMPLE_TARGET_B, true),
