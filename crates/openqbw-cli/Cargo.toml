@@ -27,6 +27,8 @@ opensqlany = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 rusqlite = { workspace = true }
+same-file = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

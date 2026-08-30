@@ -1,8 +1,8 @@
 //! SA17 date and counter epoch utilities (Phase 6, WP-6C).
 //!
-//! SA17 stores calendar dates as `u32` "SA-days" where SA-day 0 maps to
-//! the Unix date 1980-12-31 (i.e. SA-day 1 = 1981-01-01). The offset to
-//! the Unix epoch is therefore:
+//! SA17 stores calendar dates as `u32` "SA-days".  The decoder treats zero
+//! as a missing placeholder; the supported conversion is anchored solely by
+//! the recovered offset below. The offset to the Unix epoch is:
 //!
 //! ```text
 //!     unix_day = sa_day - DATE_EPOCH_DAYS_BEFORE_UNIX_NEG
@@ -19,8 +19,8 @@
 //! tuple and are unaffected by the epoch.
 
 /// SA-day -> Unix-day offset: `unix_day = sa_day - DATE_EPOCH_DAYS_BEFORE_UNIX`.
-/// Equivalently, SA-day 0 = Unix-day -4017 = 1956-12-?? -- but we use the
-/// "SA-day 4017 = Unix-day 0" framing throughout the codebase.
+/// Equivalently, SA-day 4017 is Unix-day 0.  SA-day zero is not a valid
+/// source date and is never converted.
 pub const DATE_EPOCH_DAYS_BEFORE_UNIX: i64 = 4017;
 
 /// Lower plausibility bound for SA-day values: any `sa_day < 1` is
@@ -48,7 +48,7 @@ pub fn sa_day_to_unix_day(sa_day: u32) -> Option<i64> {
 /// window.
 pub fn unix_day_to_sa_day(unix_day: i64) -> Option<u32> {
     let v = unix_day + DATE_EPOCH_DAYS_BEFORE_UNIX;
-    if v < 0 || v > SA_DAY_MAX_PLAUSIBLE as i64 {
+    if !(i64::from(SA_DAY_MIN_PLAUSIBLE)..=i64::from(SA_DAY_MAX_PLAUSIBLE)).contains(&v) {
         return None;
     }
     Some(v as u32)
@@ -104,5 +104,10 @@ mod tests {
     #[test]
     fn negative_unix_day_rejected_for_sa_conversion() {
         assert_eq!(unix_day_to_sa_day(-5000), None);
+    }
+
+    #[test]
+    fn inverse_rejects_the_zero_placeholder() {
+        assert_eq!(unix_day_to_sa_day(-DATE_EPOCH_DAYS_BEFORE_UNIX), None);
     }
 }

@@ -268,6 +268,12 @@ pub enum MaterializedCheckPostingRowError {
     /// The bounded base-100 amount did not fit signed cents.
     #[error("materialized Check amount exceeded signed cents")]
     AmountOverflow,
+    /// The row contains bytes outside every explicitly calibrated amount envelope.
+    #[error("materialized Check amount has no attested envelope in a {segment_len}-byte segment")]
+    UnattestedAmountEnvelope {
+        /// Exact declared row length that did not match a calibrated envelope.
+        segment_len: usize,
+    },
     /// Neither controlled shape supplied a nonzero source account at its shape-specific offset.
     #[error("materialized Check {shape:?} row lacks a source account")]
     MissingSourceAccount {
@@ -304,37 +310,59 @@ fn decode_shape_amount(
                 field
             }
         };
-    match decode_amount(amount, input.len()) {
-        Ok(decoded) => Ok(decoded),
-        Err(primary_error) => match decode_repeated_tail_amount(input) {
-            RepeatedTailAmount::Decoded(decoded) => Ok(decoded),
-            RepeatedTailAmount::Malformed => Err(primary_error),
-            RepeatedTailAmount::NotApplicable => {
-                // Enterprise 24 also materializes the same Check amount field
-                // after one of three longer nullable/variable envelopes.  Accept
-                // an alternate envelope only when exactly one bounded amount is
-                // repeated later byte-for-byte in the same row.
-                let candidates = [0x4f_usize, 0x6a, 0x6d, 0x7d]
-                    .into_iter()
-                    .filter_map(|candidate_offset| {
-                        let tail = input.get(candidate_offset..)?;
-                        let digits = usize::from(*tail.first()?);
-                        let token_len = 2_usize.checked_add(digits)?;
-                        let token = tail.get(..token_len)?;
-                        let decoded = decode_amount(token, input.len()).ok()?;
-                        let repeated = (candidate_offset + token_len..input.len())
-                            .any(|later| input.get(later..later + token_len) == Some(token));
-                        repeated.then_some(decoded)
-                    })
-                    .collect::<Vec<_>>();
-                match candidates.first().copied() {
-                    Some(decoded) if candidates.iter().all(|candidate| *candidate == decoded) => {
-                        Ok(decoded)
-                    }
-                    _ => Err(primary_error),
-                }
-            }
+    // A direct field is attested only when it consumes the whole bounded
+    // carrier.  Parsing a valid numeric prefix while ignoring arbitrary
+    // declared bytes would turn an unknown row revision into a current
+    // accounting posting.
+    let direct_token_len = amount
+        .first()
+        .and_then(|digits| usize::from(*digits).checked_add(2));
+    let direct_is_exact =
+        direct_token_len.and_then(|length| offset.checked_add(length)) == Some(input.len());
+    let primary_error = match decode_amount(amount, input.len()) {
+        // Preserve a malformed numeric diagnostic even if the surrounding
+        // envelope is not recognized.
+        Err(error) => error,
+        Ok(decoded) if direct_is_exact => return Ok(decoded),
+        Ok(_) => MaterializedCheckPostingRowError::UnattestedAmountEnvelope {
+            segment_len: input.len(),
         },
+    };
+    match decode_repeated_tail_amount(input) {
+        RepeatedTailAmount::Decoded(decoded) => Ok(decoded),
+        RepeatedTailAmount::Malformed => Err(primary_error),
+        RepeatedTailAmount::NotApplicable => {
+            // Enterprise 24 also materializes the same Check amount field
+            // after one of three longer nullable/variable envelopes.  Accept
+            // an alternate envelope only when exactly one bounded amount is
+            // repeated later byte-for-byte in the same row.
+            // The only non-tail alternative calibrated so far is the
+            // fixed 0x90-byte nullable envelope.  It carries exactly two
+            // matching copies at the fixed offsets below.
+            if input.len() != 0x90 {
+                return Err(primary_error);
+            }
+            let candidates = [0x6d_usize, 0x80]
+                .into_iter()
+                .filter_map(|candidate_offset| {
+                    let tail = input.get(candidate_offset..)?;
+                    let digits = usize::from(*tail.first()?);
+                    let token_len = 2_usize.checked_add(digits)?;
+                    let token = tail.get(..token_len)?;
+                    let decoded = decode_amount(token, input.len()).ok()?;
+                    input
+                        .get(if candidate_offset == 0x6d { 0x80 } else { 0x6d }..)
+                        .is_some_and(|other| other.get(..token_len) == Some(token))
+                        .then_some(decoded)
+                })
+                .collect::<Vec<_>>();
+            match candidates.first().copied() {
+                Some(decoded) if candidates.iter().all(|candidate| *candidate == decoded) => {
+                    Ok(decoded)
+                }
+                _ => Err(primary_error),
+            }
+        }
     }
 }
 
@@ -574,6 +602,26 @@ mod tests {
         ambiguous[0x4f..0x4f + other.len()].copy_from_slice(&other);
         ambiguous[0x94..0x94 + other.len()].copy_from_slice(&other);
         assert!(MaterializedCheckPostingRow::parse(&ambiguous).is_err());
+    }
+
+    #[test]
+    fn rejects_a_valid_amount_prefix_with_unattested_declared_tail_bytes() {
+        let mut extended = row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            None,
+            &[2, 0xbf, 41, 37],
+            SAMPLE_EDIT_BEFORE,
+        );
+        extended.extend_from_slice(&[0xde, 0xad]);
+        let extended_len = extended.len();
+        extended[..2].copy_from_slice(&(extended_len as u16).to_le_bytes());
+        assert_eq!(
+            MaterializedCheckPostingRow::parse(&extended),
+            Err(MaterializedCheckPostingRowError::UnattestedAmountEnvelope {
+                segment_len: extended_len,
+            })
+        );
     }
 
     #[test]

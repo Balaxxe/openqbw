@@ -236,7 +236,8 @@ pub use partial_row::{
 };
 pub use physical_carrier_census::{
     AdjacentPageStructuralSummary, ContinuationPrefixProvenance, MAX_CONTINUATION_PREFIX_LEN,
-    PhysicalCarrierCensus, PhysicalCarrierPage, PhysicalCarrierPageStatus, SlotDirectoryCensus,
+    MAX_UNCLASSIFIED_PREFIX_LEN, PhysicalCarrierCensus, PhysicalCarrierPage,
+    PhysicalCarrierPageStatus, SlotDirectoryCensus, UnclassifiedPrefixProvenance,
     census_decoded_physical_carrier_page, census_physical_carriers,
 };
 pub use quickbooks_balance::{

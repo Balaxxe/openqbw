@@ -368,6 +368,16 @@ pub enum MaterializedDepositPostingRowError {
     /// The controlled numeric value did not fit signed cents.
     #[error("materialized Deposit amount exceeded signed cents")]
     AmountOverflow,
+    /// Bytes followed a complete controlled amount token.
+    #[error(
+        "materialized Deposit posting row has unrecognized bytes after its amount token: amount ends at {amount_end}, segment is {segment_len} bytes"
+    )]
+    UnexpectedTrailingAmountData {
+        /// First byte after the count-prefixed amount token.
+        amount_end: usize,
+        /// Exact bounded row length.
+        segment_len: usize,
+    },
 }
 
 fn ensure_minimum(input: &[u8], minimum: usize) -> Result<(), MaterializedDepositPostingRowError> {
@@ -394,6 +404,27 @@ fn decode_amount(
     input: &[u8],
     amount_offset: usize,
 ) -> Result<(i64, bool), MaterializedDepositPostingRowError> {
+    let token_len = input
+        .first()
+        .and_then(|digits| usize::from(*digits).checked_add(2))
+        .ok_or(MaterializedDepositPostingRowError::AmountOutsideSegment {
+            digits: 0,
+            segment_len: input.len() + amount_offset,
+        })?;
+    if token_len > input.len() {
+        return Err(MaterializedDepositPostingRowError::AmountOutsideSegment {
+            digits: usize::from(input[0]),
+            segment_len: input.len() + amount_offset,
+        });
+    }
+    if token_len < input.len() {
+        return Err(
+            MaterializedDepositPostingRowError::UnexpectedTrailingAmountData {
+                amount_end: amount_offset + token_len,
+                segment_len: input.len() + amount_offset,
+            },
+        );
+    }
     let amount = MaterializedPostingCents::parse(input).map_err(|error| match error {
         MaterializedPostingCentsError::TokenTooShort { .. }
         | MaterializedPostingCentsError::DigitsOutsideToken { digits: 0, .. } => {
@@ -549,6 +580,25 @@ mod tests {
         assert!(matches!(
             MaterializedDepositPostingRow::parse(&truncated),
             Err(MaterializedDepositPostingRowError::AmountOutsideSegment { .. })
+        ));
+    }
+
+    #[test]
+    fn parser_rejects_trailing_amount_data() {
+        let mut input = row(
+            MATERIALIZED_DEPOSIT_POSTING_KIND,
+            1,
+            2,
+            Some(3),
+            4,
+            &[1, 0xbf, 1],
+        );
+        input.push(0);
+        let length = input.len() as u16;
+        input[..2].copy_from_slice(&length.to_le_bytes());
+        assert!(matches!(
+            MaterializedDepositPostingRow::parse(&input),
+            Err(MaterializedDepositPostingRowError::UnexpectedTrailingAmountData { .. })
         ));
     }
 

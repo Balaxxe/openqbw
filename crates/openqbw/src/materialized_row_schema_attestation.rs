@@ -18,9 +18,9 @@ use opensqlany::{
 use thiserror::Error;
 
 use crate::{
-    CatalogCoverageAttestation, CatalogDefaultAttestation, CatalogDefaultEnvelope,
-    EnterpriseMaterializedTablePage, EnterpriseTablePageCandidateGroup, EnterpriseTableScan,
-    RowStorageAttestation, SchemaAdapterError, SysColumn, adapt_complete_schema,
+    CatalogCoverageAttestation, CatalogDefaultAttestation, EnterpriseMaterializedTablePage,
+    EnterpriseTablePageCandidateGroup, EnterpriseTableScan, RowStorageAttestation,
+    SchemaAdapterError, SysColumn, adapt_complete_schema,
 };
 
 /// Caller-attested coverage of all bounded materialized records for one table.
@@ -194,10 +194,13 @@ pub struct RejectedTableRowStorageLayout {
 /// selected only when exactly one candidate succeeds, or all successful
 /// candidate outcomes are equal.  Missing slots and row-reference artifacts
 /// are retained explicitly and are excluded from the independently attested
-/// self-contained logical-row count.
+/// self-contained logical-row count. `defaults` must be supplied from evidence
+/// independent of `columns`; this wrapper never treats catalog bytes as their
+/// own attestation.
 pub fn attest_and_resolve_materialized_table_schema(
     columns: &[SysColumn],
     catalog_coverage: CatalogCoverageAttestation,
+    defaults: CatalogDefaultAttestation<'_>,
     scan: &EnterpriseTableScan,
     table_coverage: MaterializedTableCoverageAttestation,
     tested_overflow_pointer_widths: &[u8],
@@ -248,10 +251,6 @@ pub fn attest_and_resolve_materialized_table_schema(
         });
     }
 
-    let default_envelopes = exact_default_envelopes(columns);
-    let defaults = CatalogDefaultAttestation {
-        envelopes: &default_envelopes,
-    };
     let layouts = supported_storage_layouts(columns, tested_overflow_pointer_widths)?;
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
@@ -385,10 +384,12 @@ fn decode_candidate_page(
 /// layouts are varied only when Boolean columns are present; otherwise their
 /// choice is observationally irrelevant and is canonicalized to `Bytes`.  The same
 /// canonicalization avoids artificial ambiguity for overflow choices when the
-/// table has no variable columns.
+/// table has no variable columns. `defaults` must be supplied from evidence
+/// independent of `columns`; this wrapper never derives it from catalog rows.
 pub fn attest_materialized_row_schema(
     columns: &[SysColumn],
     catalog_coverage: CatalogCoverageAttestation,
+    defaults: CatalogDefaultAttestation<'_>,
     rows: &[MaterializedRowRecord<'_>],
     row_coverage: MaterializedRowCoverageAttestation,
     tested_overflow_pointer_widths: &[u8],
@@ -416,11 +417,6 @@ pub fn attest_materialized_row_schema(
             table_id: row_coverage.table_id(),
         });
     }
-
-    let default_envelopes = exact_default_envelopes(columns);
-    let defaults = CatalogDefaultAttestation {
-        envelopes: &default_envelopes,
-    };
 
     let layouts = supported_storage_layouts(columns, tested_overflow_pointer_widths)?;
 
@@ -473,18 +469,6 @@ pub fn attest_materialized_row_schema(
             layouts: accepted.into_iter().map(|(storage, _)| storage).collect(),
         }),
     }
-}
-
-fn exact_default_envelopes(columns: &[SysColumn]) -> Vec<CatalogDefaultEnvelope<'_>> {
-    columns
-        .iter()
-        .filter(|column| column.row_flags != 0 || !column.post_name_bytes.is_empty())
-        .map(|column| CatalogDefaultEnvelope {
-            column_id: column.column_id,
-            row_flags: column.row_flags,
-            post_name_bytes: &column.post_name_bytes,
-        })
-        .collect()
 }
 
 fn supported_storage_layouts(
@@ -732,7 +716,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{EnterprisePageTransformKey, scan_enterprise_table_pages};
+    use crate::{CatalogDefaultEnvelope, EnterprisePageTransformKey, scan_enterprise_table_pages};
 
     fn column(id: u32, domain_id: u16, width: u32) -> SysColumn {
         SysColumn {
@@ -854,6 +838,7 @@ mod tests {
         let result = attest_materialized_row_schema(
             &columns,
             CatalogCoverageAttestation::new(9001, 4).unwrap(),
+            CatalogDefaultAttestation::none(),
             &rows,
             MaterializedRowCoverageAttestation::new(9001, 1).unwrap(),
             &[],
@@ -877,6 +862,7 @@ mod tests {
             attest_materialized_row_schema(
                 &columns,
                 CatalogCoverageAttestation::new(9001, 2).unwrap(),
+                CatalogDefaultAttestation::none(),
                 &rows,
                 MaterializedRowCoverageAttestation::new(9001, 1).unwrap(),
                 &[4],
@@ -895,6 +881,7 @@ mod tests {
             attest_materialized_row_schema(
                 &columns,
                 CatalogCoverageAttestation::new(9001, 1).unwrap(),
+                CatalogDefaultAttestation::none(),
                 &rows,
                 MaterializedRowCoverageAttestation::new(9001, 1).unwrap(),
                 &[],
@@ -913,6 +900,7 @@ mod tests {
             attest_materialized_row_schema(
                 &columns,
                 CatalogCoverageAttestation::new(9001, 1).unwrap(),
+                CatalogDefaultAttestation::none(),
                 &rows,
                 MaterializedRowCoverageAttestation::new(9001, 2).unwrap(),
                 &[],
@@ -934,6 +922,7 @@ mod tests {
             attest_materialized_row_schema(
                 &columns,
                 CatalogCoverageAttestation::new(9001, 1).unwrap(),
+                CatalogDefaultAttestation::none(),
                 &rows,
                 MaterializedRowCoverageAttestation::new(9001, 1).unwrap(),
                 &[4],
@@ -950,10 +939,18 @@ mod tests {
         let page = record_page(&row(&[9, 0]));
         let parsed = MaterializedTablePage::parse(&page).unwrap();
         let rows = [parsed.record(0).unwrap()];
+        let defaults = [CatalogDefaultEnvelope {
+            column_id: 1,
+            row_flags: 0x80,
+            post_name_bytes: &[0x02, b'D', b'F'],
+        }];
         assert!(
             attest_materialized_row_schema(
                 &columns,
                 CatalogCoverageAttestation::new(9001, 1).unwrap(),
+                CatalogDefaultAttestation {
+                    envelopes: &defaults,
+                },
                 &rows,
                 MaterializedRowCoverageAttestation::new(9001, 1).unwrap(),
                 &[],
@@ -963,10 +960,34 @@ mod tests {
     }
 
     #[test]
+    fn defaults_must_be_supplied_by_the_caller() {
+        let mut columns = vec![column(1, 2, 2)];
+        columns[0].row_flags = 0x80;
+        columns[0].post_name_bytes = vec![0x02, b'D', b'F'];
+        let page = record_page(&row(&[9, 0]));
+        let parsed = MaterializedTablePage::parse(&page).unwrap();
+        let rows = [parsed.record(0).unwrap()];
+        assert!(matches!(
+            attest_materialized_row_schema(
+                &columns,
+                CatalogCoverageAttestation::new(9001, 1).unwrap(),
+                CatalogDefaultAttestation::none(),
+                &rows,
+                MaterializedRowCoverageAttestation::new(9001, 1).unwrap(),
+                &[],
+            ),
+            Err(MaterializedRowSchemaAttestationError::Schema(
+                SchemaAdapterError::CatalogDefaultNotAttested { .. }
+            ))
+        ));
+    }
+
+    #[test]
     fn table_scan_attestation_resolves_all_groups_and_accounts_for_artifacts() {
         let result = attest_and_resolve_materialized_table_schema(
             &[column(1, 2, 2)],
             CatalogCoverageAttestation::new(9001, 1).unwrap(),
+            CatalogDefaultAttestation::none(),
             &scanned_page_with_missing_and_reference(),
             MaterializedTableCoverageAttestation::new(9001, 1, 2).unwrap(),
             &[],

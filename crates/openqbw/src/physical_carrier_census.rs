@@ -2,9 +2,9 @@
 //!
 //! The census is deliberately below the record layer. It reports only page
 //! geometry already validated by [`opensqlany::SlottedPage`], and the bounded
-//! page-start region that the lower-level parser exposes as an overflow
-//! prefix. It neither emits payload bytes nor associates a prefix with a row,
-//! table, transaction, or the preceding page.
+//! page-start region that the lower-level parser exposes as an unclassified
+//! prefix. It neither emits payload bytes nor treats the prefix as a row
+//! continuation, table, transaction, or relation to the preceding page.
 
 use std::ops::Range;
 
@@ -13,11 +13,14 @@ use opensqlany::{ApModel, Page, PageStore, PageType, SlottedPage};
 use crate::SlotEndian;
 use crate::row_scan::{RowScanError, decode_page_for_structural_scan};
 
-/// Maximum prefix extent reported by this primitive.
+/// Maximum unclassified prefix extent reported by this primitive.
 ///
 /// `SlottedPage` searches its directory only in the first `0x300` bytes, so
-/// a continuation-prefix provenance can never exceed this bound.
+/// an unclassified-prefix provenance can never exceed this bound.
 pub const MAX_CONTINUATION_PREFIX_LEN: usize = 0x300;
+
+/// Preferred semantic name for [`MAX_CONTINUATION_PREFIX_LEN`].
+pub const MAX_UNCLASSIFIED_PREFIX_LEN: usize = MAX_CONTINUATION_PREFIX_LEN;
 
 /// Whether a page had plaintext structural geometry available to census.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -53,7 +56,7 @@ pub struct SlotDirectoryCensus {
     pub leading_zero: bool,
 }
 
-/// Provenance of a non-zero page-start continuation region.
+/// Provenance of a non-zero, semantically unclassified page-start region.
 ///
 /// This deliberately contains no bytes and does not identify an owner. It is
 /// only a bounded range on the page that follows a parser-validated directory
@@ -68,6 +71,9 @@ pub struct ContinuationPrefixProvenance {
     pub byte_len: usize,
 }
 
+/// Preferred semantic name for [`ContinuationPrefixProvenance`].
+pub type UnclassifiedPrefixProvenance = ContinuationPrefixProvenance;
+
 /// Structural census for a single physical page.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PhysicalCarrierPage {
@@ -80,7 +86,17 @@ pub struct PhysicalCarrierPage {
     /// Validated slot-directory geometry, when one was found.
     pub directory: Option<SlotDirectoryCensus>,
     /// Non-zero page-start region before `directory.array_start`, if any.
+    /// Historical field name retained for source compatibility. The observed
+    /// region is semantically unclassified and is not continuation evidence.
     pub continuation_prefix: Option<ContinuationPrefixProvenance>,
+}
+
+impl PhysicalCarrierPage {
+    /// Returns the non-zero page-start region as unclassified provenance.
+    #[must_use]
+    pub fn unclassified_prefix(&self) -> Option<&UnclassifiedPrefixProvenance> {
+        self.continuation_prefix.as_ref()
+    }
 }
 
 /// Aggregate, adjacency-only observations over a censused page interval.
@@ -93,7 +109,7 @@ pub struct AdjacentPageStructuralSummary {
     pub consecutive_pairs: u64,
     /// Pairs where both pages had a validated slot directory.
     pub both_pages_have_directory: u64,
-    /// Pairs whose right page exposed a non-zero continuation-prefix range.
+    /// Pairs whose right page exposed a non-zero unclassified-prefix range.
     pub right_page_has_continuation_prefix: u64,
     /// Pairs whose right page had both a directory and a prefix.
     pub right_page_has_directory_and_prefix: u64,
@@ -135,9 +151,9 @@ pub fn census_decoded_physical_carrier_page(page: Page<'_>) -> PhysicalCarrierPa
             continuation_prefix: None,
         };
     };
-    let continuation_prefix = slotted.overflow_prefix().map(|prefix| {
+    let continuation_prefix = slotted.unclassified_prefix().map(|prefix| {
         // `array_start` is discovered in SlottedPage's bounded search window.
-        debug_assert!(prefix.len() <= MAX_CONTINUATION_PREFIX_LEN);
+        debug_assert!(prefix.len() <= MAX_UNCLASSIFIED_PREFIX_LEN);
         ContinuationPrefixProvenance {
             page_number,
             byte_range: 0..prefix.len(),

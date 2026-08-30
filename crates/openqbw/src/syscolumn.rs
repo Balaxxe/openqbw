@@ -982,15 +982,20 @@ pub fn collect_unique(store: &PageStore, model: &ApModel) -> Vec<SysColumn> {
 /// Return all recovered columns for the table named `table_name`, ordered by
 /// `column_id`.
 ///
-/// This resolves the table name to its physical `SYSTABLE.table_id` and joins
-/// that value directly to [`SysColumn::table_id`]. It returns an empty vector
-/// when the table is unknown or no catalog column rows were recovered. An
+/// This resolves the table name to exactly one physical `SYSTABLE.table_id`
+/// and joins that value directly to [`SysColumn::table_id`]. It returns an
+/// empty vector when the table is unknown, ambiguous, or no catalog column
+/// rows were recovered. An
 /// empty result does not establish that the physical table has no columns.
 pub fn schema_for(store: &PageStore, model: &ApModel, table_name: &str) -> Vec<SysColumn> {
     let tables = crate::collect_unique(store, model);
-    let Some(table) = tables.into_iter().find(|table| table.name == table_name) else {
+    let mut matches = tables.into_iter().filter(|table| table.name == table_name);
+    let Some(table) = matches.next() else {
         return Vec::new();
     };
+    if matches.next().is_some() {
+        return Vec::new();
+    }
     let mut cols: Vec<SysColumn> = collect_unique(store, model)
         .into_iter()
         .filter(|c| c.table_id == table.table_id)

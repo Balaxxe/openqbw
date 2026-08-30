@@ -454,10 +454,31 @@ fn removal_clusters(
         .collect()
 }
 fn count_nonoverlapping(haystack: &[u8], needle: &[u8]) -> usize {
-    haystack
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut at = 0;
+    while let Some(found) = haystack[at..]
         .windows(needle.len())
-        .filter(|window| *window == needle)
-        .count()
+        .position(|w| w == needle)
+    {
+        count += 1;
+        at += found + needle.len();
+    }
+    count
+}
+
+#[cfg(test)]
+mod nonoverlap_tests {
+    use super::count_nonoverlapping;
+
+    #[test]
+    fn counts_only_disjoint_matches() {
+        assert_eq!(count_nonoverlapping(b"aaaaa", b"aa"), 2);
+        assert_eq!(count_nonoverlapping(b"aaaa", b"aa"), 2);
+        assert_eq!(count_nonoverlapping(b"abc", b""), 0);
+    }
 }
 fn regular_file_len(path: &Path) -> Result<u64, String> {
     let metadata = fs::metadata(path).map_err(io_error)?;

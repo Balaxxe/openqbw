@@ -4,18 +4,20 @@
 //! `accounting-report`.
 
 use std::collections::BTreeSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use openqbw::{
     AccountId, MaterializedPostingDate, QuickBooksAccrualTrialBalancePolicy, TrialBalance,
     TrialBalanceOptions,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, MAIN_DB};
 
 use crate::batch_extract::{SnapshotJobOutcome, schedule_snapshot_jobs, snapshot_still_matches};
 use crate::report_output::{
     ReportBundle, ReportMetadata, TrialBalancePolicyProvenance, write_sqlite_with_account_catalog,
 };
+use crate::{create_staged_file, publish_staged_path, remove_staged_path};
 
 /// One manifest row.  Paths are deliberately never written to the output DB
 /// or included in diagnostic messages.
@@ -113,7 +115,7 @@ pub fn run_batch_trial_balance<F>(
     build_ledger: F,
 ) -> Result<(), String>
 where
-    F: Fn(&Path, String) -> anyhow::Result<openqbw::Ledger> + Sync,
+    F: Fn(Vec<u8>, String) -> anyhow::Result<openqbw::Ledger> + Sync,
 {
     if output.exists() {
         return Err("refusing to overwrite existing consolidated output".to_owned());
@@ -143,11 +145,12 @@ where
     let scheduled = schedule_snapshot_jobs(paths, workers, |job| {
         let input_index = job.input_index;
         let input = &manifest[input_index];
-        // `schedule_snapshot_jobs` opens and attests the file before this
-        // call. PageStore is then opened read-only by the normal production
-        // decoder; it has no SDK/COM/GUI/ODBC state or shared connection.
-        let (_, source_path, snapshot, _bytes) = job.into_parts();
-        let ledger = match build_ledger(&source_path, input.snapshot_id.clone()) {
+        // The decoder consumes precisely the bytes that were hashed. This
+        // avoids a second path read whose contents could differ from the
+        // reported snapshot; `PageStore::from_bytes` takes ownership without
+        // making another company-file copy.
+        let (_, source_path, snapshot, bytes) = job.into_parts();
+        let ledger = match build_ledger(bytes, input.snapshot_id.clone()) {
             Ok(ledger) => ledger,
             Err(_) => return Err(()),
         };
@@ -228,14 +231,13 @@ fn write_consolidated_sqlite(
     output: &Path,
     completed: &[CompletedTrialBalance],
 ) -> Result<(), String> {
-    // We create only after all readers succeed. If SQLite fails after this
-    // reservation, delete only our newly-created file so no partial report is
-    // left under the requested destination name.
-    std::fs::File::create_new(output)
-        .map_err(|_| "creating consolidated output failed".to_owned())?;
+    // Build only after all readers succeed and keep the final path untouched
+    // until the complete database can be published with create-new semantics.
+    let (_stage_directory, stage, mut file) = create_staged_file(output)
+        .map_err(|_| "creating staged consolidated output failed".to_owned())?;
     let write_result = (|| -> Result<(), String> {
-        let mut connection = Connection::open(output)
-            .map_err(|_| "opening consolidated SQLite output failed".to_owned())?;
+        let mut connection = Connection::open_in_memory()
+            .map_err(|_| "opening in-memory consolidated SQLite output failed".to_owned())?;
         for item in completed {
             write_sqlite_with_account_catalog(
                 &mut connection,
@@ -257,12 +259,20 @@ fn write_consolidated_sqlite(
                 rusqlite::params![item.entity_id, item.snapshot_id, item.input_index as i64],
             ).map_err(|_| "writing consolidated SQLite output failed".to_owned())?;
         }
-        Ok(())
+        let serialized = connection
+            .serialize(MAIN_DB)
+            .map_err(|_| "serializing consolidated SQLite output failed".to_owned())?;
+        file.write_all(&serialized)
+            .map_err(|_| "writing staged consolidated SQLite output failed".to_owned())?;
+        file.sync_all()
+            .map_err(|_| "syncing staged consolidated SQLite output failed".to_owned())
     })();
     if write_result.is_err() {
-        let _ = std::fs::remove_file(output);
+        remove_staged_path(&stage, false);
+        return write_result;
     }
-    write_result
+    publish_staged_path(&stage, output, false, false, None)
+        .map_err(|_| "publishing consolidated output failed".to_owned())
 }
 
 fn parse_csv(text: &str) -> Result<Vec<Vec<String>>, String> {
@@ -270,8 +280,32 @@ fn parse_csv(text: &str) -> Result<Vec<Vec<String>>, String> {
     let mut row = Vec::new();
     let mut field = String::new();
     let mut quoted = false;
+    let mut after_quote = false;
     let mut chars = text.chars().peekable();
     while let Some(character) = chars.next() {
+        if after_quote {
+            match character {
+                ',' => {
+                    row.push(std::mem::take(&mut field));
+                    after_quote = false;
+                }
+                '\n' => {
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                    after_quote = false;
+                }
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                    after_quote = false;
+                }
+                _ => return Err("manifest has characters after a closing quote".to_owned()),
+            }
+            continue;
+        }
         match character {
             '"' if quoted => {
                 if chars.peek() == Some(&'"') {
@@ -279,9 +313,11 @@ fn parse_csv(text: &str) -> Result<Vec<Vec<String>>, String> {
                     field.push('"');
                 } else {
                     quoted = false;
+                    after_quote = true;
                 }
             }
             '"' if field.is_empty() => quoted = true,
+            '"' => return Err("manifest has a bare quote in an unquoted field".to_owned()),
             ',' if !quoted => {
                 row.push(std::mem::take(&mut field));
             }
@@ -350,6 +386,8 @@ mod tests {
     #[test]
     fn malformed_csv_fails_closed() {
         assert!(parse_manifest_csv(b"entity_id,qbw_path,snapshot_id,fiscal_year_start,retained_earnings_account_id,retained_earnings_report_name\nSAMPLE_A,\"unterminated,S,2026-01-01,R,SAMPLE\n").is_err());
+        assert!(parse_manifest_csv(b"entity_id,qbw_path,snapshot_id,fiscal_year_start,retained_earnings_account_id,retained_earnings_report_name\nSAMPLE_A,plain\"quote,S,2026-01-01,R,SAMPLE\n").is_err());
+        assert!(parse_manifest_csv(b"entity_id,qbw_path,snapshot_id,fiscal_year_start,retained_earnings_account_id,retained_earnings_report_name\nSAMPLE_A,\"quoted\"tail,S,2026-01-01,R,SAMPLE\n").is_err());
     }
 
     #[test]
@@ -461,8 +499,8 @@ mod tests {
             2,
             "2026-01-31T00:00:00Z",
             &output,
-            |path, _| {
-                if path == second {
+            |bytes, _| {
+                if bytes == b"SAMPLE_FAIL" {
                     anyhow::bail!("SAMPLE failure")
                 } else {
                     Ok(sample_ledger())

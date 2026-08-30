@@ -56,19 +56,30 @@ impl MaterializedGeneralJournalSourceLinkRow {
     /// Parses an exactly bounded controlled General Journal source/link row.
     pub fn parse(input: &[u8]) -> Result<Self, MaterializedGeneralJournalPostingRowError> {
         validate_header(input, SOURCE_MIN_LEN)?;
+        if input.len() != SOURCE_MIN_LEN {
+            return Err(
+                MaterializedGeneralJournalPostingRowError::UnexpectedTrailingData {
+                    expected_end: SOURCE_MIN_LEN,
+                    segment_len: input.len(),
+                },
+            );
+        }
         if input
             [SOURCE_LAYOUT_PREFIX_OFFSET..SOURCE_LAYOUT_PREFIX_OFFSET + SOURCE_LAYOUT_PREFIX.len()]
             != SOURCE_LAYOUT_PREFIX
         {
             return Err(MaterializedGeneralJournalPostingRowError::UnexpectedSourceLayoutPrefix);
         }
+        let source_link_record_number = required_reference(input, SOURCE_RECORD, "source/link")?;
+        let master_record_number = required_reference(input, SOURCE_MASTER, "master")?;
+        let account_record_number = required_reference(input, SOURCE_ACCOUNT, "account")?;
         Ok(Self {
-            source_link_record_number: u32_at(input, SOURCE_RECORD),
-            master_record_number: u32_at(input, SOURCE_MASTER),
+            source_link_record_number,
+            master_record_number,
             date_raw: u32_at(input, SOURCE_DATE),
             view_type: u16_at(input, SOURCE_VIEW),
             next_target_record_number: nonzero(u32_at(input, SOURCE_NEXT)),
-            account_record_number: u32_at(input, SOURCE_ACCOUNT),
+            account_record_number,
         })
     }
 
@@ -156,6 +167,9 @@ impl MaterializedGeneralJournalPostingTargetRow {
             });
         }
         let amount = decode_amount(&input[amount_offset..], amount_offset)?;
+        let target_record_number = required_reference(input, TARGET_RECORD, "target")?;
+        let master_record_number = required_reference(input, TARGET_MASTER, "master")?;
+        let account_record_number = required_reference(input, TARGET_ACCOUNT, "account")?;
         let next_target = u32_at(input, TARGET_NEXT);
         if shape == MaterializedGeneralJournalPostingTargetShape::Linked && next_target == 0 {
             return Err(MaterializedGeneralJournalPostingRowError::MissingLinkedTargetRecordNumber);
@@ -171,9 +185,9 @@ impl MaterializedGeneralJournalPostingTargetRow {
             );
         }
         Ok(Self {
-            target_record_number: u32_at(input, TARGET_RECORD),
-            master_record_number: u32_at(input, TARGET_MASTER),
-            account_record_number: u32_at(input, TARGET_ACCOUNT),
+            target_record_number,
+            master_record_number,
+            account_record_number,
             date_raw: u32_at(input, TARGET_DATE),
             view_type: u16_at(input, TARGET_VIEW),
             next_target_record_number: nonzero(next_target),
@@ -288,6 +302,22 @@ pub enum MaterializedGeneralJournalPostingRowError {
     /// A linked target did not contain the corroborated nonzero next target.
     #[error("materialized General Journal linked target has no next target record number")]
     MissingLinkedTargetRecordNumber,
+    /// A required identifier was the zero sentinel.
+    #[error("materialized General Journal row has zero required {field} reference")]
+    MissingRequiredReference {
+        /// Structural identifier label.
+        field: &'static str,
+    },
+    /// Bytes followed a complete controlled structure or amount token.
+    #[error(
+        "materialized General Journal row has unrecognized trailing data: expected end {expected_end}, segment is {segment_len} bytes"
+    )]
+    UnexpectedTrailingData {
+        /// First unrecognized byte.
+        expected_end: usize,
+        /// Exact bounded row length.
+        segment_len: usize,
+    },
     /// The amount token reached beyond the exactly bounded target row.
     #[error(
         "materialized General Journal target amount declares {digits} base-100 digits beyond a {segment_len}-byte segment"
@@ -357,6 +387,23 @@ fn decode_amount(
     input: &[u8],
     amount_offset: usize,
 ) -> Result<MaterializedPostingCents, MaterializedGeneralJournalPostingRowError> {
+    let token_len = input
+        .first()
+        .and_then(|digits| usize::from(*digits).checked_add(2))
+        .ok_or(
+            MaterializedGeneralJournalPostingRowError::AmountOutsideSegment {
+                digits: 0,
+                segment_len: input.len() + amount_offset,
+            },
+        )?;
+    if token_len != input.len() {
+        return Err(
+            MaterializedGeneralJournalPostingRowError::UnexpectedTrailingData {
+                expected_end: amount_offset + token_len,
+                segment_len: input.len() + amount_offset,
+            },
+        );
+    }
     MaterializedPostingCents::parse(input).map_err(|error| match error {
         MaterializedPostingCentsError::TokenTooShort { .. }
         | MaterializedPostingCentsError::DigitsOutsideToken { digits: 0, .. } => {
@@ -384,6 +431,16 @@ fn decode_amount(
             MaterializedGeneralJournalPostingRowError::AmountOverflow
         }
     })
+}
+fn required_reference(
+    input: &[u8],
+    offset: usize,
+    field: &'static str,
+) -> Result<u32, MaterializedGeneralJournalPostingRowError> {
+    let value = u32_at(input, offset);
+    (value != 0)
+        .then_some(value)
+        .ok_or(MaterializedGeneralJournalPostingRowError::MissingRequiredReference { field })
 }
 
 fn u16_at(input: &[u8], offset: usize) -> u16 {
@@ -1746,9 +1803,6 @@ mod tests {
         shape: MaterializedGeneralJournalPostingTargetShape,
         amount: &[u8],
     ) -> Vec<u8> {
-        let mut row = vec![0; 0x80];
-        let length = row.len() as u16;
-        row[..2].copy_from_slice(&length.to_le_bytes());
         let (layout_marker, amount_offset) = match shape {
             MaterializedGeneralJournalPostingTargetShape::Linked => {
                 (LINKED_TARGET_LAYOUT_MARKER, LINKED_TARGET_AMOUNT)
@@ -1757,6 +1811,9 @@ mod tests {
                 (TERMINAL_TARGET_LAYOUT_MARKER, TERMINAL_TARGET_AMOUNT)
             }
         };
+        let mut row = vec![0; amount_offset + amount.len()];
+        let length = row.len() as u16;
+        row[..2].copy_from_slice(&length.to_le_bytes());
         common(&mut row, layout_marker);
         row[TARGET_RECORD..TARGET_RECORD + 4].copy_from_slice(&target.to_le_bytes());
         row[TARGET_MASTER..TARGET_MASTER + 4].copy_from_slice(&SAMPLE_MASTER.to_le_bytes());
@@ -1917,6 +1974,61 @@ mod tests {
         assert!(matches!(
             MaterializedGeneralJournalPostingTargetRow::parse(&missing_link),
             Err(MaterializedGeneralJournalPostingRowError::MissingLinkedTargetRecordNumber)
+        ));
+    }
+
+    #[test]
+    fn legacy_parsers_reject_zero_identifiers_and_trailing_data() {
+        let mut zero_source = source_link();
+        zero_source[SOURCE_RECORD..SOURCE_RECORD + 4].fill(0);
+        assert!(matches!(
+            MaterializedGeneralJournalSourceLinkRow::parse(&zero_source),
+            Err(
+                MaterializedGeneralJournalPostingRowError::MissingRequiredReference {
+                    field: "source/link"
+                }
+            )
+        ));
+
+        let mut zero_target = target(
+            SAMPLE_TARGET_A,
+            SAMPLE_ACCOUNT_A,
+            Some(SAMPLE_TARGET_B),
+            MaterializedGeneralJournalPostingTargetShape::Linked,
+            &[1, 0xbf, 1],
+        );
+        zero_target[TARGET_ACCOUNT..TARGET_ACCOUNT + 4].fill(0);
+        assert!(matches!(
+            MaterializedGeneralJournalPostingTargetRow::parse(&zero_target),
+            Err(
+                MaterializedGeneralJournalPostingRowError::MissingRequiredReference {
+                    field: "account"
+                }
+            )
+        ));
+
+        let mut trailing_source = source_link();
+        trailing_source.push(0);
+        let source_length = trailing_source.len() as u16;
+        trailing_source[..2].copy_from_slice(&source_length.to_le_bytes());
+        assert!(matches!(
+            MaterializedGeneralJournalSourceLinkRow::parse(&trailing_source),
+            Err(MaterializedGeneralJournalPostingRowError::UnexpectedTrailingData { .. })
+        ));
+
+        let mut trailing_target = target(
+            SAMPLE_TARGET_A,
+            SAMPLE_ACCOUNT_A,
+            Some(SAMPLE_TARGET_B),
+            MaterializedGeneralJournalPostingTargetShape::Linked,
+            &[1, 0xbf, 1],
+        );
+        trailing_target.push(0);
+        let target_length = trailing_target.len() as u16;
+        trailing_target[..2].copy_from_slice(&target_length.to_le_bytes());
+        assert!(matches!(
+            MaterializedGeneralJournalPostingTargetRow::parse(&trailing_target),
+            Err(MaterializedGeneralJournalPostingRowError::UnexpectedTrailingData { .. })
         ));
     }
 

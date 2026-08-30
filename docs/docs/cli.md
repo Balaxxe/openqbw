@@ -224,7 +224,12 @@ $ openqbw export mybooks.qbw books.sqlite
 
 Writes a SQLite database containing catalog and legacy discovery results. The
 output is deterministic for the same input, but is not a reconciled accounting
-export.
+export. Outputs are staged beside their final destination and published only
+after a complete successful write. Existing destinations are refused by default;
+use `--force` only to replace an artifact after review. The CLI rejects an
+output that is the input itself, a canonical/relative alias, or a hard link to
+the input. A forced replacement keeps the prior artifact in a uniquely named
+sibling backup; remove that backup only after validating the replacement.
 
 ### `migrate <INPUT.QBW> --out <PATH> [--format csv|sqlite|iif]`
 
@@ -249,6 +254,12 @@ Data-liberation export with three target formats:
   available the header's transaction type is used, otherwise the
   group is emitted as `GENERAL JOURNAL`. SPL amounts are negated
   per IIF's double-entry convention.
+
+All migration formats stage their complete result before publication. For CSV,
+the three-file directory is published as one unit. An existing `--out` is
+refused unless `--force` is explicit; a failed write preserves any prior output.
+Successful forced replacement also retains the prior output as a sibling
+backup for explicit operator cleanup.
 
 ### `forensics`
 
@@ -340,7 +351,11 @@ $ openqbw accounting-report SAMPLE_COMPANY.qbw --report general-ledger \
     --format sqlite --out general-ledger.sqlite
 ```
 
-Writes a new CSV, JSON, or SQLite report; it refuses to overwrite the output.
+Writes a new CSV, JSON, or SQLite report through a same-directory staged file;
+partial reports are never published. It refuses to overwrite the output unless
+`--force` is explicit, in which case an existing report is preserved until the
+replacement has been completely written and published, then retained as a
+uniquely named sibling backup for explicit operator cleanup.
 For an accrual Trial Balance, `--fiscal-year-start` and
 `--retained-earnings-account-id` are required. The optional
 `--retained-earnings-report-name` changes only native-report presentation; it
@@ -369,6 +384,10 @@ Builds the direct QBW accrual Trial Balance and compares it account-by-account
 and cent-by-cent with the supplied native QuickBooks CSV. It exits nonzero for
 an unbalanced input, unsupported decoding condition, missing/extra account,
 or any variance.
+
+Reconciliation failures print aggregate counts only by default, since account
+names and balances can be sensitive. Pass `--show-account-details` to opt in to
+those local diagnostics.
 
 ### `reconcile-qbw-general-ledger`
 

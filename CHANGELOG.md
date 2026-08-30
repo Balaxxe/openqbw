@@ -8,11 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The normalized decoder contract now records source/link rows, deletion
-  tombstones, and proven canonical-zero void rows as explicit, auditable
-  exclusions. They count toward complete coverage without violating the
-  ledger's non-zero-posting invariant. Decoder examples and public changes
-  must use synthetic data only.
+- Operational exports and migrations now reject input/output aliases, stage
+  complete artifacts before publication, and require `--force` to replace an
+  existing destination. Trial Balance failures hide account-level details
+  unless explicitly requested.
+- Batch decoding hashes inputs as streams, enforces a 256 MiB snapshot bound,
+  and decodes the exact attested bytes instead of reopening the source path.
+- Generic materialized-schema attestation now requires independently supplied
+  catalog-default evidence. Archived raw-output probes were removed; decoder
+  examples and public changes must use synthetic data only.
+
+### Fixed
+
+- Canonical numeric zero no longer claims that a Bill or Check row is voided;
+  complete accounting output remains blocked until independent lifecycle
+  evidence resolves the row.
+- Duplicate account identities, mismatched/duplicate table coverage, and
+  conflicting SYSTABLE identities now fail closed instead of selecting one by
+  iteration order.
+- Materialized Check, Deposit, and legacy General Journal parsers reject
+  unproven trailing data and missing required identifiers.
+- CSV reconciliation parsers reject malformed quote transitions, SDK-oracle
+  TSV cells are spreadsheet-safe, and research occurrence counters now use
+  genuinely non-overlapping matches.
 
 ## [0.1.4] - 2026-08-12
 

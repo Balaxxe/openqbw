@@ -850,6 +850,15 @@ pub enum Enterprise24AccountingPipelineBlocker {
     SchemaStorageMismatch { table_id: u32 },
     /// Candidate consensus or partial decode coverage was incomplete.
     IncompleteTableCoverage { table_id: u32 },
+    /// More than one supplied table census claimed the same table identity.
+    DuplicateTableCoverage { table_id: u32 },
+    /// A row collection's decoder policy did not attest the same table as its coverage.
+    TablePolicyCoverageMismatch {
+        policy_table_id: u32,
+        coverage_table_id: u32,
+    },
+    /// More than one physical Account row claimed the same record number.
+    DuplicateAccountRecordNumber { record_number: u32 },
     /// An Account row could not be normalized from its bounded evidence.
     AccountAdaptationFailed { page: u64, record: u16 },
     /// A posting row could not be normalized from its bounded evidence.
@@ -895,9 +904,13 @@ pub fn build_enterprise24_accounting_pipeline(
             .blockers
             .push(Enterprise24AccountingPipelineBlocker::SchemaManifestValidationFailed);
     }
-    add_table_coverage(&mut diagnostics, &account_rows.coverage);
+    add_table_coverage(
+        &mut diagnostics,
+        account_rows.policy.table.id(),
+        &account_rows.coverage,
+    );
     for rows in posting_rows {
-        add_table_coverage(&mut diagnostics, &rows.coverage);
+        add_table_coverage(&mut diagnostics, rows.policy.table.id(), &rows.coverage);
     }
     for policy in ENTERPRISE24_R21_PARTIAL_TABLE_POLICIES {
         let Some(coverage) = diagnostics.tables.get(&policy.table.id()) else {
@@ -945,26 +958,42 @@ pub fn build_enterprise24_accounting_pipeline(
     };
     diagnostics.account_candidates = account_rows.records.len() as u64;
     // Pass one establishes the physical-record-number -> ordinary ListID map.
-    let identity_map: BTreeMap<u32, AccountId> = account_rows
-        .records
-        .iter()
-        .filter_map(|record| {
-            let identity = MaterializedAccountRow::parse(&record.bytes).ok()?;
-            let id = AccountId::new(identity.ordinary_list_id()).ok()?;
-            Some((identity.record_number(), id))
-        })
-        .collect();
-    if identity_map.len() != account_rows.records.len() {
-        for record in &account_rows.records {
-            if MaterializedAccountRow::parse(&record.bytes).is_err() {
+    let mut identity_map = BTreeMap::new();
+    for record in &account_rows.records {
+        let identity = match MaterializedAccountRow::parse(&record.bytes) {
+            Ok(identity) => identity,
+            Err(_) => {
                 diagnostics.blockers.push(
                     Enterprise24AccountingPipelineBlocker::AccountAdaptationFailed {
                         page: record.raw_page_number,
                         record: record.record_id,
                     },
                 );
+                continue;
             }
+        };
+        let id = match AccountId::new(identity.ordinary_list_id()) {
+            Ok(id) => id,
+            Err(_) => {
+                diagnostics.blockers.push(
+                    Enterprise24AccountingPipelineBlocker::AccountAdaptationFailed {
+                        page: record.raw_page_number,
+                        record: record.record_id,
+                    },
+                );
+                continue;
+            }
+        };
+        let record_number = identity.record_number();
+        if identity_map.contains_key(&record_number) {
+            diagnostics.blockers.push(
+                Enterprise24AccountingPipelineBlocker::DuplicateAccountRecordNumber {
+                    record_number,
+                },
+            );
+            continue;
         }
+        identity_map.insert(record_number, id);
     }
 
     // Pass two resolves parent references only after every identity is known.
@@ -1951,11 +1980,12 @@ fn validate_check_master_balances_partial(
         .ok_or(())
 }
 
-/// Requires every non-void Check master in the complete table-3047 census to
-/// net to zero.  The companion carrier is explicitly non-posting, while a
-/// canonical-zero Check row is a lifecycle tombstone rather than a monetary
-/// line.  This is a table-family invariant in addition to the final ledger's
-/// cross-family balance contract.
+/// Requires every non-zero Check master in the complete table-3047 census to
+/// net to zero. The companion carrier is explicitly non-posting. A canonical
+/// zero contributes no monetary amount here, but does not establish lifecycle
+/// state; the later disposition gate must resolve it independently or block
+/// the ledger. This is a table-family invariant in addition to the final
+/// ledger's cross-family balance contract.
 fn validate_check_master_balances(rows: &[Enterprise24PartialRecord]) -> Result<(), ()> {
     let mut balances = BTreeMap::<u64, i128>::new();
     for record in rows {
@@ -1978,8 +2008,26 @@ fn validate_check_master_balances(rows: &[Enterprise24PartialRecord]) -> Result<
 
 fn add_table_coverage(
     diagnostics: &mut Enterprise24AccountingCoverageDiagnostics,
+    policy_table_id: u32,
     coverage: &Enterprise24PartialTableCoverage,
 ) {
+    if policy_table_id != coverage.table_id {
+        diagnostics.blockers.push(
+            Enterprise24AccountingPipelineBlocker::TablePolicyCoverageMismatch {
+                policy_table_id,
+                coverage_table_id: coverage.table_id,
+            },
+        );
+        return;
+    }
+    if diagnostics.tables.contains_key(&coverage.table_id) {
+        diagnostics.blockers.push(
+            Enterprise24AccountingPipelineBlocker::DuplicateTableCoverage {
+                table_id: coverage.table_id,
+            },
+        );
+        return;
+    }
     diagnostics
         .tables
         .insert(coverage.table_id, coverage.clone());
@@ -2533,6 +2581,41 @@ mod tests {
     }
 
     #[test]
+    fn coverage_rejects_duplicate_and_policy_mismatched_table_claims() {
+        let mut diagnostics = Enterprise24AccountingCoverageDiagnostics::default();
+        let coverage = Enterprise24PartialTableCoverage {
+            table_id: Enterprise24AccountingTable::CheckLine.id(),
+            ..Enterprise24PartialTableCoverage::default()
+        };
+        add_table_coverage(
+            &mut diagnostics,
+            Enterprise24AccountingTable::CheckLine.id(),
+            &coverage,
+        );
+        add_table_coverage(
+            &mut diagnostics,
+            Enterprise24AccountingTable::CheckLine.id(),
+            &coverage,
+        );
+        add_table_coverage(
+            &mut diagnostics,
+            Enterprise24AccountingTable::BillLine.id(),
+            &coverage,
+        );
+        assert!(diagnostics.blockers.contains(
+            &Enterprise24AccountingPipelineBlocker::DuplicateTableCoverage {
+                table_id: Enterprise24AccountingTable::CheckLine.id(),
+            }
+        ));
+        assert!(diagnostics.blockers.contains(
+            &Enterprise24AccountingPipelineBlocker::TablePolicyCoverageMismatch {
+                policy_table_id: Enterprise24AccountingTable::BillLine.id(),
+                coverage_table_id: Enterprise24AccountingTable::CheckLine.id(),
+            }
+        ));
+    }
+
+    #[test]
     fn direct_check_master_balance_gate_requires_each_master_to_net_zero() {
         // Same base-100 magnitude, opposite calibrated sign markers.
         let debit = check_record(10, 100, 7, [2, 0xbf, 1, 23]);
@@ -2544,7 +2627,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_check_strategy_requires_one_noncolliding_companion_per_master() {
+    fn materialized_check_strategy_fails_closed_for_unproven_canonical_zero_lifecycle() {
         let master = 100;
         let records = vec![
             check_companion_record(
@@ -2561,13 +2644,7 @@ mod tests {
             records: records.clone(),
             coverage: Enterprise24PartialTableCoverage::default(),
         };
-        let selected = try_materialized_check_dispositions(&rows, &BTreeMap::new()).unwrap();
-        assert_eq!(selected.len(), 3);
-        assert!(
-            selected
-                .iter()
-                .all(|row| matches!(row, PostingDisposition::Excluded(_)))
-        );
+        assert!(try_materialized_check_dispositions(&rows, &BTreeMap::new()).is_err());
 
         let mut duplicate = records.clone();
         duplicate.push(check_companion_record(
