@@ -875,6 +875,9 @@ pub enum Enterprise24AccountingPipelineBlocker {
     },
     /// A complete physical posting-family census did not balance by master.
     UnbalancedPostingMasters { table_id: u32 },
+    /// Every attested strategy for a posting family rejected its complete
+    /// evidence; this is not itself a claim that its monetary masters failed.
+    PostingStrategyRejected { table_id: u32 },
     /// The final normalized ledger rejected a structural invariant.
     LedgerContractRejected,
 }
@@ -1148,11 +1151,9 @@ pub fn build_enterprise24_accounting_pipeline(
             continue;
         }
         if table == Enterprise24AccountingTable::CheckLine {
-            let selected = try_materialized_check_dispositions(rows, &identity_map).or_else(|_| {
-                schemas
-                    .get(&table.id())
-                    .ok_or(())
-                    .and_then(|schema| try_partial_check_dispositions(rows, schema, &identity_map))
+            let selected = schemas.get(&table.id()).ok_or(()).and_then(|schema| {
+                try_materialized_check_dispositions(rows, schema, &identity_map)
+                    .or_else(|_| try_partial_check_dispositions(rows, schema, &identity_map))
             });
             diagnostics.posting_candidates += rows.records.len() as u64;
             match selected {
@@ -1167,7 +1168,7 @@ pub fn build_enterprise24_accounting_pipeline(
                 }
                 Err(()) => {
                     diagnostics.blockers.push(
-                        Enterprise24AccountingPipelineBlocker::UnbalancedPostingMasters {
+                        Enterprise24AccountingPipelineBlocker::PostingStrategyRejected {
                             table_id: table.id(),
                         },
                     );
@@ -1185,6 +1186,14 @@ pub fn build_enterprise24_accounting_pipeline(
             continue;
         }
         if table == Enterprise24AccountingTable::BillLine {
+            if validate_materialized_bill_zero_families(&rows.records).is_err() {
+                diagnostics.blockers.push(
+                    Enterprise24AccountingPipelineBlocker::PostingStrategyRejected {
+                        table_id: table.id(),
+                    },
+                );
+                continue;
+            }
             let mut balances = BTreeMap::<u64, i128>::new();
             for record in &rows.records {
                 match MaterializedBillPostingRow::parse(&record.bytes) {
@@ -1267,6 +1276,17 @@ pub fn build_enterprise24_accounting_pipeline(
             );
             continue;
         };
+        if table == Enterprise24AccountingTable::BillPaymentCheckLine
+            && validate_partial_zero_families(table, &rows.records, schema, &BTreeSet::new())
+                .is_err()
+        {
+            diagnostics.blockers.push(
+                Enterprise24AccountingPipelineBlocker::PostingStrategyRejected {
+                    table_id: table.id(),
+                },
+            );
+            continue;
+        }
         if table == Enterprise24AccountingTable::DepositLine {
             let headers = match deposit_nonposting_header_record_ids(&rows.records, schema) {
                 Ok(headers) => headers,
@@ -1281,6 +1301,16 @@ pub fn build_enterprise24_accounting_pipeline(
                     continue;
                 }
             };
+            // Only the independently proven header topologies may skip
+            // monetary-row validation; unknown carriers remain failures.
+            if validate_partial_zero_families(table, &rows.records, schema, &headers).is_err() {
+                diagnostics.blockers.push(
+                    Enterprise24AccountingPipelineBlocker::PostingStrategyRejected {
+                        table_id: table.id(),
+                    },
+                );
+                continue;
+            }
             match validate_deposit_master_balances(&rows.records, schema, &headers) {
                 Ok(()) => {}
                 Err(DepositTableValidationError::Adaptation) => {
@@ -1755,67 +1785,82 @@ fn deposit_nonposting_header_disposition(
 
 fn try_materialized_check_dispositions(
     rows: &Enterprise24PartialTableRows,
+    schema: &RowSchema,
     identity_map: &BTreeMap<u32, AccountId>,
 ) -> Result<Vec<PostingDisposition>, ()> {
-    validate_check_master_balances(&rows.records)?;
-    let evidence = check_void_evidence_for_rows(&rows.records)?;
-    let carriers = rows
-        .records
-        .iter()
-        .filter_map(|record| MaterializedCheckVoidCompanionCarrier::parse(&record.bytes).ok())
-        .collect::<Vec<_>>();
-    let mut carrier_counts = BTreeMap::<u32, usize>::new();
-    let mut carrier_targets = std::collections::BTreeSet::new();
-    for carrier in &carriers {
-        *carrier_counts
-            .entry(carrier.master_record_number())
-            .or_default() += 1;
-        if carrier.target_record_number() == carrier.master_record_number()
-            || !carrier_targets.insert(carrier.target_record_number())
-        {
-            return Err(());
-        }
-    }
-    if carrier_counts.values().any(|count| *count != 1) {
-        return Err(());
-    }
-    let posting_targets = rows
-        .records
-        .iter()
-        .filter(|record| MaterializedCheckVoidCompanionCarrier::parse(&record.bytes).is_err())
-        .map(|record| MaterializedCheckPostingRow::parse(&record.bytes).map_err(|_| ()))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|row| row.target_record_number())
-        .collect::<std::collections::BTreeSet<_>>();
-    if !carrier_targets.is_disjoint(&posting_targets) {
-        return Err(());
-    }
-    let mut selected = Vec::with_capacity(rows.records.len());
-    for record in &rows.records {
-        if let Ok(carrier) = MaterializedCheckVoidCompanionCarrier::parse(&record.bytes) {
-            selected.push(check_companion_disposition(
-                record,
-                carrier,
-                &evidence,
-                rows.policy.version,
-            )?);
-            continue;
-        }
-        let row = MaterializedCheckPostingRow::parse(&record.bytes).map_err(|_| ())?;
-        let adaptation = adapt_materialized_check_posting_row(&row).map_err(|_| ())?;
-        selected.push(
-            normalized_disposition(
+    prepare_check_dispositions(rows, identity_map, |record| {
+        adapt_check_observation(record, schema)
+    })
+}
+
+/// Every nonzero amount remains on the strict physical path. A direct
+/// canonical zero with an opaque suffix may instead be a neutral observation
+/// only when the attested named prefix and the fixed physical header agree.
+/// This does not attest the suffix or permit a schema-derived nonzero amount.
+fn adapt_check_observation(
+    record: &Enterprise24PartialRecord,
+    schema: &RowSchema,
+) -> Result<EnterprisePostingAdaptation, ()> {
+    match MaterializedCheckPostingRow::parse(&record.bytes) {
+        Ok(row) => adapt_materialized_check_posting_row(&row).map_err(|_| ()),
+        Err(crate::MaterializedCheckPostingRowError::UnattestedAmountEnvelope { .. }) => {
+            let adaptation = adapt_enterprise_posting_row_partial(
                 Enterprise24AccountingTable::CheckLine,
-                record,
-                adaptation,
-                identity_map,
-                rows.policy.version,
+                schema,
+                &record.partial,
             )
-            .map_err(|_| ())?,
-        );
+            .map_err(|_| ())?;
+            let EnterprisePostingAdaptation::Excluded(
+                EnterprisePostingExclusion::CanonicalZeroAmount {
+                    target_id,
+                    transaction_id,
+                    account_id,
+                    transaction_date,
+                    transaction_type,
+                },
+            ) = adaptation
+            else {
+                return Err(());
+            };
+            let bytes = &record.bytes;
+            if bytes.len() < 0x55
+                || usize::from(u16::from_le_bytes([bytes[0], bytes[1]])) != bytes.len()
+                || bytes[2] != 0
+                || bytes[3] != crate::MATERIALIZED_CHECK_POSTING_KIND
+                || bytes.get(0x53..0x55) != Some(&[0, 0x81])
+            {
+                return Err(());
+            }
+            let read = |offset: usize| {
+                bytes
+                    .get(offset..offset + 4)
+                    .and_then(|value| value.try_into().ok())
+                    .map(u32::from_le_bytes)
+            };
+            if read(0x0c) != u32::try_from(target_id).ok()
+                || read(0x10) != u32::try_from(transaction_id).ok()
+                || read(0x14) != u32::try_from(account_id).ok()
+                || crate::MaterializedPostingDate::from_raw_bits(read(0x18).ok_or(())?)
+                    .map_err(|_| ())?
+                    .accounting_date()
+                    != transaction_date
+                || transaction_type != crate::EnterprisePostingTransactionType::Check
+                || (read(0x22).ok_or(())? == 0 && read(0x1e).ok_or(())? == 0)
+            {
+                return Err(());
+            }
+            Ok(EnterprisePostingAdaptation::Excluded(
+                EnterprisePostingExclusion::CanonicalZeroAmount {
+                    target_id,
+                    transaction_id,
+                    account_id,
+                    transaction_date,
+                    transaction_type,
+                },
+            ))
+        }
+        Err(_) => Err(()),
     }
-    Ok(selected)
 }
 
 fn try_partial_check_dispositions(
@@ -1829,179 +1874,242 @@ fn try_partial_check_dispositions(
     }) {
         return Err(());
     }
-    validate_check_master_balances_partial(&rows.records, schema)?;
-    let evidence = check_void_evidence_for_partial_rows(&rows.records, schema)?;
-    let mut selected = Vec::with_capacity(rows.records.len());
-    for record in &rows.records {
-        if let Ok(carrier) = MaterializedCheckVoidCompanionCarrier::parse(&record.bytes) {
-            selected.push(check_companion_disposition(
-                record,
-                carrier,
-                &evidence,
-                rows.policy.version,
-            )?);
-            continue;
-        }
-        match adapt_enterprise_posting_row_partial(
+    prepare_check_dispositions(rows, identity_map, |record| {
+        adapt_enterprise_posting_row_partial(
             Enterprise24AccountingTable::CheckLine,
             schema,
             &record.partial,
-        ) {
-            Ok(adaptation) => selected.push(
+        )
+        .map_err(|_| ())
+    })
+}
+
+#[derive(Default)]
+struct CheckMasterObservation {
+    zero_targets: BTreeSet<u64>,
+    nonzero_count: u64,
+    nonzero_net: i128,
+}
+
+/// Both strategies use the same complete-family validation. Observations are
+/// collected once, so balance, companion proof, and normalization cannot
+/// accidentally use different decoders or skip a zero-only observation.
+fn prepare_check_dispositions(
+    rows: &Enterprise24PartialTableRows,
+    identity_map: &BTreeMap<u32, AccountId>,
+    adapt: impl Fn(&Enterprise24PartialRecord) -> Result<EnterprisePostingAdaptation, ()>,
+) -> Result<Vec<PostingDisposition>, ()> {
+    let mut observations = Vec::with_capacity(rows.records.len());
+    let mut carriers = BTreeMap::<usize, MaterializedCheckVoidCompanionCarrier>::new();
+    let mut carrier_counts = BTreeMap::<u64, usize>::new();
+    let mut carrier_targets = BTreeSet::new();
+    let mut targets = BTreeSet::new();
+    let mut masters = BTreeMap::<u64, CheckMasterObservation>::new();
+    for (index, record) in rows.records.iter().enumerate() {
+        if let Ok(carrier) = MaterializedCheckVoidCompanionCarrier::parse(&record.bytes) {
+            let master = u64::from(carrier.master_record_number());
+            let target = u64::from(carrier.target_record_number());
+            if target == master || !carrier_targets.insert(target) {
+                return Err(());
+            }
+            *carrier_counts.entry(master).or_default() += 1;
+            carriers.insert(index, carrier);
+            observations.push(None);
+            continue;
+        }
+        let adaptation = adapt(record)?;
+        let monetary = match &adaptation {
+            EnterprisePostingAdaptation::Posting(row) => {
+                let master = masters.entry(row.transaction_id).or_default();
+                master.nonzero_count += 1;
+                master.nonzero_net += i128::from(row.amount_cents);
+                Some(row.target_id)
+            }
+            EnterprisePostingAdaptation::Excluded(
+                EnterprisePostingExclusion::CanonicalZeroAmount {
+                    target_id,
+                    transaction_id,
+                    ..
+                },
+            ) => {
+                masters
+                    .entry(*transaction_id)
+                    .or_default()
+                    .zero_targets
+                    .insert(*target_id);
+                Some(*target_id)
+            }
+            EnterprisePostingAdaptation::Excluded(
+                EnterprisePostingExclusion::NoPost { .. }
+                | EnterprisePostingExclusion::MemorizedTransaction { .. }
+                | EnterprisePostingExclusion::SourceOrLink { .. },
+            ) => None,
+            // No current adapter produces this legacy lifecycle assertion.
+            // It cannot substitute for the complete companion proof below.
+            EnterprisePostingAdaptation::Excluded(
+                EnterprisePostingExclusion::CanonicalZeroVoided { .. },
+            ) => return Err(()),
+        };
+        if monetary.is_some_and(|target| !targets.insert(target)) {
+            return Err(());
+        }
+        observations.push(Some(adaptation));
+    }
+    if !targets.is_disjoint(&carrier_targets)
+        || carrier_counts.values().any(|count| *count != 1)
+        || masters.values().any(|master| {
+            master.nonzero_net != 0
+                || (!master.zero_targets.is_empty() && master.nonzero_count != 0)
+        })
+    {
+        return Err(());
+    }
+    let mut evidence = BTreeMap::new();
+    for master in carrier_counts.keys() {
+        let observation = masters.get(master).ok_or(())?;
+        if observation.zero_targets.len() != 2 || observation.nonzero_count != 0 {
+            return Err(());
+        }
+        evidence.insert(
+            *master,
+            CheckVoidCompanionMasterEvidence {
+                canonical_zero_e4_row_count: 2,
+                nonzero_posting_row_count: 0,
+            },
+        );
+    }
+    rows.records
+        .iter()
+        .zip(observations)
+        .enumerate()
+        .map(|(index, (record, adaptation))| {
+            if let Some(carrier) = carriers.get(&index) {
+                check_companion_disposition(record, *carrier, &evidence, rows.policy.version)
+            } else {
                 normalized_disposition(
                     Enterprise24AccountingTable::CheckLine,
                     record,
-                    adaptation,
+                    adaptation.ok_or(())?,
                     identity_map,
                     rows.policy.version,
                 )
-                .map_err(|_| ())?,
-            ),
-            Err(_) => return Err(()),
-        }
-    }
-    Ok(selected)
+                .map_err(|_| ())
+            }
+        })
+        .collect()
 }
 
-fn check_void_evidence_for_rows(
-    rows: &[Enterprise24PartialRecord],
-) -> Result<BTreeMap<u64, CheckVoidCompanionMasterEvidence>, ()> {
-    let mut counts = BTreeMap::<u64, (u8, u32)>::new();
-    for record in rows {
-        if MaterializedCheckVoidCompanionCarrier::parse(&record.bytes).is_ok() {
-            continue;
-        }
-        let row = MaterializedCheckPostingRow::parse(&record.bytes).map_err(|_| ())?;
-        let adaptation = adapt_materialized_check_posting_row(&row).map_err(|_| ())?;
-        let (transaction_id, canonical_zero, nonzero) = match adaptation {
-            EnterprisePostingAdaptation::Posting(row) => (row.transaction_id, false, true),
-            EnterprisePostingAdaptation::Excluded(
-                EnterprisePostingExclusion::CanonicalZeroVoided { transaction_id, .. },
-            ) => (transaction_id, true, false),
-            EnterprisePostingAdaptation::Excluded(_) => continue,
-        };
-        let entry = counts.entry(transaction_id).or_default();
-        if canonical_zero {
-            entry.0 = entry.0.saturating_add(1);
-        }
-        if nonzero {
-            entry.1 = entry.1.saturating_add(1);
-        }
-    }
-    Ok(counts
-        .into_iter()
-        .map(
-            |(master, (canonical_zero_e4_row_count, nonzero_posting_row_count))| {
-                (
-                    master,
-                    CheckVoidCompanionMasterEvidence {
-                        canonical_zero_e4_row_count,
-                        nonzero_posting_row_count,
-                    },
-                )
-            },
-        )
-        .collect())
-}
-
-fn check_void_evidence_for_partial_rows(
-    rows: &[Enterprise24PartialRecord],
-    schema: &RowSchema,
-) -> Result<BTreeMap<u64, CheckVoidCompanionMasterEvidence>, ()> {
-    let mut counts = BTreeMap::<u64, (u8, u32)>::new();
-    for record in rows {
-        if MaterializedCheckVoidCompanionCarrier::parse(&record.bytes).is_ok() {
-            continue;
-        }
-        let adaptation = match adapt_enterprise_posting_row_partial(
-            Enterprise24AccountingTable::CheckLine,
-            schema,
-            &record.partial,
-        ) {
-            Ok(adaptation) => adaptation,
-            Err(_) => return Err(()),
-        };
-        let (transaction_id, canonical_zero, nonzero) = match adaptation {
-            EnterprisePostingAdaptation::Posting(row) => (row.transaction_id, false, true),
-            EnterprisePostingAdaptation::Excluded(
-                EnterprisePostingExclusion::CanonicalZeroVoided { transaction_id, .. },
-            ) => (transaction_id, true, false),
-            EnterprisePostingAdaptation::Excluded(_) => continue,
-        };
-        let entry = counts.entry(transaction_id).or_default();
-        if canonical_zero {
-            entry.0 = entry.0.saturating_add(1);
-        }
-        if nonzero {
-            entry.1 = entry.1.saturating_add(1);
-        }
-    }
-    Ok(counts
-        .into_iter()
-        .map(
-            |(master, (canonical_zero_e4_row_count, nonzero_posting_row_count))| {
-                (
-                    master,
-                    CheckVoidCompanionMasterEvidence {
-                        canonical_zero_e4_row_count,
-                        nonzero_posting_row_count,
-                    },
-                )
-            },
-        )
-        .collect())
-}
-
-fn validate_check_master_balances_partial(
-    rows: &[Enterprise24PartialRecord],
-    schema: &RowSchema,
-) -> Result<(), ()> {
-    let mut balances = BTreeMap::<u64, i128>::new();
-    for record in rows {
-        if MaterializedCheckVoidCompanionCarrier::parse(&record.bytes).is_ok() {
-            continue;
-        }
-        let adaptation = match adapt_enterprise_posting_row_partial(
-            Enterprise24AccountingTable::CheckLine,
-            schema,
-            &record.partial,
-        ) {
-            Ok(adaptation) => adaptation,
-            Err(_) => return Err(()),
-        };
-        if let EnterprisePostingAdaptation::Posting(row) = adaptation {
-            *balances.entry(row.transaction_id).or_default() += i128::from(row.amount_cents);
-        }
-    }
-    balances
-        .into_values()
-        .all(|balance| balance == 0)
-        .then_some(())
-        .ok_or(())
-}
-
-/// Requires every non-zero Check master in the complete table-3047 census to
-/// net to zero. The companion carrier is explicitly non-posting. A canonical
-/// zero contributes no monetary amount here, but does not establish lifecycle
-/// state; the later disposition gate must resolve it independently or block
-/// the ledger. This is a table-family invariant in addition to the final
-/// ledger's cross-family balance contract.
+#[cfg(test)]
 fn validate_check_master_balances(rows: &[Enterprise24PartialRecord]) -> Result<(), ()> {
-    let mut balances = BTreeMap::<u64, i128>::new();
+    let accounts = BTreeMap::from([
+        (7, AccountId::new("sample-account-a").unwrap()),
+        (8, AccountId::new("sample-account-b").unwrap()),
+    ]);
+    let table = Enterprise24PartialTableRows {
+        policy: enterprise24_r21_partial_table_policy(Enterprise24AccountingTable::CheckLine)
+            .ok_or(())?,
+        records: rows.to_vec(),
+        coverage: Enterprise24PartialTableCoverage::default(),
+    };
+    prepare_check_dispositions(&table, &accounts, |record| {
+        let row = MaterializedCheckPostingRow::parse(&record.bytes).map_err(|_| ())?;
+        adapt_materialized_check_posting_row(&row).map_err(|_| ())
+    })
+    .map(|_| ())
+}
+
+fn validate_materialized_bill_zero_families(rows: &[Enterprise24PartialRecord]) -> Result<(), ()> {
+    let mut families = BTreeMap::<u32, Vec<MaterializedBillPostingRow>>::new();
+    let mut targets = BTreeSet::new();
     for record in rows {
-        if MaterializedCheckVoidCompanionCarrier::parse(&record.bytes).is_ok() {
+        let row = MaterializedBillPostingRow::parse(&record.bytes).map_err(|_| ())?;
+        if !targets.insert(row.target_record_number()) {
+            return Err(());
+        }
+        families
+            .entry(row.master_record_number())
+            .or_default()
+            .push(row);
+    }
+    for family in families.values() {
+        let zeros = family
+            .iter()
+            .filter(|row| row.has_canonical_zero_amount())
+            .collect::<Vec<_>>();
+        if zeros.is_empty() {
             continue;
         }
-        let row = MaterializedCheckPostingRow::parse(&record.bytes).map_err(|_| ())?;
-        if !row.has_canonical_zero_amount() {
-            *balances
-                .entry(u64::from(row.master_record_number()))
-                .or_default() += i128::from(row.signed_cents());
+        // Canonical-zero splits can coexist with balanced monetary siblings.
+        // Logical targets identify distinct lines, even when accounts repeat.
+        // A uniform date and known view preserve the attested Bill family;
+        // zero does not select a current version or establish a void.
+        let zero = zeros[0];
+        let date = zero.posting_date().map_err(|_| ())?;
+        let kind = zero.transaction_kind().ok_or(())?;
+        let mut net = 0_i128;
+        for row in family {
+            if row.posting_date().map_err(|_| ())? != date || row.transaction_kind() != Some(kind) {
+                return Err(());
+            }
+            if !row.has_canonical_zero_amount() {
+                net += i128::from(row.signed_cents());
+            }
+        }
+        if net != 0 {
+            return Err(());
         }
     }
-    balances
+    Ok(())
+}
+
+/// Generic families that now expose an attested canonical-zero adaptation use
+/// the same no-mixed-siblings rule as Check. This includes Deposit so the new
+/// adapter branch cannot silently widen that family.
+fn validate_partial_zero_families(
+    table: Enterprise24AccountingTable,
+    rows: &[Enterprise24PartialRecord],
+    schema: &RowSchema,
+    proven_headers: &BTreeSet<(u64, u16)>,
+) -> Result<(), ()> {
+    let mut families = BTreeMap::<u64, (u32, u32)>::new();
+    let mut targets = BTreeSet::new();
+    for record in rows {
+        if proven_headers.contains(&(record.raw_page_number, record.record_id)) {
+            continue;
+        }
+        let adaptation =
+            adapt_enterprise_posting_row_partial(table, schema, &record.partial).map_err(|_| ())?;
+        let (target_id, transaction_id, zero) = match adaptation {
+            EnterprisePostingAdaptation::Posting(row) => (row.target_id, row.transaction_id, false),
+            EnterprisePostingAdaptation::Excluded(
+                EnterprisePostingExclusion::CanonicalZeroAmount {
+                    target_id,
+                    transaction_id,
+                    ..
+                },
+            )
+            | EnterprisePostingAdaptation::Excluded(
+                EnterprisePostingExclusion::CanonicalZeroVoided {
+                    target_id,
+                    transaction_id,
+                    ..
+                },
+            ) => (target_id, transaction_id, true),
+            EnterprisePostingAdaptation::Excluded(_) => continue,
+        };
+        if !targets.insert(target_id) {
+            return Err(());
+        }
+        let entry = families.entry(transaction_id).or_default();
+        if zero {
+            entry.0 += 1;
+        } else {
+            entry.1 += 1;
+        }
+    }
+    families
         .into_values()
-        .all(|balance| balance == 0)
+        .all(|(zeros, nonzeros)| zeros == 0 || nonzeros == 0)
         .then_some(())
         .ok_or(())
 }
@@ -2075,7 +2183,10 @@ fn normalized_disposition(
     match adaptation {
         EnterprisePostingAdaptation::Posting(row) => {
             let account_id = identity_map
-                .get(&(row.account_id as u32))
+                .get(
+                    &u32::try_from(row.account_id)
+                        .map_err(|_| NormalizationFailure::MissingAccountIdentity)?,
+                )
                 .cloned()
                 .ok_or(NormalizationFailure::MissingAccountIdentity)?;
             let (side, minor_units) = if row.amount_cents > 0 {
@@ -2118,6 +2229,18 @@ fn normalized_disposition(
                 }
                 EnterprisePostingExclusion::CanonicalZeroVoided { .. } => {
                     PostingExclusionReason::CanonicalZeroVoidedRow
+                }
+                EnterprisePostingExclusion::CanonicalZeroAmount { account_id, .. } => {
+                    // The adapter established all required monetary fields before
+                    // this branch. Resolve the account here as well, so a zero
+                    // row cannot bypass the same account-identity contract.
+                    identity_map
+                        .get(
+                            &u32::try_from(account_id)
+                                .map_err(|_| NormalizationFailure::MissingAccountIdentity)?,
+                        )
+                        .ok_or(NormalizationFailure::MissingAccountIdentity)?;
+                    PostingExclusionReason::CanonicalZeroAmount
                 }
             };
             Ok(PostingExclusion::new(provenance, reason).into())
@@ -2165,11 +2288,11 @@ mod tests {
         }
     }
 
-    fn check_record(
+    fn check_record<const N: usize>(
         target: u32,
         master: u32,
         account: u32,
-        amount: [u8; 4],
+        amount: [u8; N],
     ) -> Enterprise24PartialRecord {
         // Exact bounded terminal Check grammar: the source account is at
         // +0x1e and the monetary token begins at +0x53.
@@ -2428,6 +2551,24 @@ mod tests {
             validate_deposit_master_balances(&records, &schema, &headers),
             Ok(())
         );
+        assert!(
+            validate_partial_zero_families(
+                Enterprise24AccountingTable::DepositLine,
+                &records,
+                &schema,
+                &headers,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_partial_zero_families(
+                Enterprise24AccountingTable::DepositLine,
+                &records,
+                &schema,
+                &BTreeSet::new(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2627,7 +2768,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_check_strategy_fails_closed_for_unproven_canonical_zero_lifecycle() {
+    fn materialized_check_companion_requires_exact_family_and_resolved_accounts() {
         let master = 100;
         let records = vec![
             check_companion_record(
@@ -2635,8 +2776,8 @@ mod tests {
                 master,
                 crate::MATERIALIZED_CHECK_VOID_COMPANION_LONG_LEN,
             ),
-            check_record(101, master, 7, [0, 0x81, 0, 0]),
-            check_record(102, master, 8, [0, 0x81, 0, 0]),
+            check_record(101, master, 7, [0, 0x81]),
+            check_record(102, master, 8, [0, 0x81]),
         ];
         let rows = Enterprise24PartialTableRows {
             policy: enterprise24_r21_partial_table_policy(Enterprise24AccountingTable::CheckLine)
@@ -2644,7 +2785,18 @@ mod tests {
             records: records.clone(),
             coverage: Enterprise24PartialTableCoverage::default(),
         };
-        assert!(try_materialized_check_dispositions(&rows, &BTreeMap::new()).is_err());
+        let accounts = BTreeMap::from([
+            (7, AccountId::new("companion-zero-account-7").unwrap()),
+            (8, AccountId::new("companion-zero-account-8").unwrap()),
+        ]);
+        let selected =
+            try_materialized_check_dispositions(&rows, &deposit_schema(), &accounts).unwrap();
+        assert_eq!(selected.len(), 3);
+        assert!(
+            selected
+                .iter()
+                .all(|item| matches!(item, PostingDisposition::Excluded(_)))
+        );
 
         let mut duplicate = records.clone();
         duplicate.push(check_companion_record(
@@ -2657,7 +2809,10 @@ mod tests {
             records: duplicate,
             coverage: Enterprise24PartialTableCoverage::default(),
         };
-        assert!(try_materialized_check_dispositions(&duplicate_rows, &BTreeMap::new()).is_err());
+        assert!(
+            try_materialized_check_dispositions(&duplicate_rows, &deposit_schema(), &accounts)
+                .is_err()
+        );
 
         let collision_rows = Enterprise24PartialTableRows {
             policy: rows.policy,
@@ -2667,12 +2822,370 @@ mod tests {
                     master,
                     crate::MATERIALIZED_CHECK_VOID_COMPANION_LONG_LEN,
                 ),
-                check_record(101, master, 7, [0, 0x81, 0, 0]),
-                check_record(102, master, 8, [0, 0x81, 0, 0]),
+                check_record(101, master, 7, [0, 0x81]),
+                check_record(102, master, 8, [0, 0x81]),
             ],
             coverage: Enterprise24PartialTableCoverage::default(),
         };
-        assert!(try_materialized_check_dispositions(&collision_rows, &BTreeMap::new()).is_err());
+        assert!(
+            try_materialized_check_dispositions(&collision_rows, &deposit_schema(), &accounts)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn materialized_neutral_zero_only_check_family_is_not_a_void_claim() {
+        let rows = Enterprise24PartialTableRows {
+            policy: enterprise24_r21_partial_table_policy(Enterprise24AccountingTable::CheckLine)
+                .unwrap(),
+            records: vec![
+                check_record(101, 100, 7, [0, 0x81]),
+                check_record(102, 101, 8, [0, 0x81]),
+            ],
+            coverage: Enterprise24PartialTableCoverage::default(),
+        };
+        let accounts = BTreeMap::from([
+            (7, AccountId::new("neutral-zero-account-7").unwrap()),
+            (8, AccountId::new("neutral-zero-account-8").unwrap()),
+        ]);
+        let dispositions =
+            try_materialized_check_dispositions(&rows, &deposit_schema(), &accounts).unwrap();
+        assert_eq!(dispositions.len(), 2);
+        assert!(
+            dispositions
+                .iter()
+                .all(|item| matches!(item, PostingDisposition::Excluded(_)))
+        );
+    }
+
+    #[test]
+    fn materialized_mixed_zero_and_nonzero_check_master_stays_blocked() {
+        let rows = Enterprise24PartialTableRows {
+            policy: enterprise24_r21_partial_table_policy(Enterprise24AccountingTable::CheckLine)
+                .unwrap(),
+            records: vec![
+                check_record(101, 100, 7, [0, 0x81]),
+                check_record(102, 100, 8, [2, 0xbf, 1, 23]),
+            ],
+            coverage: Enterprise24PartialTableCoverage::default(),
+        };
+        assert!(
+            try_materialized_check_dispositions(&rows, &deposit_schema(), &BTreeMap::new())
+                .is_err()
+        );
+    }
+
+    fn schema_check_record(
+        target: u32,
+        master: u32,
+        account: i64,
+        zero: bool,
+    ) -> Enterprise24PartialRecord {
+        // The shared synthetic schema contains the named monetary prefix and
+        // Boolean sidecar consumed by the Check adapter. Raw carrier parsing
+        // is tested separately; these fixtures exercise the validated prefix.
+        let mut record = deposit_record(
+            target as u16,
+            i64::from(target),
+            i64::from(master),
+            crate::MATERIALIZED_CHECK_POSTING_KIND,
+            85,
+            Some(account),
+            Some((0xbf, 1)),
+            false,
+            false,
+        );
+        if zero {
+            record.partial.prefix_values[4].value =
+                Value::EnterpriseNumeric(EnterpriseNumericToken {
+                    marker: 0x81,
+                    digits: Vec::new(),
+                });
+        }
+        record
+    }
+
+    #[test]
+    fn schema_check_companion_requires_distinct_complete_zero_family() {
+        let schema = deposit_schema();
+        let accounts = BTreeMap::from([
+            (7, AccountId::new("sample-equity").unwrap()),
+            (8, AccountId::new("sample-cash").unwrap()),
+        ]);
+        let companion =
+            check_companion_record(103, 100, crate::MATERIALIZED_CHECK_VOID_COMPANION_LEN);
+        let first = schema_check_record(101, 100, 7, true);
+        let second = schema_check_record(102, 100, 8, true);
+        let rows = |records| Enterprise24PartialTableRows {
+            policy: enterprise24_r21_partial_table_policy(Enterprise24AccountingTable::CheckLine)
+                .unwrap(),
+            records,
+            coverage: Enterprise24PartialTableCoverage::default(),
+        };
+        let valid = rows(vec![companion.clone(), first.clone(), second.clone()]);
+        let result = try_partial_check_dispositions(&valid, &schema, &accounts).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|item| matches!(item,
+                    PostingDisposition::Excluded(excluded)
+                        if excluded.reason() == PostingExclusionReason::CanonicalZeroAmount
+                ))
+                .count(),
+            2
+        );
+
+        let mut duplicate_target = first.clone();
+        duplicate_target.record_id = 104;
+        let invalid_families = [
+            vec![companion.clone(), first.clone()],
+            vec![
+                companion.clone(),
+                first.clone(),
+                second.clone(),
+                schema_check_record(104, 100, 7, true),
+            ],
+            vec![companion.clone(), first.clone(), duplicate_target],
+            vec![
+                companion.clone(),
+                first.clone(),
+                second.clone(),
+                check_companion_record(104, 100, crate::MATERIALIZED_CHECK_VOID_COMPANION_LEN),
+            ],
+            vec![
+                companion.clone(),
+                first.clone(),
+                schema_check_record(103, 100, 8, true),
+            ],
+            vec![
+                companion.clone(),
+                first.clone(),
+                schema_check_record(102, 100, 8, false),
+            ],
+            vec![companion, first, schema_check_record(102, 100, 99, true)],
+        ];
+        for records in invalid_families {
+            assert!(try_partial_check_dispositions(&rows(records), &schema, &accounts).is_err());
+        }
+    }
+
+    fn bridged_check_zero(target: u32, master: u32, account: u32) -> Enterprise24PartialRecord {
+        let mut record = check_record(target, master, account, [0, 0x81]);
+        record.bytes.resize(188, 0);
+        record.bytes[..2].copy_from_slice(&188_u16.to_le_bytes());
+        record.bytes[24..28].copy_from_slice(&194_516_640_u32.to_le_bytes());
+        record.partial = schema_check_record(target, master, i64::from(account), true).partial;
+        record.partial.declared_size = record.bytes.len();
+        record
+    }
+
+    #[test]
+    fn check_zero_prefix_bridge_reaches_all_family_and_normalization_gates() {
+        let schema = deposit_schema();
+        let accounts = BTreeMap::from([
+            (7, AccountId::new("sample-account-a").unwrap()),
+            (8, AccountId::new("sample-account-b").unwrap()),
+        ]);
+        let first = bridged_check_zero(101, 100, 7);
+        assert!(matches!(
+            MaterializedCheckPostingRow::parse(&first.bytes),
+            Err(crate::MaterializedCheckPostingRowError::UnattestedAmountEnvelope { .. })
+        ));
+        let rows = Enterprise24PartialTableRows {
+            policy: enterprise24_r21_partial_table_policy(Enterprise24AccountingTable::CheckLine)
+                .unwrap(),
+            records: vec![
+                check_companion_record(103, 100, crate::MATERIALIZED_CHECK_VOID_COMPANION_LONG_LEN),
+                first.clone(),
+                bridged_check_zero(102, 100, 8),
+            ],
+            coverage: Enterprise24PartialTableCoverage::default(),
+        };
+        let selected = try_materialized_check_dispositions(&rows, &schema, &accounts).unwrap();
+        assert_eq!(selected.len(), 3);
+        assert_eq!(
+            selected
+                .iter()
+                .filter(|item| matches!(item,
+                    PostingDisposition::Excluded(excluded)
+                        if excluded.reason() == PostingExclusionReason::CanonicalZeroAmount
+                ))
+                .count(),
+            2
+        );
+
+        let mut unknown_account = rows.clone();
+        unknown_account.records[1] = bridged_check_zero(101, 100, 99);
+        assert!(try_materialized_check_dispositions(&unknown_account, &schema, &accounts).is_err());
+
+        let mut mismatched_target = first.clone();
+        mismatched_target.bytes[12..16].copy_from_slice(&199_u32.to_le_bytes());
+        let mut mismatched_date = first.clone();
+        mismatched_date.bytes[24..28].copy_from_slice(&194_518_080_u32.to_le_bytes());
+        let mut invalid_flags = first.clone();
+        invalid_flags.bytes[2] = 0x40;
+        let mut invalid_source = first.clone();
+        invalid_source.bytes[30..38].fill(0);
+        let mut malformed_length = first.clone();
+        malformed_length.bytes[..2].copy_from_slice(&189_u16.to_le_bytes());
+        let mut schema_nonzero = first.clone();
+        schema_nonzero.partial.prefix_values[4].value =
+            Value::EnterpriseNumeric(EnterpriseNumericToken {
+                marker: 0xbf,
+                digits: vec![1],
+            });
+        let mut schema_missing_account = first.clone();
+        schema_missing_account.partial.prefix_values[2].value = Value::Null;
+        let mut schema_bad_date = first;
+        schema_bad_date.partial.prefix_values[3].value = Value::Date(SaDate { raw_minutes: 1 });
+        for invalid in [
+            mismatched_target,
+            mismatched_date,
+            invalid_flags,
+            invalid_source,
+            malformed_length,
+            schema_nonzero,
+            schema_missing_account,
+            schema_bad_date,
+        ] {
+            assert!(adapt_check_observation(&invalid, &schema).is_err());
+        }
+    }
+
+    #[test]
+    fn neutral_bill_payment_rows_keep_logical_identity_and_mixed_master_guards() {
+        let schema = deposit_schema();
+        let first = schema_check_record(101, 100, 7, true);
+        let second = schema_check_record(102, 100, 8, true);
+        let table = Enterprise24AccountingTable::BillPaymentCheckLine;
+        assert!(
+            validate_partial_zero_families(
+                table,
+                &[first.clone(), second],
+                &schema,
+                &BTreeSet::new()
+            )
+            .is_ok()
+        );
+        let mut duplicate_target = first.clone();
+        duplicate_target.record_id = 104;
+        assert!(
+            validate_partial_zero_families(
+                table,
+                &[first.clone(), duplicate_target],
+                &schema,
+                &BTreeSet::new()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_partial_zero_families(
+                table,
+                &[first, schema_check_record(102, 100, 8, false)],
+                &schema,
+                &BTreeSet::new()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn neutral_zero_account_join_rejects_missing_and_truncated_aliases() {
+        let accounts = BTreeMap::from([(7, AccountId::new("sample-account").unwrap())]);
+        let record = schema_check_record(101, 100, 7, true);
+        for account_id in [99_u64, u64::from(u32::MAX) + 8] {
+            let adaptation = EnterprisePostingAdaptation::Excluded(
+                EnterprisePostingExclusion::CanonicalZeroAmount {
+                    target_id: 101,
+                    transaction_id: 100,
+                    account_id,
+                    transaction_date: 1,
+                    transaction_type: crate::EnterprisePostingTransactionType::Check,
+                },
+            );
+            assert!(matches!(
+                normalized_disposition(
+                    Enterprise24AccountingTable::CheckLine,
+                    &record,
+                    adaptation,
+                    &accounts,
+                    "sample-decoder"
+                ),
+                Err(NormalizationFailure::MissingAccountIdentity)
+            ));
+        }
+    }
+
+    fn bill_family_record(target: u32, account: u32, amount: &[u8]) -> Enterprise24PartialRecord {
+        let mut bytes = vec![0_u8; 64];
+        bytes[..2].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[2] = 0x40;
+        bytes[3] = 0x02;
+        bytes[4] = 0xe4;
+        bytes[12..16].copy_from_slice(&target.to_le_bytes());
+        bytes[16..20].copy_from_slice(&100_u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&account.to_le_bytes());
+        bytes[24..28].copy_from_slice(&194_516_640_u32.to_le_bytes());
+        bytes[28..30].copy_from_slice(&9_u16.to_le_bytes());
+        bytes[56 - amount.len()..56].copy_from_slice(amount);
+        bytes[59..].copy_from_slice(&[0, 0, 0, 0, 0x81]);
+        Enterprise24PartialRecord {
+            raw_page_number: 1,
+            record_id: target as u16,
+            bytes,
+            partial: partial(1),
+        }
+    }
+
+    #[test]
+    fn bill_neutral_split_requires_complete_distinct_balanced_family() {
+        let zero = bill_family_record(101, 7, &[0, 0x81]);
+        let debit = bill_family_record(102, 8, &[1, 0xbf, 1]);
+        let credit = bill_family_record(103, 9, &[1, 0x3f, 1]);
+        assert!(
+            validate_materialized_bill_zero_families(&[
+                zero.clone(),
+                debit.clone(),
+                credit.clone()
+            ])
+            .is_ok()
+        );
+        assert!(
+            validate_materialized_bill_zero_families(&[
+                zero.clone(),
+                bill_family_record(104, 8, &[0, 0x81]),
+                bill_family_record(105, 8, &[0, 0x81]),
+                debit.clone(),
+                credit.clone(),
+            ])
+            .is_ok()
+        );
+        assert!(
+            validate_materialized_bill_zero_families(&[
+                zero.clone(),
+                bill_family_record(102, 7, &[1, 0xbf, 1]),
+                credit.clone(),
+            ])
+            .is_ok()
+        );
+
+        let mut different_date = credit.clone();
+        different_date.bytes[24..28].copy_from_slice(&194_518_080_u32.to_le_bytes());
+        let mut different_view = credit.clone();
+        different_view.bytes[28..30].copy_from_slice(&12_u16.to_le_bytes());
+        let mut malformed_date = zero.clone();
+        malformed_date.bytes[24..28].copy_from_slice(&1_u32.to_le_bytes());
+        for records in [
+            vec![zero.clone(), debit.clone()],
+            vec![zero.clone(), debit.clone(), different_date],
+            vec![zero.clone(), debit.clone(), different_view],
+            vec![malformed_date, debit.clone(), credit.clone()],
+            vec![zero.clone(), zero.clone(), debit.clone(), credit.clone()],
+            vec![zero, debit, bill_family_record(102, 9, &[1, 0x3f, 1])],
+        ] {
+            assert!(validate_materialized_bill_zero_families(&records).is_err());
+        }
     }
 
     #[test]

@@ -20,9 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Canonical numeric zero no longer claims that a Bill or Check row is voided;
-  complete accounting output remains blocked until independent lifecycle
-  evidence resolves the row.
+- Validated canonical-zero Bill, bill-payment, and Check rows can remain
+  neutral accounting exclusions without claiming a void or deletion. Complete
+  transaction topology and account/date validation still gate output.
+- Check extraction supports bounded repeated-amount envelopes and
+  header-matched zero-prefix evidence, and distinguishes a rejected decoding
+  strategy from a proven monetary imbalance.
 - Duplicate account identities, mismatched/duplicate table coverage, and
   conflicting SYSTABLE identities now fail closed instead of selecting one by
   iteration order.

@@ -173,6 +173,9 @@ fn accounting_blocker_summary(
             openqbw::Enterprise24AccountingPipelineBlocker::UnbalancedPostingMasters {
                 table_id,
             } => format!("unbalanced-posting-masters-table-{table_id}"),
+            openqbw::Enterprise24AccountingPipelineBlocker::PostingStrategyRejected {
+                table_id,
+            } => format!("posting-strategy-rejected-table-{table_id}"),
             openqbw::Enterprise24AccountingPipelineBlocker::LedgerContractRejected => {
                 "ledger-contract-rejected".to_owned()
             }
