@@ -41,8 +41,15 @@ jobs:
       - name: Checkout OpenSQLAnywhere (sibling path dep)
         uses: actions/checkout@v7
         with:
-          repository: Sigilweaver/OpenSQLAnywhere
+          repository: Balaxxe/opensqlanywhere
+          ref: cb75087cef8f8e1d01f53e9f0d294663dfbfb6b7
           path: OpenSQLAnywhere
+
+      - name: Patch OpenSQLAnywhere into Cargo
+        shell: bash
+        run: |
+          mkdir -p OpenQBW/.cargo
+          printf '%s\n' '[patch.crates-io]' 'opensqlany = { path = "../OpenSQLAnywhere/crates/opensqlany" }' > OpenQBW/.cargo/config.toml
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -72,8 +79,15 @@ jobs:
       - name: Checkout OpenSQLAnywhere (sibling path dep)
         uses: actions/checkout@v7
         with:
-          repository: Sigilweaver/OpenSQLAnywhere
+          repository: Balaxxe/opensqlanywhere
+          ref: cb75087cef8f8e1d01f53e9f0d294663dfbfb6b7
           path: OpenSQLAnywhere
+
+      - name: Patch OpenSQLAnywhere into Cargo
+        shell: bash
+        run: |
+          mkdir -p OpenQBW/.cargo
+          printf '%s\n' '[patch.crates-io]' 'opensqlany = { path = "../OpenSQLAnywhere/crates/opensqlany" }' > OpenQBW/.cargo/config.toml
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -103,8 +117,15 @@ jobs:
       - name: Checkout OpenSQLAnywhere (sibling path dep)
         uses: actions/checkout@v7
         with:
-          repository: Sigilweaver/OpenSQLAnywhere
+          repository: Balaxxe/opensqlanywhere
+          ref: cb75087cef8f8e1d01f53e9f0d294663dfbfb6b7
           path: OpenSQLAnywhere
+
+      - name: Patch OpenSQLAnywhere into Cargo
+        shell: bash
+        run: |
+          mkdir -p OpenQBW/.cargo
+          printf '%s\n' '[patch.crates-io]' 'opensqlany = { path = "../OpenSQLAnywhere/crates/opensqlany" }' > OpenQBW/.cargo/config.toml
 
       - uses: dtolnay/rust-toolchain@stable
 
