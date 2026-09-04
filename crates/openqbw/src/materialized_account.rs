@@ -25,6 +25,8 @@ pub enum MaterializedAccountType {
     Bank,
     /// Controlled Other Current Asset code 2.
     OtherCurrentAsset,
+    /// Calibrated Credit Card code 6.
+    CreditCard,
     /// Controlled Other Current Liability code 7.
     OtherCurrentLiability,
     /// Controlled Expense code 12.
@@ -42,6 +44,7 @@ impl MaterializedAccountType {
         match self {
             Self::Bank => 0,
             Self::OtherCurrentAsset => 2,
+            Self::CreditCard => 6,
             Self::OtherCurrentLiability => 7,
             Self::Expense => 12,
             Self::OtherIncome => 13,
@@ -53,6 +56,7 @@ impl MaterializedAccountType {
         match code {
             0 => Self::Bank,
             2 => Self::OtherCurrentAsset,
+            6 => Self::CreditCard,
             7 => Self::OtherCurrentLiability,
             12 => Self::Expense,
             13 => Self::OtherIncome,
@@ -420,7 +424,7 @@ mod tests {
         row
     }
     #[test]
-    fn parses_five_calibrated_types_at_name_relative_offsets() {
+    fn parses_six_calibrated_types_at_name_relative_offsets() {
         for (name, recnum, code, ty) in [
             ("SAMPLE_Bank", 488, 0, MaterializedAccountType::Bank),
             (
@@ -430,15 +434,21 @@ mod tests {
                 MaterializedAccountType::OtherCurrentAsset,
             ),
             (
-                "SAMPLE_Liability",
+                "SAMPLE_CreditCard",
                 490,
+                6,
+                MaterializedAccountType::CreditCard,
+            ),
+            (
+                "SAMPLE_Liability",
+                491,
                 7,
                 MaterializedAccountType::OtherCurrentLiability,
             ),
-            ("SAMPLE_Expense", 491, 12, MaterializedAccountType::Expense),
+            ("SAMPLE_Expense", 492, 12, MaterializedAccountType::Expense),
             (
                 "SAMPLE_Income",
-                492,
+                493,
                 13,
                 MaterializedAccountType::OtherIncome,
             ),
@@ -475,6 +485,7 @@ mod tests {
         for (name, code, number, description) in [
             ("SAMPLE_Bank", 0, "1000", "sample bank"),
             ("SAMPLE_Asset", 2, "1010", "sample asset"),
+            ("SAMPLE_CreditCard", 6, "2010", "sample credit card"),
             ("SAMPLE_Liability", 7, "2000", "sample liability"),
             ("SAMPLE_Expense", 12, "5000", "sample expense"),
             ("SAMPLE_Income", 13, "4000", "sample income"),

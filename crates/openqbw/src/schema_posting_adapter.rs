@@ -82,12 +82,12 @@ pub fn adapt_materialized_bill_posting_row(
     let target_id = u64::from(row.target_record_number());
     let transaction_id = u64::from(row.master_record_number());
     if row.has_canonical_zero_amount() {
-        return Ok(EnterprisePostingAdaptation::Excluded(
-            EnterprisePostingExclusion::CanonicalZeroVoided {
+        return Err(
+            EnterprisePostingAdapterError::CanonicalZeroRequiresLifecycleEvidence {
                 target_id,
                 transaction_id,
             },
-        ));
+        );
     }
     let transaction_date = row
         .posting_date()
@@ -158,12 +158,12 @@ pub fn adapt_materialized_check_posting_row(
     let target_id = u64::from(row.target_record_number());
     let transaction_id = u64::from(row.master_record_number());
     if row.has_canonical_zero_amount() {
-        return Ok(EnterprisePostingAdaptation::Excluded(
-            EnterprisePostingExclusion::CanonicalZeroVoided {
+        return Err(
+            EnterprisePostingAdapterError::CanonicalZeroRequiresLifecycleEvidence {
                 target_id,
                 transaction_id,
             },
-        ));
+        );
     }
     let transaction_date = row
         .posting_date()
@@ -227,9 +227,10 @@ pub enum EnterprisePostingExclusion {
     },
     /// The line carries the exact observed canonical zero amount token.
     ///
-    /// This is a void/tombstone-style non-posting disposition, not a
-    /// zero-valued ledger posting. The source identifiers remain available
-    /// for lifecycle reconciliation.
+    /// This legacy exclusion is valid only after independent lifecycle
+    /// evidence establishes a void/tombstone. Production adapters do not infer
+    /// it from the zero token alone. Source identifiers remain available for
+    /// lifecycle reconciliation.
     CanonicalZeroVoided {
         /// Logical line identity retained for audit/provenance.
         target_id: u64,
@@ -316,12 +317,12 @@ pub fn adapt_enterprise_posting_row(
     }
     let amount = required_amount(schema, &row, layout.amount_amt)?;
     if amount.canonical_zero {
-        return Ok(EnterprisePostingAdaptation::Excluded(
-            EnterprisePostingExclusion::CanonicalZeroVoided {
+        return Err(
+            EnterprisePostingAdapterError::CanonicalZeroRequiresLifecycleEvidence {
                 target_id,
                 transaction_id,
             },
-        ));
+        );
     }
     let account_id = required_id(schema, &row, layout.account_id)?;
     let transaction_date = required_date(schema, &row, layout.transaction_date)?;
@@ -384,12 +385,12 @@ pub fn adapt_enterprise_posting_row_partial(
     }
     let amount = partial_required_amount(schema, partial, layout.amount_amt)?;
     if amount.canonical_zero {
-        return Ok(EnterprisePostingAdaptation::Excluded(
-            EnterprisePostingExclusion::CanonicalZeroVoided {
+        return Err(
+            EnterprisePostingAdapterError::CanonicalZeroRequiresLifecycleEvidence {
                 target_id,
                 transaction_id,
             },
-        ));
+        );
     }
     let transaction_type = EnterprisePostingTransactionType::fixed_for_table(table)
         .ok_or(EnterprisePostingAdapterError::TransactionTypeRequiresDedicatedDecoder { table })?;
@@ -787,6 +788,17 @@ fn named_column<'a>(
 /// Reasons a schema-decoded row cannot safely become a posting candidate.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum EnterprisePostingAdapterError {
+    /// A canonical numeric zero is not, by itself, proof that the row was
+    /// deleted or voided. A separate lifecycle resolver must attest it.
+    #[error(
+        "canonical zero amount for target {target_id} / transaction {transaction_id} lacks lifecycle evidence"
+    )]
+    CanonicalZeroRequiresLifecycleEvidence {
+        /// Logical line identity retained for audit diagnostics.
+        target_id: u64,
+        /// Logical transaction identity requiring independent lifecycle evidence.
+        transaction_id: u64,
+    },
     /// A partial row's retained id/index provenance did not match the schema
     /// used to resolve a named field.
     #[error("partial posting value for column {name} does not match schema provenance")]
@@ -1093,9 +1105,7 @@ mod tests {
                 &schema(true),
                 &voided,
             ),
-            Ok(EnterprisePostingAdaptation::Excluded(
-                EnterprisePostingExclusion::CanonicalZeroVoided { .. }
-            ))
+            Err(EnterprisePostingAdapterError::CanonicalZeroRequiresLifecycleEvidence { .. })
         ));
         let mut source_link = partial(false, false);
         source_link.prefix_values[4].value = Value::Null;
@@ -1191,30 +1201,28 @@ mod tests {
     }
 
     #[test]
-    fn gates_the_exact_canonical_zero_token_as_voided_not_a_zero_posting() {
+    fn rejects_canonical_zero_without_independent_lifecycle_evidence() {
         let mut voided = row(false, false);
         voided.values[4] = Value::EnterpriseNumeric(EnterpriseNumericToken {
             marker: 0x81,
             digits: Vec::new(),
         });
-        // A canonical-zero disposition must not rely on accounting fields
-        // that a physical void/tombstone is permitted to omit.
+        // A numeric zero alone cannot establish a deletion or void lifecycle.
         voided.values[2] = Value::Null;
         voided.values[3] = Value::Null;
-        assert_eq!(
+        assert!(matches!(
             adapt_enterprise_posting_row(
                 Enterprise24AccountingTable::CheckLine,
                 &schema(true),
                 voided,
-            )
-            .unwrap(),
-            EnterprisePostingAdaptation::Excluded(
-                EnterprisePostingExclusion::CanonicalZeroVoided {
+            ),
+            Err(
+                EnterprisePostingAdapterError::CanonicalZeroRequiresLifecycleEvidence {
                     target_id: 7,
                     transaction_id: 11,
                 }
             )
-        );
+        ));
     }
 
     #[test]

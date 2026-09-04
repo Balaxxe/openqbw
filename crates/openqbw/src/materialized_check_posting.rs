@@ -268,6 +268,12 @@ pub enum MaterializedCheckPostingRowError {
     /// The bounded base-100 amount did not fit signed cents.
     #[error("materialized Check amount exceeded signed cents")]
     AmountOverflow,
+    /// The row contains bytes outside every explicitly calibrated amount envelope.
+    #[error("materialized Check amount has no attested envelope in a {segment_len}-byte segment")]
+    UnattestedAmountEnvelope {
+        /// Exact declared row length that did not match a calibrated envelope.
+        segment_len: usize,
+    },
     /// Neither controlled shape supplied a nonzero source account at its shape-specific offset.
     #[error("materialized Check {shape:?} row lacks a source account")]
     MissingSourceAccount {
@@ -304,7 +310,118 @@ fn decode_shape_amount(
                 field
             }
         };
-    decode_amount(amount, input.len())
+    // A direct field is attested only when it consumes the whole bounded
+    // carrier.  Parsing a valid numeric prefix while ignoring arbitrary
+    // declared bytes would turn an unknown row revision into a current
+    // accounting posting.
+    let direct_token_len = amount
+        .first()
+        .and_then(|digits| usize::from(*digits).checked_add(2));
+    let direct_is_exact =
+        direct_token_len.and_then(|length| offset.checked_add(length)) == Some(input.len());
+    let primary_error = match decode_amount(amount, input.len()) {
+        // Preserve a malformed numeric diagnostic even if the surrounding
+        // envelope is not recognized.
+        Err(error) => error,
+        Ok(decoded) if direct_is_exact => return Ok(decoded),
+        Ok(_) => MaterializedCheckPostingRowError::UnattestedAmountEnvelope {
+            segment_len: input.len(),
+        },
+    };
+    match decode_repeated_tail_amount(input) {
+        RepeatedTailAmount::Decoded(decoded) => Ok(decoded),
+        RepeatedTailAmount::Malformed => Err(primary_error),
+        RepeatedTailAmount::NotApplicable => {
+            // Enterprise 24 also materializes the same Check amount field
+            // after one of three longer nullable/variable envelopes.  Accept
+            // an alternate envelope only when exactly one bounded amount is
+            // repeated later byte-for-byte in the same row.
+            // The only non-tail alternative calibrated so far is the
+            // fixed 0x90-byte nullable envelope.  It carries exactly two
+            // matching copies at the fixed offsets below.
+            if input.len() != 0x90 {
+                return Err(primary_error);
+            }
+            let candidates = [0x6d_usize, 0x80]
+                .into_iter()
+                .filter_map(|candidate_offset| {
+                    let tail = input.get(candidate_offset..)?;
+                    let digits = usize::from(*tail.first()?);
+                    let token_len = 2_usize.checked_add(digits)?;
+                    let token = tail.get(..token_len)?;
+                    let decoded = decode_amount(token, input.len()).ok()?;
+                    input
+                        .get(if candidate_offset == 0x6d { 0x80 } else { 0x6d }..)
+                        .is_some_and(|other| other.get(..token_len) == Some(token))
+                        .then_some(decoded)
+                })
+                .collect::<Vec<_>>();
+            match candidates.first().copied() {
+                Some(decoded) if candidates.iter().all(|candidate| *candidate == decoded) => {
+                    Ok(decoded)
+                }
+                _ => Err(primary_error),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepeatedTailAmount {
+    NotApplicable,
+    Decoded((i64, bool)),
+    Malformed,
+}
+
+fn decode_repeated_tail_amount(input: &[u8]) -> RepeatedTailAmount {
+    let grammars = [
+        (
+            matches!(input.len(), 209 | 216 | 217),
+            2_usize,
+            &[107_usize, 126][..],
+        ),
+        (matches!(input.len(), 209 | 217), 3_usize, &[109_usize][..]),
+        (input.len() == 216, 4_usize, &[109_usize][..]),
+        (true, 6_usize, &[115_usize][..]),
+    ];
+    let mut saw_signature = false;
+    let mut decoded = Vec::new();
+    for (length_matches, token_len, prefix_offsets) in grammars {
+        if !length_matches
+            || input.get(prefix_offsets[0]).copied() != u8::try_from(token_len - 2).ok()
+        {
+            continue;
+        }
+        saw_signature = true;
+        let Some(second_start) = input.len().checked_sub(token_len + 7) else {
+            continue;
+        };
+        let Some(first_start) = second_start.checked_sub(token_len + 5) else {
+            continue;
+        };
+        let Some(first) = input.get(first_start..first_start + token_len) else {
+            continue;
+        };
+        let Some(second) = input.get(second_start..second_start + token_len) else {
+            continue;
+        };
+        if first != second
+            || usize::from(first[0]) + 2 != token_len
+            || prefix_offsets
+                .iter()
+                .any(|offset| input.get(*offset..*offset + token_len) != Some(first))
+        {
+            continue;
+        }
+        if let Ok(amount) = decode_amount(first, input.len()) {
+            decoded.push(amount);
+        }
+    }
+    match decoded.as_slice() {
+        [amount] => RepeatedTailAmount::Decoded(*amount),
+        [] if !saw_signature => RepeatedTailAmount::NotApplicable,
+        _ => RepeatedTailAmount::Malformed,
+    }
 }
 
 fn decode_amount(
@@ -453,6 +570,163 @@ mod tests {
         assert_eq!(voided.signed_cents(), 0);
         assert!(voided.has_canonical_zero_amount());
         assert_eq!(voided.edit_sequence(), SAMPLE_EDIT_AFTER);
+    }
+
+    #[test]
+    fn alternate_amount_envelope_requires_one_repeated_value() {
+        let mut extended = row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            None,
+            &[1, 0x14, 0],
+            SAMPLE_EDIT_BEFORE,
+        );
+        extended.resize(0x90, 0);
+        let extended_len = extended.len() as u16;
+        extended[..2].copy_from_slice(&extended_len.to_le_bytes());
+        let amount = [2, 0xbf, 41, 37];
+        extended[0x6d..0x6d + amount.len()].copy_from_slice(&amount);
+        extended[0x80..0x80 + amount.len()].copy_from_slice(&amount);
+        assert_eq!(
+            MaterializedCheckPostingRow::parse(&extended)
+                .unwrap()
+                .signed_cents(),
+            3_741
+        );
+
+        let mut ambiguous = extended;
+        ambiguous.resize(0xa0, 0);
+        let ambiguous_len = ambiguous.len() as u16;
+        ambiguous[..2].copy_from_slice(&ambiguous_len.to_le_bytes());
+        let other = [1, 0x3f, 9];
+        ambiguous[0x4f..0x4f + other.len()].copy_from_slice(&other);
+        ambiguous[0x94..0x94 + other.len()].copy_from_slice(&other);
+        assert!(MaterializedCheckPostingRow::parse(&ambiguous).is_err());
+    }
+
+    #[test]
+    fn rejects_a_valid_amount_prefix_with_unattested_declared_tail_bytes() {
+        let mut extended = row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            None,
+            &[2, 0xbf, 41, 37],
+            SAMPLE_EDIT_BEFORE,
+        );
+        extended.extend_from_slice(&[0xde, 0xad]);
+        let extended_len = extended.len();
+        extended[..2].copy_from_slice(&(extended_len as u16).to_le_bytes());
+        assert_eq!(
+            MaterializedCheckPostingRow::parse(&extended),
+            Err(MaterializedCheckPostingRowError::UnattestedAmountEnvelope {
+                segment_len: extended_len,
+            })
+        );
+    }
+
+    #[test]
+    fn repeated_tail_zero_envelope_requires_all_four_exact_copies() {
+        for envelope_len in [209_usize, 216, 217] {
+            let mut extended = row(
+                SAMPLE_EXPENSE_TARGET,
+                SAMPLE_EXPENSE_ACCOUNT,
+                None,
+                &[1, 0x14, 0],
+                SAMPLE_EDIT_BEFORE,
+            );
+            extended.resize(envelope_len, 0);
+            extended[..2].copy_from_slice(&(envelope_len as u16).to_le_bytes());
+            let zero = [0, 0x81];
+            for offset in [107, 126, envelope_len - 16, envelope_len - 9] {
+                extended[offset..offset + zero.len()].copy_from_slice(&zero);
+            }
+            let parsed = MaterializedCheckPostingRow::parse(&extended).unwrap();
+            assert_eq!(parsed.signed_cents(), 0);
+            assert!(parsed.has_canonical_zero_amount());
+
+            extended[envelope_len - 9 + 1] ^= 1;
+            assert!(MaterializedCheckPostingRow::parse(&extended).is_err());
+        }
+
+        let mut unsupported_len = row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            None,
+            &[1, 0x14, 0],
+            SAMPLE_EDIT_BEFORE,
+        );
+        unsupported_len.resize(218, 0);
+        unsupported_len[..2].copy_from_slice(&218_u16.to_le_bytes());
+        for offset in [107, 126, 218 - 16, 218 - 9] {
+            unsupported_len[offset..offset + 2].copy_from_slice(&[0, 0x81]);
+        }
+        assert!(MaterializedCheckPostingRow::parse(&unsupported_len).is_err());
+    }
+
+    #[test]
+    fn repeated_tail_variable_envelopes_require_their_exact_prefix_and_tail_copies() {
+        for (envelope_len, amount, expected) in [
+            (217_usize, vec![1, 0xbf, 7], 7_i64),
+            (209_usize, vec![1, 0xbf, 7], 7_i64),
+            (216_usize, vec![2, 0xbf, 41, 37], 3_741_i64),
+        ] {
+            let mut extended = row(
+                SAMPLE_EXPENSE_TARGET,
+                SAMPLE_EXPENSE_ACCOUNT,
+                None,
+                &[1, 0x14, 0],
+                SAMPLE_EDIT_BEFORE,
+            );
+            extended.resize(envelope_len, 0);
+            extended[..2].copy_from_slice(&(envelope_len as u16).to_le_bytes());
+            let token_len = amount.len();
+            let second_tail = envelope_len - token_len - 7;
+            let first_tail = second_tail - token_len - 5;
+            for offset in [109, first_tail, second_tail] {
+                extended[offset..offset + token_len].copy_from_slice(&amount);
+            }
+            extended[129..131].copy_from_slice(&[0, 0x81]);
+            assert_eq!(
+                MaterializedCheckPostingRow::parse(&extended)
+                    .unwrap()
+                    .signed_cents(),
+                expected
+            );
+
+            extended[second_tail + token_len - 1] ^= 1;
+            assert!(MaterializedCheckPostingRow::parse(&extended).is_err());
+        }
+    }
+
+    #[test]
+    fn repeated_tail_nonzero_envelope_uses_only_its_three_proven_copies() {
+        let envelope_len = 240_usize;
+        let mut extended = row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            None,
+            &[1, 0x14, 0],
+            SAMPLE_EDIT_BEFORE,
+        );
+        extended.resize(envelope_len, 0);
+        extended[..2].copy_from_slice(&(envelope_len as u16).to_le_bytes());
+        let amount = [4, 0xbf, 1, 2, 3, 4];
+        for offset in [115, envelope_len - 24, envelope_len - 13] {
+            extended[offset..offset + amount.len()].copy_from_slice(&amount);
+        }
+        // A different, repeated valid token at legacy candidate locations
+        // must not displace the independently attested tail grammar.
+        extended[0x4f..0x51].copy_from_slice(&[0, 0x81]);
+        extended[0x6a..0x6c].copy_from_slice(&[0, 0x81]);
+        assert_eq!(
+            MaterializedCheckPostingRow::parse(&extended)
+                .unwrap()
+                .signed_cents(),
+            4_030_201
+        );
+
+        extended[envelope_len - 13 + 2] ^= 1;
+        assert!(MaterializedCheckPostingRow::parse(&extended).is_err());
     }
 
     #[test]

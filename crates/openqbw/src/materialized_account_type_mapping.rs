@@ -15,11 +15,13 @@
 //! code joined exactly one AccountQuery `AccountType`; no accepted code had a
 //! conflicting label.
 //!
-//! Code `11` has a separate, stronger calibration path.  The installed
+//! Codes `6` and `11` have a separate, stronger calibration path. The installed
 //! Enterprise 24 `qblist32` static Account-type label table is a contiguous
 //! zero-based sequence whose surrounding labels exactly agree with the
 //! independently joined materialized codes `0..=5` and `7..=14`.  Its ordinal
-//! 11 label is `Cost of Goods Sold`, between `Income` (10) and `Expense` (12).
+//! 6 label is `Credit Card`, between `Accounts Payable` (5) and
+//! `Other Current Liability` (7); ordinal 11 is `Cost of Goods Sold`, between
+//! `Income` (10) and `Expense` (12).
 //! A private aggregate-only B3 corpus check also found one structurally valid
 //! code-11 Account row with one bounded ordinary identity; it had no current
 //! Account Listing representative, so no name, identifier, or company data is
@@ -49,6 +51,8 @@ pub enum QuickBooksAccountClassification {
     OtherAsset,
     /// Trade payable account.
     AccountsPayable,
+    /// Credit-card liability account.
+    CreditCard,
     /// Other current liability.
     OtherCurrentLiability,
     /// Long-term liability.
@@ -78,6 +82,7 @@ impl QuickBooksAccountClassification {
             Self::FixedAsset => 3,
             Self::OtherAsset => 4,
             Self::AccountsPayable => 5,
+            Self::CreditCard => 6,
             Self::OtherCurrentLiability => 7,
             Self::LongTermLiability => 8,
             Self::Equity => 9,
@@ -99,6 +104,7 @@ impl QuickBooksAccountClassification {
             Self::FixedAsset => "FixedAsset",
             Self::OtherAsset => "OtherAsset",
             Self::AccountsPayable => "AccountsPayable",
+            Self::CreditCard => "CreditCard",
             Self::OtherCurrentLiability => "OtherCurrentLiability",
             Self::LongTermLiability => "LongTermLiability",
             Self::Equity => "Equity",
@@ -119,9 +125,10 @@ impl QuickBooksAccountClassification {
             | Self::OtherCurrentAsset
             | Self::FixedAsset
             | Self::OtherAsset => AccountType::Asset,
-            Self::AccountsPayable | Self::OtherCurrentLiability | Self::LongTermLiability => {
-                AccountType::Liability
-            }
+            Self::AccountsPayable
+            | Self::CreditCard
+            | Self::OtherCurrentLiability
+            | Self::LongTermLiability => AccountType::Liability,
             Self::Equity => AccountType::Equity,
             Self::Income | Self::OtherIncome => AccountType::Income,
             Self::CostOfGoodsSold => AccountType::CostOfGoodsSold,
@@ -132,10 +139,10 @@ impl QuickBooksAccountClassification {
 
 /// Returns the calibrated classification for one materialized Account code.
 ///
-/// Codes `6` and `15` remain intentionally rejected: neither has a
-/// calibration path sufficient for accounting output. Code `11` is accepted
-/// under the static-table/corpus calibration documented at this module's
-/// evidence boundary.
+/// Code `15` remains intentionally rejected because it has no calibration
+/// path sufficient for accounting output. Codes `6` and `11` are accepted
+/// under the complete static-label-table ordinal alignment documented at this
+/// module's evidence boundary.
 pub const fn map_materialized_account_type_code(
     code: u8,
 ) -> Result<QuickBooksAccountClassification, MaterializedAccountTypeMappingError> {
@@ -146,6 +153,7 @@ pub const fn map_materialized_account_type_code(
         3 => Ok(QuickBooksAccountClassification::FixedAsset),
         4 => Ok(QuickBooksAccountClassification::OtherAsset),
         5 => Ok(QuickBooksAccountClassification::AccountsPayable),
+        6 => Ok(QuickBooksAccountClassification::CreditCard),
         7 => Ok(QuickBooksAccountClassification::OtherCurrentLiability),
         8 => Ok(QuickBooksAccountClassification::LongTermLiability),
         9 => Ok(QuickBooksAccountClassification::Equity),
@@ -203,6 +211,11 @@ mod tests {
                 AccountType::Liability,
             ),
             (
+                6,
+                QuickBooksAccountClassification::CreditCard,
+                AccountType::Liability,
+            ),
+            (
                 7,
                 QuickBooksAccountClassification::OtherCurrentLiability,
                 AccountType::Liability,
@@ -254,7 +267,7 @@ mod tests {
 
     #[test]
     fn rejects_unobserved_or_unknown_codes_instead_of_guessing() {
-        for code in [6, 15, u8::MAX] {
+        for code in [15, u8::MAX] {
             assert_eq!(
                 map_materialized_account_type_code(code),
                 Err(MaterializedAccountTypeMappingError::UncalibratedCode { code })

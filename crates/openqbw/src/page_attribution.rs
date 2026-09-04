@@ -88,11 +88,13 @@ impl PageAttribution {
 
     /// Look up the table that most likely owns `page_number`.
     pub fn attribute(&self, page_number: u64) -> Option<&SysTableEntry> {
+        // Catalog page references are u32. Never truncate an unrepresentable
+        // physical page number into a plausible, unrelated page.
+        let key = u32::try_from(page_number).ok()?;
         if self.by_root.is_empty() {
             return None;
         }
         // Binary search for the largest data_root <= page_number.
-        let key = page_number as u32;
         let idx = self
             .by_root
             .partition_point(|e| e.data_root_page.unwrap_or(0) <= key);
@@ -106,7 +108,7 @@ impl PageAttribution {
         // ignored).
         if let (Some(last), Some(root)) = (entry.last_page, entry.data_root_page)
             && last >= root
-            && (page_number as u32) > last
+            && key > last
         {
             return None;
         }
@@ -268,5 +270,11 @@ mod tests {
         assert_eq!(groups.get("alpha").unwrap(), &vec![150]);
         assert_eq!(groups.get("beta").unwrap(), &vec![350]);
         assert_eq!(groups.get("").unwrap(), &vec![50, 250, 500]);
+    }
+
+    #[test]
+    fn rejects_page_numbers_outside_the_catalog_domain() {
+        let attr = PageAttribution::from_catalog(vec![entry(1, "alpha", Some(100), None)]);
+        assert!(attr.attribute(u64::from(u32::MAX) + 1).is_none());
     }
 }

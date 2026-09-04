@@ -561,21 +561,49 @@ pub(crate) fn parse_csv_records(text: &str) -> Result<Vec<Vec<String>>, TrialBal
     let mut row = Vec::new();
     let mut field = String::new();
     let mut quoted = false;
+    let mut after_quote = false;
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
+        if after_quote {
+            match ch {
+                ',' => {
+                    row.push(std::mem::take(&mut field));
+                    after_quote = false;
+                }
+                '\n' => {
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                    after_quote = false;
+                }
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                    after_quote = false;
+                }
+                _ => return Err(TrialBalanceError::CharactersAfterClosingQuote),
+            }
+            continue;
+        }
         if quoted {
             match ch {
                 '"' if chars.peek() == Some(&'"') => {
                     field.push('"');
                     chars.next();
                 }
-                '"' => quoted = false,
+                '"' => {
+                    quoted = false;
+                    after_quote = true;
+                }
                 _ => field.push(ch),
             }
             continue;
         }
         match ch {
             '"' if field.is_empty() => quoted = true,
+            '"' => return Err(TrialBalanceError::BareQuote),
             ',' => {
                 row.push(std::mem::take(&mut field));
             }
@@ -625,6 +653,8 @@ pub enum TrialBalanceError {
     },
     AmountOverflow,
     UnclosedQuote,
+    BareQuote,
+    CharactersAfterClosingQuote,
 }
 
 impl fmt::Display for TrialBalanceError {
@@ -659,6 +689,10 @@ impl fmt::Display for TrialBalanceError {
             ),
             Self::AmountOverflow => f.write_str("currency amount exceeds i64 cents"),
             Self::UnclosedQuote => f.write_str("CSV ends inside a quoted field"),
+            Self::BareQuote => f.write_str("CSV has a bare quote in an unquoted field"),
+            Self::CharactersAfterClosingQuote => {
+                f.write_str("CSV has characters after a closing quote")
+            }
         }
     }
 }
@@ -676,6 +710,39 @@ mod tests {
         assert_eq!(parsed.balances_cents.get("Cash, operating"), Some(&123_456));
         assert_eq!(parsed.balances_cents.get("Owner’s equity"), Some(&-123_456));
         assert!(parsed.is_balanced());
+    }
+
+    #[test]
+    fn csv_rejects_bare_quotes_and_text_after_a_closing_quote() {
+        assert_eq!(
+            parse_csv_records("Account,Debit,Credit\nCash\" account,1.00,\n"),
+            Err(TrialBalanceError::BareQuote)
+        );
+        assert_eq!(
+            parse_csv_records("Account,Debit,Credit\n\"Cash\"tail,1.00,\n"),
+            Err(TrialBalanceError::CharactersAfterClosingQuote)
+        );
+    }
+
+    #[test]
+    fn csv_accepts_escaped_quotes_and_crlf_after_closing_quote() {
+        assert_eq!(
+            parse_csv_records(
+                "\"Account\",\"Debit\",\"Credit\"\r\n\"Cash \"\"drawer\"\"\",1.00,\r\n"
+            ),
+            Ok(vec![
+                vec![
+                    "Account".to_owned(),
+                    "Debit".to_owned(),
+                    "Credit".to_owned()
+                ],
+                vec![
+                    "Cash \"drawer\"".to_owned(),
+                    "1.00".to_owned(),
+                    String::new()
+                ],
+            ])
+        );
     }
 
     #[test]

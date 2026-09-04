@@ -26,7 +26,7 @@
 //! practice this is rare enough that majority-vote disambiguation
 //! suffices when an owner has multiple candidate names.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use opensqlany::{ApModel, PageStore, PageType};
 
@@ -60,7 +60,8 @@ fn looks_like_identifier(s: &[u8]) -> bool {
 /// comparison only; production schema lookup joins `SYSCOLUMN.table_id`
 /// directly to `SYSTABLE.table_id`. The scan is conservative
 /// (see module docs); when an owner has multiple candidate names the
-/// one with the highest sighting count is chosen.
+/// one with a strictly highest sighting count is chosen. Ties are left
+/// unresolved rather than depending on hash-map iteration order.
 pub fn bridge_owners_to_tables(
     store: &PageStore,
     model: &ApModel,
@@ -77,7 +78,7 @@ pub fn bridge_owners_to_tables(
     }
 
     // owner -> name -> votes
-    let mut votes: HashMap<u32, HashMap<String, u32>> = HashMap::new();
+    let mut votes: BTreeMap<u32, BTreeMap<String, u32>> = BTreeMap::new();
 
     let n_pages = store.page_count();
     for pn in 0..n_pages {
@@ -123,7 +124,11 @@ pub fn bridge_owners_to_tables(
 
     let mut bridge: HashMap<u32, String> = HashMap::new();
     for (oid, cands) in votes {
-        if let Some((name, _)) = cands.into_iter().max_by_key(|(_, c)| *c) {
+        let max = cands.values().copied().max().unwrap_or(0);
+        let mut winners = cands.into_iter().filter(|(_, count)| *count == max);
+        if let Some((name, _)) = winners.next()
+            && winners.next().is_none()
+        {
             bridge.insert(oid, name);
         }
     }

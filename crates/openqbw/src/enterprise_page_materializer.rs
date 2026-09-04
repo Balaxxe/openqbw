@@ -11,7 +11,10 @@
 //! that context to decode sparse pages which do not carry enough structure to
 //! select it safely by themselves.
 
-use std::{collections::BTreeSet, sync::OnceLock};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::OnceLock,
+};
 
 use opensqlany::{
     MATERIALIZED_TABLE_PAGE_LEN, MaterializedTablePage, PagePermutationError, PageStore,
@@ -259,6 +262,63 @@ pub fn discover_enterprise_page_transform_key_in_store(
     store: &PageStore,
 ) -> Result<EnterprisePageTransformKey, EnterprisePageMaterializationError> {
     discover_enterprise_page_transform_key(store.pages().map(|page| (page.index(), page.bytes())))
+}
+
+/// Enumerate every independently witnessed file-wide transform-key candidate.
+///
+/// Each returned high word has at least one structurally decisive physical
+/// type-4 page witness. This function preserves weak and conflicting
+/// candidates for a higher-level semantic catalog attestor; it never chooses
+/// by plurality. The strict legacy discovery API still requires three
+/// agreeing witnesses before returning a key directly.
+pub fn discover_enterprise_page_transform_key_candidates<'a, I>(
+    raw_pages: I,
+) -> Result<Vec<EnterprisePageTransformKey>, EnterprisePageMaterializationError>
+where
+    I: IntoIterator<Item = (u64, &'a [u8])>,
+{
+    let mut witnesses = BTreeMap::<u16, BTreeSet<u32>>::new();
+    for (page_number, raw_page) in raw_pages {
+        let page_key = checked_page_key(raw_page, page_number)?;
+        let header_candidates = recover_header_candidates(&raw_page[..SECTOR_LEN], page_key);
+        if header_candidates.len() != 1 {
+            continue;
+        }
+        let candidate_high_words = valid_high_words(raw_page, page_key, header_candidates[0])?;
+        if candidate_high_words.len() != 1 {
+            continue;
+        }
+        let high_word = *candidate_high_words
+            .first()
+            .expect("one checked high-word candidate");
+        witnesses.entry(high_word).or_default().insert(page_key);
+    }
+
+    let candidates = witnesses
+        .into_iter()
+        .map(|(high_word, page_keys)| EnterprisePageTransformKey {
+            high_word,
+            decisive_witness_count: page_keys.len(),
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Err(
+            EnterprisePageMaterializationError::InsufficientTransformKeyWitnesses {
+                actual: 0,
+                minimum: 1,
+            },
+        );
+    }
+    Ok(candidates)
+}
+
+/// Enumerate witnessed transform-key candidates from an immutable page store.
+pub fn discover_enterprise_page_transform_key_candidates_in_store(
+    store: &PageStore,
+) -> Result<Vec<EnterprisePageTransformKey>, EnterprisePageMaterializationError> {
+    discover_enterprise_page_transform_key_candidates(
+        store.pages().map(|page| (page.index(), page.bytes())),
+    )
 }
 
 fn checked_page_key(
@@ -685,6 +745,61 @@ mod tests {
             materialize_enterprise_table_page_with_key(&raws[2].1, u64::from(raws[2].0), context)
                 .expect("context materializes a page without page-local high-word selection");
         assert_eq!(recovered.bytes(), &synthetic_page_for_key(raws[2].0));
+    }
+
+    #[test]
+    fn candidate_discovery_preserves_every_structurally_witnessed_high_word() {
+        let other_signed_key = SIGNED_KEY ^ 0x0001_0000;
+        let singleton_signed_key = SIGNED_KEY ^ 0x0002_0000;
+        let mut raws = Vec::new();
+        for page_key in PAGE_KEY..PAGE_KEY + 3 {
+            raws.push((
+                page_key,
+                encode_raw_with_key(synthetic_page_for_key(page_key), SIGNED_KEY),
+            ));
+        }
+        for page_key in PAGE_KEY + 3..PAGE_KEY + 6 {
+            raws.push((
+                page_key,
+                encode_raw_with_key(synthetic_page_for_key(page_key), other_signed_key),
+            ));
+        }
+        raws.push((
+            PAGE_KEY + 6,
+            encode_raw_with_key(synthetic_page_for_key(PAGE_KEY + 6), singleton_signed_key),
+        ));
+
+        let candidates = discover_enterprise_page_transform_key_candidates(
+            raws.iter()
+                .map(|(page_key, raw)| (u64::from(*page_key), raw.as_slice())),
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.high_word())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                (SIGNED_KEY >> 16) as u16,
+                (other_signed_key >> 16) as u16,
+                (singleton_signed_key >> 16) as u16,
+            ])
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.decisive_witness_count())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([1, 3])
+        );
+        assert!(matches!(
+            discover_enterprise_page_transform_key(
+                raws.iter()
+                    .map(|(page_key, raw)| (u64::from(*page_key), raw.as_slice()))
+            ),
+            Err(EnterprisePageMaterializationError::ConflictingTransformKeyWitnesses { .. })
+        ));
     }
 
     #[test]

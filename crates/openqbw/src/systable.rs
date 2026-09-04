@@ -1082,15 +1082,75 @@ pub fn iter_systable_entries<'a>(
     SysTableIter::new(store)
 }
 
-/// Collect a deduplicated catalog keyed by `(table_id, name)`, choosing
-/// the first occurrence found.
+/// Collect a conflict-free catalog.
+///
+/// Repeated, byte-for-byte-equivalent logical rows are collapsed. Any
+/// conflicting reuse of either a physical table id or a table name removes
+/// every participant from the result. This deliberately fails closed: a
+/// caller must not attribute or export a table based on scan order when the
+/// recovered catalog disagrees about its identity.
 pub fn collect_unique(store: &PageStore, model: &ApModel) -> Vec<SysTableEntry> {
-    let mut uniq: BTreeMap<(u32, String), SysTableEntry> = BTreeMap::new();
-    for entry in iter_systable_entries(store, model) {
-        uniq.entry((entry.table_id, entry.name.clone()))
-            .or_insert(entry);
+    collect_conflict_free(iter_systable_entries(store, model))
+}
+
+fn collect_conflict_free(entries: impl IntoIterator<Item = SysTableEntry>) -> Vec<SysTableEntry> {
+    let entries: Vec<_> = entries.into_iter().collect();
+    let mut ids: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    let mut names: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        ids.entry(entry.table_id).or_default().push(index);
+        names.entry(&entry.name).or_default().push(index);
     }
-    uniq.into_values().collect()
+
+    let mut rejected = vec![false; entries.len()];
+    for indexes in ids.values().chain(names.values()) {
+        let first = &entries[indexes[0]];
+        if indexes
+            .iter()
+            .any(|&index| !same_catalog_identity(first, &entries[index]))
+        {
+            for &index in indexes {
+                rejected[index] = true;
+            }
+        }
+    }
+    entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (!rejected[index]).then_some(entry))
+        .map(|entry| ((entry.table_id, entry.name.clone()), entry))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect()
+}
+
+fn same_catalog_identity(a: &SysTableEntry, b: &SysTableEntry) -> bool {
+    a.table_id == b.table_id
+        && a.name == b.name
+        && a.object_id == b.object_id
+        && a.row_length == b.row_length
+        && a.row_flags == b.row_flags
+        && a.dbspace_id == b.dbspace_id
+        && a.row_count == b.row_count
+        && a.creator == b.creator
+        && a.table_page_count == b.table_page_count
+        && a.ext_page_count == b.ext_page_count
+        && a.commit_action == b.commit_action
+        && a.share_type == b.share_type
+        && a.last_modified_raw == b.last_modified_raw
+        && a.table_type == b.table_type
+        && a.replicate == b.replicate
+        && a.server_type == b.server_type
+        && a.post_name_layout_byte == b.post_name_layout_byte
+        && a.tab_page_list == b.tab_page_list
+        && a.ext_page_list == b.ext_page_list
+        && a.magic == b.magic
+        && a.col_count == b.col_count
+        && a.data_root_page == b.data_root_page
+        && a.last_page == b.last_page
+        && a.data_root_raw == b.data_root_raw
+        && a.last_page_raw == b.last_page_raw
+        && a.truncated_prefix_bytes == b.truncated_prefix_bytes
 }
 
 struct SysTableIter<'a> {
@@ -1238,6 +1298,34 @@ mod tests {
         assert_eq!(
             collection.logical_expectation(9999),
             Err(MaterializedSysTableCollectionError::UnknownTableId { table_id: 9999 })
+        );
+    }
+
+    #[test]
+    fn conflicting_catalog_identities_are_dropped_independent_of_scan_order() {
+        let first = materialized_entry(21, "sample_alpha");
+        let same_id_other_name = materialized_entry(21, "sample_beta");
+        let same_name_other_id = materialized_entry(22, "sample_alpha");
+        let clean = materialized_entry(23, "sample_clean");
+        let forward = collect_conflict_free(vec![
+            first.clone(),
+            same_id_other_name.clone(),
+            same_name_other_id.clone(),
+            clean.clone(),
+        ]);
+        let reverse =
+            collect_conflict_free(vec![clean, same_name_other_id, same_id_other_name, first]);
+        assert_eq!(forward.len(), 1);
+        assert_eq!(forward[0].table_id, 23);
+        assert_eq!(
+            forward
+                .iter()
+                .map(|entry| entry.table_id)
+                .collect::<Vec<_>>(),
+            reverse
+                .iter()
+                .map(|entry| entry.table_id)
+                .collect::<Vec<_>>()
         );
     }
 

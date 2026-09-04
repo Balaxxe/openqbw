@@ -292,7 +292,9 @@ pub struct DebitCreditAmount {
 impl DebitCreditAmount {
     /// Creates a non-zero debit or credit amount.
     pub fn new(side: DebitCredit, minor_units: i64) -> Result<Self, AccountingError> {
-        if minor_units <= 0 {
+        // `i64::MIN` cannot be negated when a credit is rendered.  Keeping it
+        // out of this absolute-value type makes signed normalization total.
+        if minor_units <= 0 || minor_units == i64::MIN {
             return Err(AccountingError::InvalidMinorUnits { minor_units });
         }
         Ok(Self { side, minor_units })
@@ -302,7 +304,10 @@ impl DebitCreditAmount {
     pub fn signed_minor_units(self) -> i64 {
         match self.side {
             DebitCredit::Debit => self.minor_units,
-            DebitCredit::Credit => -self.minor_units,
+            DebitCredit::Credit => self
+                .minor_units
+                .checked_neg()
+                .expect("DebitCreditAmount rejects i64::MIN"),
         }
     }
 }
@@ -466,7 +471,10 @@ impl Ledger {
         let mut posting_ids = BTreeSet::new();
         let mut source_rows = BTreeSet::new();
         for posting in &postings {
-            if posting.signed_minor_units == 0 {
+            // `Posting` remains publicly constructible for compatibility, so
+            // enforce the representation invariant at the ledger boundary as
+            // well as in DebitCreditAmount::new.
+            if posting.signed_minor_units == 0 || posting.signed_minor_units == i64::MIN {
                 return Err(AccountingError::ZeroPosting {
                     posting_id: posting.id.clone(),
                 });
@@ -1076,6 +1084,12 @@ mod tests {
         assert_eq!(
             DebitCreditAmount::new(DebitCredit::Debit, 0),
             Err(AccountingError::InvalidMinorUnits { minor_units: 0 })
+        );
+        assert_eq!(
+            DebitCreditAmount::new(DebitCredit::Credit, i64::MIN),
+            Err(AccountingError::InvalidMinorUnits {
+                minor_units: i64::MIN
+            })
         );
     }
 

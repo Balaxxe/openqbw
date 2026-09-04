@@ -50,6 +50,7 @@ pub const SYSCOLUMN_TAG: [u8; 8] = [0x01, 0x52, 0x00, 0x01, 0x00, 0x00, 0x00, 0x
 const NAME_LEN_MAX: usize = 128;
 const PAGE_BODY_LEN: usize = 0xFF0;
 const ROW_LEN_BYTES: usize = 4;
+const FIXED_PREFIX_LEN: usize = 12;
 const FIXED_BYTES_AFTER_LENGTH: usize = 34;
 const NAME_LEN_OFFSET: usize = ROW_LEN_BYTES + FIXED_BYTES_AFTER_LENGTH;
 const MIN_ROW_LEN: usize = NAME_LEN_OFFSET + 1 + SYSCOLUMN_TAG.len();
@@ -141,6 +142,16 @@ pub struct MaterializedSysColumnCollection {
     /// This is not silently discarded: callers that require a complete
     /// catalog-carrier classification must account for it explicitly.
     pub carrier_unparsed_records: u64,
+    /// Self-length-bounded unparsed records keyed by their safely readable
+    /// `(table_id, column_id)` fixed prefix.
+    pub unparsed_fixed_prefix_columns: BTreeMap<(u32, u32), u64>,
+    /// Unparsed records whose exact self length established the fixed prefix.
+    pub unparsed_self_length_fixed_prefix_records: u64,
+    /// Unparsed records physically too short to carry table and column ids.
+    pub unparsed_shorter_than_fixed_prefix_records: u64,
+    /// Unparsed records long enough for the prefix but lacking exact
+    /// self-length bounds. Targeted schema attestation must reject these.
+    pub unparsed_without_fixed_prefix: u64,
     /// Raw pages that had no usable materialized type-4 representation.
     pub skipped_pages: MaterializedSysColumnSkippedPages,
 }
@@ -198,6 +209,9 @@ pub enum MaterializedSysColumnCollectionError {
         /// Materialized selected-page count.
         actual: u64,
     },
+    /// SYSTABLE's base and external carrier-page counts overflowed their domain.
+    #[error("materialized SYSCOLUMN SYSTABLE page counts overflowed")]
+    CarrierPageCountOverflow,
     /// Complete parsed catalog records did not equal the independent
     /// SYSTABLE logical row count.
     #[error("materialized SYSCOLUMN carrier parsed {actual} rows, SYSTABLE declares {expected}")]
@@ -371,10 +385,14 @@ impl MaterializedSysColumnCollection {
                 actual_table_id: systable.table_id,
             });
         }
-        if self.carrier_pages != u64::from(systable.table_page_count) {
+        let expected_pages = systable
+            .table_page_count
+            .checked_add(systable.ext_page_count)
+            .ok_or(MaterializedSysColumnCollectionError::CarrierPageCountOverflow)?;
+        if self.carrier_pages != u64::from(expected_pages) {
             return Err(
                 MaterializedSysColumnCollectionError::CarrierPageCountMismatch {
-                    expected: systable.table_page_count,
+                    expected: expected_pages,
                     actual: self.carrier_pages,
                 },
             );
@@ -398,7 +416,7 @@ impl MaterializedSysColumnCollection {
         }
         Ok(MaterializedSysColumnCompletenessAttestation {
             row_count: systable.row_count,
-            page_count: systable.table_page_count,
+            page_count: expected_pages,
         })
     }
 }
@@ -519,6 +537,20 @@ pub fn parse_materialized_syscolumn_record(
     Some(column)
 }
 
+fn self_length_bounded_syscolumn_fixed_prefix(record: &[u8]) -> Option<(u32, u32)> {
+    if record.len() < FIXED_PREFIX_LEN {
+        return None;
+    }
+    let header = u32::from_le_bytes(record[..4].try_into().ok()?);
+    if usize::try_from(header & 0x00ff_ffff).ok()? != record.len() {
+        return None;
+    }
+    Some((
+        u32::from_le_bytes(record[4..8].try_into().ok()?),
+        u32::from_le_bytes(record[8..12].try_into().ok()?),
+    ))
+}
+
 /// Recover every fully bounded `SYSCOLUMN` record from one already identified
 /// runtime-materialized catalog page.
 ///
@@ -563,6 +595,10 @@ pub fn collect_materialized_syscolumns(
     let mut carrier_missing_records = 0_u64;
     let mut carrier_parsed_records = 0_u64;
     let mut carrier_unparsed_records = 0_u64;
+    let mut unparsed_fixed_prefix_columns = BTreeMap::<(u32, u32), u64>::new();
+    let mut unparsed_self_length_fixed_prefix_records = 0_u64;
+    let mut unparsed_shorter_than_fixed_prefix_records = 0_u64;
+    let mut unparsed_without_fixed_prefix = 0_u64;
     let mut skipped_pages = MaterializedSysColumnSkippedPages::default();
     let mut rows = BTreeMap::<(u32, u32, String), SysColumn>::new();
 
@@ -610,6 +646,10 @@ pub fn collect_materialized_syscolumns(
             let mut rows = Vec::new();
             let mut missing = 0_u64;
             let mut unparsed = 0_u64;
+            let mut unparsed_prefixes = BTreeMap::<(u32, u32), u64>::new();
+            let mut unparsed_self_length_prefixes = 0_u64;
+            let mut unparsed_short_prefixes = 0_u64;
+            let mut unparsed_without_prefix = 0_u64;
             for record_id in 0..table_page.record_count() {
                 let Ok(record) = table_page.record(record_id) else {
                     missing += 1;
@@ -623,6 +663,16 @@ pub fn collect_materialized_syscolumns(
                     rows.push(column);
                 } else {
                     unparsed += 1;
+                    if record.bytes().len() < FIXED_PREFIX_LEN {
+                        unparsed_short_prefixes += 1;
+                    } else if let Some(prefix) =
+                        self_length_bounded_syscolumn_fixed_prefix(record.bytes())
+                    {
+                        *unparsed_prefixes.entry(prefix).or_default() += 1;
+                        unparsed_self_length_prefixes += 1;
+                    } else {
+                        unparsed_without_prefix += 1;
+                    }
                 }
             }
             decoded.push((
@@ -630,6 +680,10 @@ pub fn collect_materialized_syscolumns(
                 u64::from(table_page.record_count()),
                 missing,
                 unparsed,
+                unparsed_prefixes,
+                unparsed_self_length_prefixes,
+                unparsed_short_prefixes,
+                unparsed_without_prefix,
             ));
         }
         if decoded.is_empty() {
@@ -637,7 +691,7 @@ pub fn collect_materialized_syscolumns(
         }
         let semantic: Vec<BTreeMap<SysColumnSemanticKey, SysColumn>> = decoded
             .iter()
-            .map(|(rows, _, _, _)| {
+            .map(|(rows, _, _, _, _, _, _, _)| {
                 rows.iter()
                     .map(|row| (SysColumnSemanticKey::from(row), row.clone()))
                     .collect()
@@ -646,9 +700,13 @@ pub fn collect_materialized_syscolumns(
         if semantic
             .windows(2)
             .any(|pair| pair[0].keys().ne(pair[1].keys()))
-            || decoded
-                .windows(2)
-                .any(|pair| (pair[0].1, pair[0].2, pair[0].3) != (pair[1].1, pair[1].2, pair[1].3))
+            || decoded.windows(2).any(|pair| {
+                (
+                    pair[0].1, pair[0].2, pair[0].3, &pair[0].4, pair[0].5, pair[0].6, pair[0].7,
+                ) != (
+                    pair[1].1, pair[1].2, pair[1].3, &pair[1].4, pair[1].5, pair[1].6, pair[1].7,
+                )
+            })
         {
             return Err(MaterializedSysColumnCollectionError::DivergentCandidates { page_number });
         }
@@ -657,6 +715,12 @@ pub fn collect_materialized_syscolumns(
         carrier_missing_records += decoded[0].2;
         carrier_parsed_records += u64::try_from(decoded[0].0.len()).expect("usize fits u64");
         carrier_unparsed_records += decoded[0].3;
+        for (&prefix, &count) in &decoded[0].4 {
+            *unparsed_fixed_prefix_columns.entry(prefix).or_default() += count;
+        }
+        unparsed_self_length_fixed_prefix_records += decoded[0].5;
+        unparsed_shorter_than_fixed_prefix_records += decoded[0].6;
+        unparsed_without_fixed_prefix += decoded[0].7;
         // Equal semantic candidate sets may differ only in physical placement.
         // Select a stable placement after equality is established.
         for row in semantic[0].values() {
@@ -681,6 +745,10 @@ pub fn collect_materialized_syscolumns(
         carrier_missing_records,
         carrier_parsed_records,
         carrier_unparsed_records,
+        unparsed_fixed_prefix_columns,
+        unparsed_self_length_fixed_prefix_records,
+        unparsed_shorter_than_fixed_prefix_records,
+        unparsed_without_fixed_prefix,
         skipped_pages,
     })
 }
@@ -914,15 +982,20 @@ pub fn collect_unique(store: &PageStore, model: &ApModel) -> Vec<SysColumn> {
 /// Return all recovered columns for the table named `table_name`, ordered by
 /// `column_id`.
 ///
-/// This resolves the table name to its physical `SYSTABLE.table_id` and joins
-/// that value directly to [`SysColumn::table_id`]. It returns an empty vector
-/// when the table is unknown or no catalog column rows were recovered. An
+/// This resolves the table name to exactly one physical `SYSTABLE.table_id`
+/// and joins that value directly to [`SysColumn::table_id`]. It returns an
+/// empty vector when the table is unknown, ambiguous, or no catalog column
+/// rows were recovered. An
 /// empty result does not establish that the physical table has no columns.
 pub fn schema_for(store: &PageStore, model: &ApModel, table_name: &str) -> Vec<SysColumn> {
     let tables = crate::collect_unique(store, model);
-    let Some(table) = tables.into_iter().find(|table| table.name == table_name) else {
+    let mut matches = tables.into_iter().filter(|table| table.name == table_name);
+    let Some(table) = matches.next() else {
         return Vec::new();
     };
+    if matches.next().is_some() {
+        return Vec::new();
+    }
     let mut cols: Vec<SysColumn> = collect_unique(store, model)
         .into_iter()
         .filter(|c| c.table_id == table.table_id)
@@ -1095,6 +1168,28 @@ mod tests {
     }
 
     #[test]
+    fn unparsed_fixed_prefix_requires_exact_self_length_bounds() {
+        let mut row = synth_row("account_id", 3026, 1, 2, b'N', 4, 0, 0x1672);
+        row[14] = 0;
+        assert!(parse_materialized_syscolumn_record(&row, 42, 0x3d8).is_none());
+        assert_eq!(
+            self_length_bounded_syscolumn_fixed_prefix(&row),
+            Some((3026, 1))
+        );
+
+        let mut wrong_length = row.clone();
+        wrong_length[0] ^= 1;
+        assert_eq!(
+            self_length_bounded_syscolumn_fixed_prefix(&wrong_length),
+            None
+        );
+        assert_eq!(
+            self_length_bounded_syscolumn_fixed_prefix(&row[..FIXED_PREFIX_LEN - 1]),
+            None
+        );
+    }
+
+    #[test]
     fn scans_only_complete_records_from_an_identified_materialized_page() {
         let row = synth_row("account_id", 3680, 1, 2, b'N', 4, 0, 0x1672);
         let mut page = vec![0_u8; 4096];
@@ -1119,6 +1214,10 @@ mod tests {
             carrier_missing_records: 0,
             carrier_parsed_records: 1,
             carrier_unparsed_records: 1,
+            unparsed_fixed_prefix_columns: BTreeMap::new(),
+            unparsed_self_length_fixed_prefix_records: 0,
+            unparsed_shorter_than_fixed_prefix_records: 0,
+            unparsed_without_fixed_prefix: 1,
             skipped_pages: MaterializedSysColumnSkippedPages::default(),
         };
         assert_eq!(
@@ -1148,6 +1247,10 @@ mod tests {
             carrier_missing_records: 0,
             carrier_parsed_records: 2,
             carrier_unparsed_records: 1,
+            unparsed_fixed_prefix_columns: BTreeMap::new(),
+            unparsed_self_length_fixed_prefix_records: 0,
+            unparsed_shorter_than_fixed_prefix_records: 1,
+            unparsed_without_fixed_prefix: 0,
             skipped_pages: MaterializedSysColumnSkippedPages::default(),
         };
         assert_eq!(

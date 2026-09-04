@@ -205,17 +205,17 @@ fn accounts_tsv(rows: &[AccountRow]) -> String {
     let mut output =
         String::from("account_list_id\tname\tfull_name\taccount_type\tparent_list_id\tis_active\n");
     for row in rows {
-        output.push_str(&row.list_id);
+        output.push_str(&spreadsheet_safe(&row.list_id));
         output.push('\t');
-        output.push_str(&row.name);
+        output.push_str(&spreadsheet_safe(&row.name));
         output.push('\t');
-        output.push_str(&row.full_name);
+        output.push_str(&spreadsheet_safe(&row.full_name));
         output.push('\t');
-        output.push_str(&row.account_type);
+        output.push_str(&spreadsheet_safe(&row.account_type));
         output.push('\t');
-        output.push_str(&row.parent_list_id);
+        output.push_str(&spreadsheet_safe(&row.parent_list_id));
         output.push('\t');
-        output.push_str(&row.is_active);
+        output.push_str(&spreadsheet_safe(&row.is_active));
         output.push('\n');
     }
     output
@@ -224,18 +224,27 @@ fn accounts_tsv(rows: &[AccountRow]) -> String {
 fn journal_tsv(rows: &[JournalLine]) -> String {
     let mut output = String::from("txn_id\ttxn_line_id\ttxn_date\taccount_list_id\tamount\n");
     for row in rows {
-        output.push_str(&row.txn_id);
+        output.push_str(&spreadsheet_safe(&row.txn_id));
         output.push('\t');
-        output.push_str(&row.line_id);
+        output.push_str(&spreadsheet_safe(&row.line_id));
         output.push('\t');
-        output.push_str(&row.txn_date);
+        output.push_str(&spreadsheet_safe(&row.txn_date));
         output.push('\t');
-        output.push_str(&row.account_list_id);
+        output.push_str(&spreadsheet_safe(&row.account_list_id));
         output.push('\t');
-        output.push_str(&row.amount);
+        output.push_str(&spreadsheet_safe(&row.amount));
         output.push('\n');
     }
     output
+}
+
+/// Prevent spreadsheet programs from treating a TSV cell as a formula.
+fn spreadsheet_safe(value: &str) -> String {
+    if matches!(value.as_bytes().first(), Some(b'=' | b'+' | b'-' | b'@')) {
+        format!("'{value}")
+    } else {
+        value.to_owned()
+    }
 }
 
 fn successful_response(xml: &[u8], response: &[u8]) -> bool {
@@ -534,5 +543,13 @@ mod tests {
         assert!(!temp.join(ACCOUNTS_TSV).exists());
         let _ = std::fs::remove_dir(temp.join(JOURNAL_TSV));
         let _ = std::fs::remove_dir(temp);
+    }
+
+    #[test]
+    fn tsv_cells_with_formula_markers_are_escaped() {
+        for value in ["=1+1", "+1", "-1", "@x"] {
+            assert_eq!(spreadsheet_safe(value), format!("'{value}"));
+        }
+        assert_eq!(spreadsheet_safe("ordinary"), "ordinary");
     }
 }

@@ -7,6 +7,7 @@
 //! ordering, provenance, or error-isolation semantics.
 
 use std::fmt::Write as _;
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -15,6 +16,13 @@ use std::thread;
 /// Hard ceiling for concurrently opened company files.
 pub const MAX_WORKERS: usize = 8;
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
+/// Largest input that the in-memory SQL Anywhere decoder can safely accept.
+///
+/// `PageStore` owns its complete input, so a decoder cannot be made streaming
+/// without changing that library's representation.  This explicit ceiling
+/// makes batch memory bounded at `MAX_WORKERS * MAX_SNAPSHOT_FILE_BYTES` and
+/// rejects oversize input before allocating it.
+pub const MAX_SNAPSHOT_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Immutable identity of the exact bytes inspected by one worker.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,27 +141,54 @@ pub fn worker_limit(requested: usize, input_count: usize) -> Result<usize, Strin
 /// remains deliberately `Unsupported`: outputting a partial Trial Balance or
 /// GL before decoder coverage is complete would be unsafe.
 pub fn inspect_files(inputs: Vec<PathBuf>, requested_workers: usize) -> Result<BatchRun, String> {
-    let run = schedule_snapshot_jobs(inputs, requested_workers, |job| {
-        let (_, source_path, snapshot, bytes) = job.into_parts();
-        debug_assert_eq!(u64::try_from(bytes.len()).ok(), Some(snapshot.byte_length));
-        unsupported_status(&source_path)
-    })?;
-    Ok(BatchRun {
-        worker_limit: run.worker_limit,
-        results: run
-            .results
-            .into_iter()
-            .map(|result| BatchFileResult {
-                input_index: result.input_index,
-                source_path: result.source_path,
-                snapshot: result.snapshot,
-                status: match result.outcome {
-                    SnapshotJobOutcome::Completed(status) => status,
-                    SnapshotJobOutcome::InputError { reason } => BatchStatus::InputError { reason },
-                },
-            })
-            .collect(),
-    })
+    let input_count = inputs.len();
+    let bound = worker_limit(requested_workers, input_count)?;
+    let tasks = Arc::new(Mutex::new(inputs.into_iter().enumerate()));
+    let (sender, receiver) = mpsc::channel();
+    let run = thread::scope(|scope| {
+        for _ in 0..bound {
+            let tasks = Arc::clone(&tasks);
+            let sender = sender.clone();
+            scope.spawn(move || {
+                loop {
+                    let Some((input_index, source_path)) =
+                        tasks.lock().expect("batch task lock poisoned").next()
+                    else {
+                        break;
+                    };
+                    let result = match attest_file(&source_path) {
+                        Ok(snapshot) => BatchFileResult {
+                            input_index,
+                            status: unsupported_status(&source_path),
+                            source_path,
+                            snapshot: Some(snapshot),
+                        },
+                        Err(reason) => BatchFileResult {
+                            input_index,
+                            source_path,
+                            snapshot: None,
+                            status: BatchStatus::InputError { reason },
+                        },
+                    };
+                    sender.send(result).expect("batch result receiver dropped");
+                }
+            });
+        }
+        drop(sender);
+        let mut ordered: Vec<Option<BatchFileResult>> = (0..input_count).map(|_| None).collect();
+        for result in receiver {
+            let index = result.input_index;
+            ordered[index] = Some(result);
+        }
+        BatchRun {
+            worker_limit: bound,
+            results: ordered
+                .into_iter()
+                .map(|result| result.expect("one result per batch input"))
+                .collect(),
+        }
+    });
+    Ok(run)
 }
 
 /// Run one pure, caller-supplied processor for each stable local snapshot.
@@ -271,9 +306,20 @@ fn snapshot_file(path: &Path) -> Result<(SnapshotMetadata, Vec<u8>), String> {
         return Err("input is not a regular file".to_owned());
     }
     let expected_len = before.len();
+    if expected_len > MAX_SNAPSHOT_FILE_BYTES {
+        return Err(format!(
+            "input exceeds the {}-byte batch snapshot limit",
+            MAX_SNAPSHOT_FILE_BYTES
+        ));
+    }
     let before_modified = before.modified().ok();
-    let bytes = std::fs::read(path).map_err(|error| error.kind().to_string())?;
-    let snapshot = hash_reader(bytes.as_slice(), expected_len)?;
+    let mut file = File::open(path).map_err(|error| error.kind().to_string())?;
+    let capacity = usize::try_from(expected_len).map_err(|_| "input is too large".to_owned())?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| "unable to reserve bounded batch snapshot buffer".to_owned())?;
+    let snapshot = read_and_hash_snapshot(&mut file, expected_len, &mut bytes)?;
     let after = std::fs::metadata(path).map_err(|error| error.kind().to_string())?;
     if after.len() != expected_len
         || snapshot.byte_length != expected_len
@@ -289,9 +335,70 @@ fn snapshot_file(path: &Path) -> Result<(SnapshotMetadata, Vec<u8>), String> {
 /// direct page-store decode, so a source mutation between scheduler read and
 /// decoder read fails closed rather than being reported under stale provenance.
 pub fn snapshot_still_matches(path: &Path, expected: &SnapshotMetadata) -> bool {
-    snapshot_file(path)
-        .map(|(actual, _)| actual == *expected)
+    attest_file(path)
+        .map(|actual| actual == *expected)
         .unwrap_or(false)
+}
+
+/// Hash a file without retaining its bytes. Used by inspection and
+/// post-decode re-attestation, where keeping a second company-file copy would
+/// only inflate peak memory.
+fn attest_file(path: &Path) -> Result<SnapshotMetadata, String> {
+    let before = std::fs::metadata(path).map_err(|error| error.kind().to_string())?;
+    if !before.is_file() {
+        return Err("input is not a regular file".to_owned());
+    }
+    let expected_len = before.len();
+    if expected_len > MAX_SNAPSHOT_FILE_BYTES {
+        return Err(format!(
+            "input exceeds the {}-byte batch snapshot limit",
+            MAX_SNAPSHOT_FILE_BYTES
+        ));
+    }
+    let before_modified = before.modified().ok();
+    let mut file = File::open(path).map_err(|error| error.kind().to_string())?;
+    let snapshot = hash_reader(&mut file, expected_len)?;
+    let after = std::fs::metadata(path).map_err(|error| error.kind().to_string())?;
+    if after.len() != expected_len
+        || snapshot.byte_length != expected_len
+        || after.modified().ok() != before_modified
+    {
+        return Err("snapshot changed during read".to_owned());
+    }
+    Ok(snapshot)
+}
+
+fn read_and_hash_snapshot(
+    reader: &mut impl Read,
+    expected_len: u64,
+    bytes: &mut Vec<u8>,
+) -> Result<SnapshotMetadata, String> {
+    let mut hasher = StreamingSha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; HASH_BUFFER_BYTES];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| error.kind().to_string())?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .ok_or_else(|| "input size overflow".to_owned())?;
+        if total > expected_len {
+            return Err("snapshot changed during read".to_owned());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        hasher.update(&buffer[..count]);
+    }
+    if total != expected_len {
+        return Err("snapshot changed during read".to_owned());
+    }
+    Ok(SnapshotMetadata {
+        byte_length: total,
+        sha256: hasher.finish_hex(),
+    })
 }
 
 fn hash_reader(mut reader: impl Read, expected_len: u64) -> Result<SnapshotMetadata, String> {
@@ -815,5 +922,18 @@ mod tests {
         assert!(worker_limit(0, 1).is_err());
         assert!(worker_limit(MAX_WORKERS + 1, 1).is_err());
         assert_eq!(worker_limit(MAX_WORKERS, 2), Ok(2));
+    }
+
+    #[test]
+    fn oversized_snapshot_is_rejected_before_buffering() {
+        let file = temp_path("oversized.qbw");
+        let handle = std::fs::File::create(&file).expect("file");
+        handle
+            .set_len(MAX_SNAPSHOT_FILE_BYTES + 1)
+            .expect("sparse length");
+        drop(handle);
+        let error = snapshot_file(&file).expect_err("must reject oversized snapshot");
+        assert!(error.contains("batch snapshot limit"));
+        let _ = std::fs::remove_file(file);
     }
 }
