@@ -43,3 +43,21 @@ unavailable rather than inferred.
 This acceptance applies only when the strict Enterprise 24 R21 catalog and row
 attestations pass. Unknown layouts, posting families, account classifications,
 and ambiguous native account mappings fail closed.
+
+The Bill, Bill-Payment Check, Check, and schema-based Deposit paths handle
+canonical zero amounts as neutral exclusions only after validating the
+monetary row's identifiers, date, transaction type, and account identity.
+They do not establish a void, deletion, or current-version claim. Ambiguous
+zero/nonzero rows for the same transaction master remain blocked. Neutral Bill
+splits can accompany balanced nonzero siblings with distinct logical targets,
+one date and a known view; a shared account does not make distinct Bill lines
+the same logical target. Check companion exclusions require the complete recognized
+topology, including distinct targets and resolved accounts.
+
+Check amount envelopes must satisfy their bounded token and repeated-copy
+constraints. A failure to select a complete Check decoding strategy is reported
+as a strategy rejection; it does not by itself establish a monetary imbalance.
+An opaque-suffix direct zero can be a neutral Check observation only when the
+attested schema prefix independently proves its canonical-zero amount and its
+validated identities and date match the fixed physical header. Nonzero amounts
+never use this bridge.

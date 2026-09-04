@@ -380,12 +380,30 @@ fn decode_repeated_tail_amount(input: &[u8]) -> RepeatedTailAmount {
             2_usize,
             &[107_usize, 126][..],
         ),
-        (matches!(input.len(), 209 | 217), 3_usize, &[109_usize][..]),
-        (input.len() == 216, 4_usize, &[109_usize][..]),
         (true, 6_usize, &[115_usize][..]),
     ];
     let mut saw_signature = false;
     let mut decoded = Vec::new();
+    // The bounded e4 family also carries one amount token at +0x6d and
+    // repeats that exact token twice in terminal carrier fields. The three
+    // fields must not overlap, and the count is bounded by the observed
+    // two-to-six-byte token family.
+    if input.len() >= 196 {
+        collect_triplicate_tail_amount(input, 109, None, &mut saw_signature, &mut decoded);
+    }
+    // A distinct long nullable family begins at +0x4f and has three
+    // length-relative tail copies. Its adjacent first two tail copies are
+    // structural, rather than an unrestricted repeated-token search.
+    collect_quadruplicate_tail_amount(input, 79, &mut saw_signature, &mut decoded);
+    // This fixed 218-byte nullable variant uses +0x7d and the same bounded
+    // triplicate tail relation. Its length remains fixed until another
+    // independent carrier establishes a variable-length family.
+    collect_triplicate_tail_amount(input, 125, Some(218), &mut saw_signature, &mut decoded);
+    // The direct +0x53 field can use the same four-copy nullable envelope as
+    // +0x4f, with the first numeric token retained before its three terminal
+    // copies. A plain direct prefix is still insufficient: all four fields
+    // must agree.
+    collect_quadruplicate_tail_amount(input, 83, &mut saw_signature, &mut decoded);
     for (length_matches, token_len, prefix_offsets) in grammars {
         if !length_matches
             || input.get(prefix_offsets[0]).copied() != u8::try_from(token_len - 2).ok()
@@ -417,11 +435,105 @@ fn decode_repeated_tail_amount(input: &[u8]) -> RepeatedTailAmount {
             decoded.push(amount);
         }
     }
+    // A 215-byte canonical-zero carrier has two fixed copies immediately
+    // before the variable tail pair.  It is a separate observed envelope;
+    // changing any of the four copies rejects the row.
+    if input.len() == 215 {
+        let token = [0, 0x81];
+        if input.get(106..108) == Some(&token)
+            && input.get(125..127) == Some(&token)
+            && input.get(199..201) == Some(&token)
+            && input.get(206..208) == Some(&token)
+        {
+            saw_signature = true;
+            decoded.push((0, true));
+        }
+    }
     match decoded.as_slice() {
         [amount] => RepeatedTailAmount::Decoded(*amount),
         [] if !saw_signature => RepeatedTailAmount::NotApplicable,
         _ => RepeatedTailAmount::Malformed,
     }
+}
+
+fn bounded_amount_token(input: &[u8], offset: usize) -> Option<&[u8]> {
+    let digits = usize::from(*input.get(offset)?);
+    let token_len = digits.checked_add(2)?;
+    (2..=6)
+        .contains(&token_len)
+        .then(|| input.get(offset..offset.checked_add(token_len)?))?
+}
+
+fn collect_triplicate_tail_amount(
+    input: &[u8],
+    prefix_offset: usize,
+    required_len: Option<usize>,
+    saw_signature: &mut bool,
+    decoded: &mut Vec<(i64, bool)>,
+) {
+    if required_len.is_some_and(|length| input.len() != length) {
+        return;
+    }
+    let Some(token) = bounded_amount_token(input, prefix_offset) else {
+        return;
+    };
+    let Ok(amount) = decode_amount(token, input.len()) else {
+        return;
+    };
+    *saw_signature = true;
+    let token_len = token.len();
+    let Some(second_start) = input.len().checked_sub(token_len + 7) else {
+        return;
+    };
+    let Some(first_start) = second_start.checked_sub(token_len + 5) else {
+        return;
+    };
+    let Some(prefix_end) = prefix_offset.checked_add(token_len) else {
+        return;
+    };
+    if prefix_end > first_start
+        || input.get(first_start..first_start + token_len) != Some(token)
+        || input.get(second_start..second_start + token_len) != Some(token)
+    {
+        return;
+    }
+    decoded.push(amount);
+}
+
+fn collect_quadruplicate_tail_amount(
+    input: &[u8],
+    prefix_offset: usize,
+    saw_signature: &mut bool,
+    decoded: &mut Vec<(i64, bool)>,
+) {
+    let Some(token) = bounded_amount_token(input, prefix_offset) else {
+        return;
+    };
+    let Ok(amount) = decode_amount(token, input.len()) else {
+        return;
+    };
+    *saw_signature = true;
+    let token_len = token.len();
+    let Some(third_start) = input.len().checked_sub(token_len + 7) else {
+        return;
+    };
+    let Some(second_start) = third_start.checked_sub(token_len + 5) else {
+        return;
+    };
+    let Some(first_start) = second_start.checked_sub(token_len) else {
+        return;
+    };
+    let Some(prefix_end) = prefix_offset.checked_add(token_len) else {
+        return;
+    };
+    if prefix_end > first_start
+        || input.get(first_start..first_start + token_len) != Some(token)
+        || input.get(second_start..second_start + token_len) != Some(token)
+        || input.get(third_start..third_start + token_len) != Some(token)
+    {
+        return;
+    }
+    decoded.push(amount);
 }
 
 fn decode_amount(
@@ -696,6 +808,204 @@ mod tests {
             extended[second_tail + token_len - 1] ^= 1;
             assert!(MaterializedCheckPostingRow::parse(&extended).is_err());
         }
+    }
+
+    #[test]
+    fn variable_triplicate_envelope_binds_the_counted_token_to_both_tail_offsets() {
+        let envelope_len = 236_usize;
+        let mut extended = row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            None,
+            &[1, 0x14, 0],
+            SAMPLE_EDIT_BEFORE,
+        );
+        extended.resize(envelope_len, 0);
+        extended[..2].copy_from_slice(&(envelope_len as u16).to_le_bytes());
+        let amount = [3, 0xbf, 41, 37, 12];
+        let token_len = amount.len();
+        let second_tail = envelope_len - token_len - 7;
+        let first_tail = second_tail - token_len - 5;
+        for offset in [109, first_tail, second_tail] {
+            extended[offset..offset + token_len].copy_from_slice(&amount);
+        }
+        assert_eq!(
+            MaterializedCheckPostingRow::parse(&extended)
+                .unwrap()
+                .signed_cents(),
+            123_741
+        );
+
+        for offset in [109, first_tail, second_tail] {
+            let mut changed = extended.clone();
+            changed[offset + token_len - 1] ^= 1;
+            assert!(MaterializedCheckPostingRow::parse(&changed).is_err());
+        }
+        let mut changed_count = extended.clone();
+        changed_count[109] = 2;
+        assert!(MaterializedCheckPostingRow::parse(&changed_count).is_err());
+        let mut truncated = extended;
+        truncated.pop();
+        let truncated_len = truncated.len() as u16;
+        truncated[..2].copy_from_slice(&truncated_len.to_le_bytes());
+        assert!(MaterializedCheckPostingRow::parse(&truncated).is_err());
+    }
+
+    #[test]
+    fn observed_215_byte_canonical_zero_envelope_requires_all_four_copies() {
+        let envelope_len = 215_usize;
+        let mut extended = row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            None,
+            &[1, 0x14, 0],
+            SAMPLE_EDIT_BEFORE,
+        );
+        extended.resize(envelope_len, 0);
+        extended[..2].copy_from_slice(&(envelope_len as u16).to_le_bytes());
+        let zero = [0, 0x81];
+        for offset in [106, 125, 199, 206] {
+            extended[offset..offset + zero.len()].copy_from_slice(&zero);
+        }
+        let parsed = MaterializedCheckPostingRow::parse(&extended).unwrap();
+        assert_eq!(parsed.signed_cents(), 0);
+        assert!(parsed.has_canonical_zero_amount());
+
+        for offset in [106, 125, 199, 206] {
+            let mut changed = extended.clone();
+            changed[offset + 1] ^= 1;
+            assert!(MaterializedCheckPostingRow::parse(&changed).is_err());
+        }
+        let mut shifted = row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            None,
+            &[1, 0x14, 0],
+            SAMPLE_EDIT_BEFORE,
+        );
+        shifted.resize(envelope_len, 0);
+        shifted[..2].copy_from_slice(&(envelope_len as u16).to_le_bytes());
+        for offset in [107, 126, 199, 206] {
+            shifted[offset..offset + zero.len()].copy_from_slice(&zero);
+        }
+        assert!(MaterializedCheckPostingRow::parse(&shifted).is_err());
+    }
+
+    #[test]
+    fn quadruplicate_4f_envelope_requires_each_bounded_copy() {
+        let envelope_len = 206_usize;
+        let mut extended = row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            None,
+            &[1, 0x14, 0],
+            SAMPLE_EDIT_BEFORE,
+        );
+        extended.resize(envelope_len, 0);
+        extended[..2].copy_from_slice(&(envelope_len as u16).to_le_bytes());
+        let amount = [3, 0xbf, 41, 37, 12];
+        let token_len = amount.len();
+        let third_tail = envelope_len - token_len - 7;
+        let second_tail = third_tail - token_len - 5;
+        let first_tail = second_tail - token_len;
+        for offset in [79, first_tail, second_tail, third_tail] {
+            extended[offset..offset + token_len].copy_from_slice(&amount);
+        }
+        assert_eq!(
+            MaterializedCheckPostingRow::parse(&extended)
+                .unwrap()
+                .signed_cents(),
+            123_741
+        );
+        for offset in [79, first_tail, second_tail, third_tail] {
+            let mut changed = extended.clone();
+            changed[offset + token_len - 1] ^= 1;
+            assert!(MaterializedCheckPostingRow::parse(&changed).is_err());
+        }
+    }
+
+    #[test]
+    fn direct_quadruplicate_envelope_does_not_accept_an_unattested_suffix() {
+        let envelope_len = 188_usize;
+        let mut extended = row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            None,
+            &[1, 0x14, 0],
+            SAMPLE_EDIT_BEFORE,
+        );
+        extended.resize(envelope_len, 0);
+        extended[..2].copy_from_slice(&(envelope_len as u16).to_le_bytes());
+        let amount = [3, 0xbf, 41, 37, 12];
+        let token_len = amount.len();
+        let third_tail = envelope_len - token_len - 7;
+        let second_tail = third_tail - token_len - 5;
+        let first_tail = second_tail - token_len;
+        for offset in [AMOUNT_OFFSET, first_tail, second_tail, third_tail] {
+            extended[offset..offset + token_len].copy_from_slice(&amount);
+        }
+        assert_eq!(
+            MaterializedCheckPostingRow::parse(&extended)
+                .unwrap()
+                .signed_cents(),
+            123_741
+        );
+        for offset in [AMOUNT_OFFSET, first_tail, second_tail, third_tail] {
+            let mut changed = extended.clone();
+            changed[offset + token_len - 1] ^= 1;
+            assert!(MaterializedCheckPostingRow::parse(&changed).is_err());
+        }
+    }
+
+    #[test]
+    fn fixed_218_byte_7d_envelope_requires_its_three_bounded_copies() {
+        let envelope_len = 218_usize;
+        let mut extended = row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            None,
+            &[1, 0x14, 0],
+            SAMPLE_EDIT_BEFORE,
+        );
+        extended.resize(envelope_len, 0);
+        extended[..2].copy_from_slice(&(envelope_len as u16).to_le_bytes());
+        let amount = [3, 0xbf, 41, 37, 12];
+        let token_len = amount.len();
+        let second_tail = envelope_len - token_len - 7;
+        let first_tail = second_tail - token_len - 5;
+        for offset in [125, first_tail, second_tail] {
+            extended[offset..offset + token_len].copy_from_slice(&amount);
+        }
+        assert_eq!(
+            MaterializedCheckPostingRow::parse(&extended)
+                .unwrap()
+                .signed_cents(),
+            123_741
+        );
+        for offset in [125, first_tail, second_tail] {
+            let mut changed = extended.clone();
+            changed[offset + token_len - 1] ^= 1;
+            assert!(MaterializedCheckPostingRow::parse(&changed).is_err());
+        }
+    }
+
+    #[test]
+    fn overlapping_triplicate_grammars_remain_ambiguous() {
+        let envelope_len = 240_usize;
+        let mut extended = row(
+            SAMPLE_EXPENSE_TARGET,
+            SAMPLE_EXPENSE_ACCOUNT,
+            None,
+            &[1, 0x14, 0],
+            SAMPLE_EDIT_BEFORE,
+        );
+        extended.resize(envelope_len, 0);
+        extended[..2].copy_from_slice(&(envelope_len as u16).to_le_bytes());
+        let amount = [4, 0xbf, 1, 2, 3, 4];
+        for offset in [109, 216, 227, 115, 222] {
+            extended[offset..offset + amount.len()].copy_from_slice(&amount);
+        }
+        assert!(MaterializedCheckPostingRow::parse(&extended).is_err());
     }
 
     #[test]

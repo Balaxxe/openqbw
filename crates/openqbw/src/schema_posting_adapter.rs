@@ -81,14 +81,7 @@ pub fn adapt_materialized_bill_posting_row(
 ) -> Result<EnterprisePostingAdaptation, EnterprisePostingAdapterError> {
     let target_id = u64::from(row.target_record_number());
     let transaction_id = u64::from(row.master_record_number());
-    if row.has_canonical_zero_amount() {
-        return Err(
-            EnterprisePostingAdapterError::CanonicalZeroRequiresLifecycleEvidence {
-                target_id,
-                transaction_id,
-            },
-        );
-    }
+    let account_id = u64::from(row.account_record_number());
     let transaction_date = row
         .posting_date()
         .map(|date| date.accounting_date())
@@ -96,17 +89,29 @@ pub fn adapt_materialized_bill_posting_row(
             name: "transaction_date".to_owned(),
             raw_minutes: i32::from_le_bytes(row.date_raw().to_le_bytes()),
         })?;
+    let transaction_type = row
+        .transaction_kind()
+        .map(EnterprisePostingTransactionType::from_bill_kind)
+        .ok_or(EnterprisePostingAdapterError::UnknownBillTransactionView {
+            view_type: row.view_type(),
+        })?;
+    if row.has_canonical_zero_amount() {
+        return Ok(EnterprisePostingAdaptation::Excluded(
+            EnterprisePostingExclusion::CanonicalZeroAmount {
+                target_id,
+                transaction_id,
+                account_id,
+                transaction_date,
+                transaction_type,
+            },
+        ));
+    }
     Ok(EnterprisePostingAdaptation::Posting(EnterprisePostingRow {
         table: Enterprise24AccountingTable::BillLine,
-        transaction_type: row
-            .transaction_kind()
-            .map(EnterprisePostingTransactionType::from_bill_kind)
-            .ok_or(EnterprisePostingAdapterError::UnknownBillTransactionView {
-                view_type: row.view_type(),
-            })?,
+        transaction_type,
         target_id,
         transaction_id,
-        account_id: u64::from(row.account_record_number()),
+        account_id,
         transaction_date,
         amount_cents: row.signed_cents(),
         is_source: None,
@@ -157,14 +162,7 @@ pub fn adapt_materialized_check_posting_row(
 ) -> Result<EnterprisePostingAdaptation, EnterprisePostingAdapterError> {
     let target_id = u64::from(row.target_record_number());
     let transaction_id = u64::from(row.master_record_number());
-    if row.has_canonical_zero_amount() {
-        return Err(
-            EnterprisePostingAdapterError::CanonicalZeroRequiresLifecycleEvidence {
-                target_id,
-                transaction_id,
-            },
-        );
-    }
+    let account_id = u64::from(row.account_record_number());
     let transaction_date = row
         .posting_date()
         .map(|date| date.accounting_date())
@@ -172,12 +170,24 @@ pub fn adapt_materialized_check_posting_row(
             name: "transaction_date".to_owned(),
             raw_minutes: i32::from_le_bytes(row.date_raw().to_le_bytes()),
         })?;
+    let transaction_type = EnterprisePostingTransactionType::Check;
+    if row.has_canonical_zero_amount() {
+        return Ok(EnterprisePostingAdaptation::Excluded(
+            EnterprisePostingExclusion::CanonicalZeroAmount {
+                target_id,
+                transaction_id,
+                account_id,
+                transaction_date,
+                transaction_type,
+            },
+        ));
+    }
     Ok(EnterprisePostingAdaptation::Posting(EnterprisePostingRow {
         table: Enterprise24AccountingTable::CheckLine,
-        transaction_type: EnterprisePostingTransactionType::Check,
+        transaction_type,
         target_id,
         transaction_id,
-        account_id: u64::from(row.account_record_number()),
+        account_id,
         transaction_date,
         amount_cents: row.signed_cents(),
         is_source: None,
@@ -236,6 +246,21 @@ pub enum EnterprisePostingExclusion {
         target_id: u64,
         /// Logical transaction identity retained for audit/provenance.
         transaction_id: u64,
+    },
+    /// A fully validated monetary-line carrier has the exact canonical zero
+    /// amount token. This is not a lifecycle claim: callers must still apply
+    /// any table-family current-state policy before excluding it.
+    CanonicalZeroAmount {
+        /// Logical line identity retained for audit/provenance.
+        target_id: u64,
+        /// Logical transaction identity retained for audit/provenance.
+        transaction_id: u64,
+        /// Validated physical account reference, which callers must resolve.
+        account_id: u64,
+        /// Validated posting date retained to prevent a zero branch bypass.
+        transaction_date: AccountingDate,
+        /// Established transaction family/view retained to prevent guessing.
+        transaction_type: EnterprisePostingTransactionType,
     },
     /// A proven source/link row carries no `amount_amt` value.
     ///
@@ -315,20 +340,23 @@ pub fn adapt_enterprise_posting_row(
             },
         ));
     }
-    let amount = required_amount(schema, &row, layout.amount_amt)?;
-    if amount.canonical_zero {
-        return Err(
-            EnterprisePostingAdapterError::CanonicalZeroRequiresLifecycleEvidence {
-                target_id,
-                transaction_id,
-            },
-        );
-    }
     let account_id = required_id(schema, &row, layout.account_id)?;
     let transaction_date = required_date(schema, &row, layout.transaction_date)?;
-
     let transaction_type = EnterprisePostingTransactionType::fixed_for_table(table)
         .ok_or(EnterprisePostingAdapterError::TransactionTypeRequiresDedicatedDecoder { table })?;
+    let is_split = optional_bool(schema, &row, layout.is_split_bool)?;
+    let amount = required_amount(schema, &row, layout.amount_amt)?;
+    if amount.canonical_zero {
+        return Ok(EnterprisePostingAdaptation::Excluded(
+            EnterprisePostingExclusion::CanonicalZeroAmount {
+                target_id,
+                transaction_id,
+                account_id,
+                transaction_date,
+                transaction_type,
+            },
+        ));
+    }
     Ok(EnterprisePostingAdaptation::Posting(EnterprisePostingRow {
         table,
         transaction_type,
@@ -338,7 +366,7 @@ pub fn adapt_enterprise_posting_row(
         transaction_date,
         amount_cents: amount.cents,
         is_source,
-        is_split: optional_bool(schema, &row, layout.is_split_bool)?,
+        is_split,
     }))
 }
 
@@ -383,27 +411,33 @@ pub fn adapt_enterprise_posting_row_partial(
             },
         ));
     }
-    let amount = partial_required_amount(schema, partial, layout.amount_amt)?;
-    if amount.canonical_zero {
-        return Err(
-            EnterprisePostingAdapterError::CanonicalZeroRequiresLifecycleEvidence {
-                target_id,
-                transaction_id,
-            },
-        );
-    }
     let transaction_type = EnterprisePostingTransactionType::fixed_for_table(table)
         .ok_or(EnterprisePostingAdapterError::TransactionTypeRequiresDedicatedDecoder { table })?;
+    let account_id = partial_required_id(schema, partial, layout.account_id)?;
+    let transaction_date = partial_required_date(schema, partial, layout.transaction_date)?;
+    let is_split = partial_optional_bool(schema, partial, layout.is_split_bool)?;
+    let amount = partial_required_amount(schema, partial, layout.amount_amt)?;
+    if amount.canonical_zero {
+        return Ok(EnterprisePostingAdaptation::Excluded(
+            EnterprisePostingExclusion::CanonicalZeroAmount {
+                target_id,
+                transaction_id,
+                account_id,
+                transaction_date,
+                transaction_type,
+            },
+        ));
+    }
     Ok(EnterprisePostingAdaptation::Posting(EnterprisePostingRow {
         table,
         transaction_type,
         target_id,
         transaction_id,
-        account_id: partial_required_id(schema, partial, layout.account_id)?,
-        transaction_date: partial_required_date(schema, partial, layout.transaction_date)?,
+        account_id,
+        transaction_date,
         amount_cents: amount.cents,
         is_source,
-        is_split: partial_optional_bool(schema, partial, layout.is_split_bool)?,
+        is_split,
     }))
 }
 
@@ -788,17 +822,6 @@ fn named_column<'a>(
 /// Reasons a schema-decoded row cannot safely become a posting candidate.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum EnterprisePostingAdapterError {
-    /// A canonical numeric zero is not, by itself, proof that the row was
-    /// deleted or voided. A separate lifecycle resolver must attest it.
-    #[error(
-        "canonical zero amount for target {target_id} / transaction {transaction_id} lacks lifecycle evidence"
-    )]
-    CanonicalZeroRequiresLifecycleEvidence {
-        /// Logical line identity retained for audit diagnostics.
-        target_id: u64,
-        /// Logical transaction identity requiring independent lifecycle evidence.
-        transaction_id: u64,
-    },
     /// A partial row's retained id/index provenance did not match the schema
     /// used to resolve a named field.
     #[error("partial posting value for column {name} does not match schema provenance")]
@@ -1105,7 +1128,15 @@ mod tests {
                 &schema(true),
                 &voided,
             ),
-            Err(EnterprisePostingAdapterError::CanonicalZeroRequiresLifecycleEvidence { .. })
+            Ok(EnterprisePostingAdaptation::Excluded(
+                EnterprisePostingExclusion::CanonicalZeroAmount {
+                    target_id: 7,
+                    transaction_id: 11,
+                    account_id: 13,
+                    transaction_date: 135_081,
+                    transaction_type: EnterprisePostingTransactionType::Check,
+                }
+            ))
         ));
         let mut source_link = partial(false, false);
         source_link.prefix_values[4].value = Value::Null;
@@ -1201,27 +1232,90 @@ mod tests {
     }
 
     #[test]
-    fn rejects_canonical_zero_without_independent_lifecycle_evidence() {
+    fn canonical_zero_is_neutral_only_after_all_monetary_fields_validate() {
         let mut voided = row(false, false);
         voided.values[4] = Value::EnterpriseNumeric(EnterpriseNumericToken {
             marker: 0x81,
             digits: Vec::new(),
         });
-        // A numeric zero alone cannot establish a deletion or void lifecycle.
-        voided.values[2] = Value::Null;
-        voided.values[3] = Value::Null;
-        assert!(matches!(
+        assert_eq!(
             adapt_enterprise_posting_row(
                 Enterprise24AccountingTable::CheckLine,
                 &schema(true),
                 voided,
-            ),
-            Err(
-                EnterprisePostingAdapterError::CanonicalZeroRequiresLifecycleEvidence {
+            )
+            .unwrap(),
+            EnterprisePostingAdaptation::Excluded(
+                EnterprisePostingExclusion::CanonicalZeroAmount {
                     target_id: 7,
                     transaction_id: 11,
+                    account_id: 13,
+                    transaction_date: 135_081,
+                    transaction_type: EnterprisePostingTransactionType::Check,
                 }
             )
+        );
+
+        let mut missing_account = row(false, false);
+        missing_account.values[4] = Value::EnterpriseNumeric(EnterpriseNumericToken {
+            marker: 0x81,
+            digits: Vec::new(),
+        });
+        missing_account.values[2] = Value::Null;
+        assert!(matches!(
+            adapt_enterprise_posting_row(
+                Enterprise24AccountingTable::CheckLine,
+                &schema(true),
+                missing_account,
+            ),
+            Err(EnterprisePostingAdapterError::UnexpectedValueType { .. })
+        ));
+
+        let mut invalid_date = row(false, false);
+        invalid_date.values[4] = Value::EnterpriseNumeric(EnterpriseNumericToken {
+            marker: 0x81,
+            digits: Vec::new(),
+        });
+        invalid_date.values[3] = Value::Date(SaDate { raw_minutes: 1 });
+        assert!(matches!(
+            adapt_enterprise_posting_row(
+                Enterprise24AccountingTable::CheckLine,
+                &schema(true),
+                invalid_date,
+            ),
+            Err(EnterprisePostingAdapterError::InvalidPostingDate { .. })
+        ));
+
+        let mut missing_partial_account = partial(false, false);
+        missing_partial_account.prefix_values[4].value =
+            Value::EnterpriseNumeric(EnterpriseNumericToken {
+                marker: 0x81,
+                digits: Vec::new(),
+            });
+        missing_partial_account
+            .prefix_values
+            .retain(|value| value.column_id != 3);
+        assert!(matches!(
+            adapt_enterprise_posting_row_partial(
+                Enterprise24AccountingTable::CheckLine,
+                &schema(true),
+                &missing_partial_account,
+            ),
+            Err(EnterprisePostingAdapterError::PartialValueUnavailable { .. })
+        ));
+
+        let mut generic_bill_zero = row(false, false);
+        generic_bill_zero.values[4] = Value::EnterpriseNumeric(EnterpriseNumericToken {
+            marker: 0x81,
+            digits: Vec::new(),
+        });
+        assert!(matches!(
+            adapt_enterprise_posting_row(
+                Enterprise24AccountingTable::BillLine,
+                &schema(true),
+                generic_bill_zero,
+            ),
+            Err(EnterprisePostingAdapterError::TransactionTypeRequiresDedicatedDecoder { .. })
         ));
     }
 
