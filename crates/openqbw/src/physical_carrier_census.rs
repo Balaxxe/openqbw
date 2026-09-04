@@ -151,7 +151,11 @@ pub fn census_decoded_physical_carrier_page(page: Page<'_>) -> PhysicalCarrierPa
             continuation_prefix: None,
         };
     };
-    let continuation_prefix = slotted.unclassified_prefix().map(|prefix| {
+    // Keep source compatibility with the published opensqlany 0.1.1 API. The
+    // newer dependency name is semantically clearer, but both accessors expose
+    // the same unclassified bytes and this layer makes no continuation claim.
+    #[allow(deprecated)]
+    let continuation_prefix = slotted.overflow_prefix().map(|prefix| {
         // `array_start` is discovered in SlottedPage's bounded search window.
         debug_assert!(prefix.len() <= MAX_UNCLASSIFIED_PREFIX_LEN);
         ContinuationPrefixProvenance {
