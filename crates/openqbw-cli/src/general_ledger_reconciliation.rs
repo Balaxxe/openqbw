@@ -368,6 +368,15 @@ pub fn resolve_native_account_sections_with_chart(
             row.identity.account_full_name = full_name.clone();
             continue;
         }
+        if let Some(account_id) =
+            resolve_native_other_section_name(&row.identity.account_full_name, decoded_chart)?
+        {
+            let full_name = full_names_by_account_id
+                .get(account_id.as_str())
+                .ok_or(GeneralLedgerError::UnresolvedNativeAccountSection)?;
+            row.identity.account_full_name = full_name.clone();
+            continue;
+        }
         let leaf = row
             .identity
             .account_full_name
@@ -464,6 +473,33 @@ fn resolve_native_account_name(
     };
     if !matches.is_empty() {
         return Err(GeneralLedgerError::AmbiguousNativeAccountSection);
+    }
+    Ok(Some(account_id))
+}
+
+/// Desktop can present a hidden or application-owned alternate section as
+/// `NAME - Other` even where the decoded chart records the only current
+/// account as `NAME`.  This fallback is deliberately narrower than leaf-name
+/// matching: it runs only after exact name/display resolution, removes only
+/// the terminal presentation suffix, and still requires exactly one complete
+/// decoded chart name match.
+fn resolve_native_other_section_name(
+    native_name: &str,
+    decoded_chart: &[Account],
+) -> Result<Option<AccountId>, GeneralLedgerError> {
+    let native_name = canonical_native_account_full_name(native_name);
+    let Some(base_name) = native_name.strip_suffix(" - Other") else {
+        return Ok(None);
+    };
+    let mut matches = exact_account_name_matches(base_name, decoded_chart);
+    let Some(account_id) = matches.pop() else {
+        return Ok(None);
+    };
+    if !matches.is_empty() {
+        // Do not choose between duplicate chart names. Returning unresolved
+        // preserves the later, stricter Accounts Payable control-role proof;
+        // every other ambiguous section remains fail-closed there.
+        return Ok(None);
     }
     Ok(Some(account_id))
 }
@@ -1202,6 +1238,39 @@ mod tests {
         assert_eq!(
             resolve_native_account_name("SAMPLE Ancestor:SAMPLE Leaf", &[account, duplicate]),
             Err(GeneralLedgerError::AmbiguousNativeAccountSection)
+        );
+    }
+
+    #[test]
+    fn other_section_suffix_requires_one_exact_chart_base_name() {
+        let account = Account::new(
+            AccountId::new("SAMPLE-OTHER").unwrap(),
+            "SAMPLE Control".to_owned(),
+            AccountType::Liability,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_native_other_section_name(
+                "SAMPLE Control - Other",
+                std::slice::from_ref(&account),
+            ),
+            Ok(Some(account.id.clone()))
+        );
+        assert_eq!(
+            resolve_native_other_section_name("SAMPLE Control", std::slice::from_ref(&account)),
+            Ok(None)
+        );
+        let duplicate = Account::new(
+            AccountId::new("SAMPLE-OTHER-TWO").unwrap(),
+            "SAMPLE Control".to_owned(),
+            AccountType::Liability,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_native_other_section_name("SAMPLE Control - Other", &[account, duplicate]),
+            Ok(None)
         );
     }
 

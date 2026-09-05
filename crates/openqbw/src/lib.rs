@@ -119,7 +119,11 @@ pub use enterprise24_accounting_pipeline::{
     Enterprise24PartialRecord, Enterprise24PartialRecordCandidate,
     Enterprise24PartialTableCoverage, Enterprise24PartialTablePolicy, Enterprise24PartialTableRows,
     Enterprise24TableCoverageExpectation, build_enterprise24_accounting_pipeline,
-    collect_enterprise24_bill_table_rows, collect_enterprise24_check_prefix_table_rows,
+    build_enterprise24_accounting_pipeline_with_general_journal_header_witnesses,
+    collect_enterprise24_bill_header_master_witnesses, collect_enterprise24_bill_table_rows,
+    collect_enterprise24_bill_table_rows_with_context,
+    collect_enterprise24_check_prefix_table_rows,
+    collect_enterprise24_general_journal_header_metadata_witnesses,
     collect_enterprise24_general_journal_table_rows, collect_enterprise24_partial_table_rows,
     enterprise24_r21_partial_table_policy, resolve_enterprise24_partial_record_candidates,
 };
@@ -191,13 +195,15 @@ pub use materialized_deposit_posting::{
     MaterializedDepositPostingRowError,
 };
 pub use materialized_general_journal_posting::{
-    MATERIALIZED_GENERAL_JOURNAL_FLAGS, MATERIALIZED_GENERAL_JOURNAL_POSTING_TABLE_ID,
-    MATERIALIZED_GENERAL_JOURNAL_ROW_KIND, MaterializedGeneralJournalAmountPosition,
-    MaterializedGeneralJournalCanonicalZeroAmount, MaterializedGeneralJournalDisposition,
-    MaterializedGeneralJournalPostingRow, MaterializedGeneralJournalPostingRowError,
-    MaterializedGeneralJournalPostingTargetRow, MaterializedGeneralJournalPostingTargetShape,
-    MaterializedGeneralJournalProductionRowError, MaterializedGeneralJournalSourceLink,
-    MaterializedGeneralJournalSourceLinkRow, classify_materialized_general_journal_rows,
+    GeneralJournalHeaderMetadataWitness, MATERIALIZED_GENERAL_JOURNAL_FLAGS,
+    MATERIALIZED_GENERAL_JOURNAL_POSTING_TABLE_ID, MATERIALIZED_GENERAL_JOURNAL_ROW_KIND,
+    MaterializedGeneralJournalAmountPosition, MaterializedGeneralJournalCanonicalZeroAmount,
+    MaterializedGeneralJournalDisposition, MaterializedGeneralJournalPostingRow,
+    MaterializedGeneralJournalPostingRowError, MaterializedGeneralJournalPostingTargetRow,
+    MaterializedGeneralJournalPostingTargetShape, MaterializedGeneralJournalProductionRowError,
+    MaterializedGeneralJournalSourceLink, MaterializedGeneralJournalSourceLinkRow,
+    classify_materialized_general_journal_rows,
+    classify_materialized_general_journal_rows_with_header_witnesses,
     validate_materialized_general_journal_master_balances,
 };
 pub use materialized_page_trace::{
