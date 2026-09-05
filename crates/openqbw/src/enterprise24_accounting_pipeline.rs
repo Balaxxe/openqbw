@@ -140,7 +140,7 @@ pub const ENTERPRISE24_R21_PARTIAL_TABLE_POLICIES: [Enterprise24PartialTablePoli
     },
     Enterprise24PartialTablePolicy {
         table: Enterprise24AccountingTable::BillLine,
-        version: "enterprise24-r21-bill-prefix-v1",
+        version: "enterprise24-r21-bill-lifecycle-prefix-v2",
         through_ordinal: Some(34),
         status: Enterprise24PartialPolicyStatus::Partial,
         storage: Some(PREFIX_TWO_U8),
@@ -522,12 +522,35 @@ pub fn collect_enterprise24_bill_table_rows(
     scan: &EnterpriseTableScan,
     expectation: Enterprise24TableCoverageExpectation,
 ) -> Result<Enterprise24PartialTableRows, Enterprise24AccountingPipelineError> {
+    collect_bill_table_rows(scan, expectation, None)
+}
+
+/// Collect Bill monetary rows with consensus schema-bound lifecycle flags.
+/// Forwarding and external text retain their separate coverage proofs.
+pub fn collect_enterprise24_bill_table_rows_with_lifecycle_schema(
+    scan: &EnterpriseTableScan,
+    schema: &RowSchema,
+    expectation: Enterprise24TableCoverageExpectation,
+) -> Result<Enterprise24PartialTableRows, Enterprise24AccountingPipelineError> {
+    collect_bill_table_rows(scan, expectation, Some(schema))
+}
+
+fn collect_bill_table_rows(
+    scan: &EnterpriseTableScan,
+    expectation: Enterprise24TableCoverageExpectation,
+    schema: Option<&RowSchema>,
+) -> Result<Enterprise24PartialTableRows, Enterprise24AccountingPipelineError> {
     let policy = enterprise24_r21_partial_table_policy(Enterprise24AccountingTable::BillLine)
         .expect("Bill policy is static");
     if scan.target_table_id != policy.table.id() {
         return Err(Enterprise24AccountingPipelineError::ScanTableMismatch {
             scan_table_id: scan.target_table_id,
             policy_table_id: policy.table.id(),
+        });
+    }
+    if schema.is_some_and(|schema| !policy_schema_matches(policy, schema)) {
+        return Err(Enterprise24AccountingPipelineError::PolicyStorageMismatch {
+            table_id: policy.table.id(),
         });
     }
     let mut coverage = Enterprise24PartialTableCoverage {
@@ -583,12 +606,41 @@ pub fn collect_enterprise24_bill_table_rows(
                     coverage.unresolved_records += 1;
                     continue;
                 }
+                let partial = if let Some(schema) = schema {
+                    let decoded = candidates
+                        .iter()
+                        .map(|bytes| {
+                            decode_row_prefix_and_boolean_tail(
+                                bytes,
+                                schema,
+                                policy.through_ordinal.expect("Bill prefix"),
+                            )
+                            .map(|partial| {
+                                Enterprise24PartialRecordCandidate {
+                                    bytes: bytes.clone(),
+                                    partial,
+                                }
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>();
+                    let resolved = decoded.ok().and_then(|decoded| {
+                        resolve_enterprise24_partial_record_candidates(&decoded)
+                    });
+                    let Some(resolved) = resolved else {
+                        coverage.decode_failures += 1;
+                        coverage.unresolved_records += 1;
+                        continue;
+                    };
+                    resolved.partial
+                } else {
+                    empty_physical_partial(&candidates[0])
+                };
                 let bytes = candidates[0].clone();
                 coverage.resolved_records += 1;
                 records.push(Enterprise24PartialRecord {
                     raw_page_number: group.raw_page_number,
                     record_id,
-                    partial: empty_physical_partial(&bytes),
+                    partial,
                     bytes,
                 });
             } else if let Some(destination) = consensus_forwarding_locator(&candidates) {
@@ -1701,6 +1753,18 @@ pub fn build_enterprise24_accounting_pipeline_with_general_journal_header_witnes
             continue;
         }
         if table == Enterprise24AccountingTable::BillLine {
+            let lifecycle = match bill_lifecycle_states(&rows.records, schemas.get(&table.id())) {
+                Ok(states) => states,
+                Err(()) => {
+                    diagnostics.blockers.push(
+                        Enterprise24AccountingPipelineBlocker::PostingStrategyRejected {
+                            table_id: table.id(),
+                        },
+                    );
+                    continue;
+                }
+            };
+
             if validate_materialized_bill_zero_families(&rows.records).is_err() {
                 diagnostics.blockers.push(
                     Enterprise24AccountingPipelineBlocker::PostingStrategyRejected {
@@ -1738,7 +1802,32 @@ pub fn build_enterprise24_accounting_pipeline_with_general_journal_header_witnes
                 diagnostics.posting_candidates += 1;
                 let adaptation = MaterializedBillPostingRow::parse(&record.bytes)
                     .map_err(|_| ())
-                    .and_then(|row| adapt_materialized_bill_posting_row(&row).map_err(|_| ()));
+                    .and_then(|row| {
+                        let adaptation =
+                            adapt_materialized_bill_posting_row(&row).map_err(|_| ())?;
+                        if !identity_map.contains_key(&row.account_record_number()) {
+                            return Err(());
+                        }
+                        let (no_post, memorized) =
+                            lifecycle.get(&row.master_record_number()).ok_or(())?;
+                        Ok(if *no_post {
+                            EnterprisePostingAdaptation::Excluded(
+                                EnterprisePostingExclusion::NoPost {
+                                    target_id: u64::from(row.target_record_number()),
+                                    transaction_id: u64::from(row.master_record_number()),
+                                },
+                            )
+                        } else if *memorized {
+                            EnterprisePostingAdaptation::Excluded(
+                                EnterprisePostingExclusion::MemorizedTransaction {
+                                    target_id: u64::from(row.target_record_number()),
+                                    transaction_id: u64::from(row.master_record_number()),
+                                },
+                            )
+                        } else {
+                            adaptation
+                        })
+                    });
                 match adaptation {
                     Ok(adaptation) => match normalized_disposition(
                         table,
@@ -2782,6 +2871,34 @@ fn validate_check_master_balances(rows: &[Enterprise24PartialRecord]) -> Result<
         adapt_materialized_check_posting_row(&row).map_err(|_| ())
     })
     .map(|_| ())
+}
+
+/// Lifecycle flags must be present and agree across every retained line of
+/// a Bill master. Monetary/date/view parsing and balance validation still run
+/// before a no-post or memorized exclusion can reach the final ledger.
+fn bill_lifecycle_states(
+    records: &[Enterprise24PartialRecord],
+    schema: Option<&RowSchema>,
+) -> Result<BTreeMap<u32, (bool, bool)>, ()> {
+    let mut states = BTreeMap::new();
+    if records.is_empty() {
+        return Ok(states);
+    }
+    let schema = schema.ok_or(())?;
+    for record in records {
+        let row = MaterializedBillPostingRow::parse(&record.bytes).map_err(|_| ())?;
+        let state = (
+            named_bool(schema, &record.partial, "is_no_post_bool").ok_or(())?,
+            named_bool(schema, &record.partial, "is_memorized_transaction_bool").ok_or(())?,
+        );
+        if states
+            .insert(row.master_record_number(), state)
+            .is_some_and(|prior| prior != state)
+        {
+            return Err(());
+        }
+    }
+    Ok(states)
 }
 
 fn validate_materialized_bill_zero_families(rows: &[Enterprise24PartialRecord]) -> Result<(), ()> {
@@ -4457,6 +4574,36 @@ mod tests {
             &schema,
             &headers
         ));
+    }
+
+    #[test]
+    fn bill_lifecycle_requires_explicit_consistent_flags_for_the_whole_master() {
+        let schema = bill_carrier_schema();
+        let mut records = vec![
+            bill_family_record(101, 7, &[1, 0xbf, 1]),
+            bill_family_record(102, 8, &[1, 0x3f, 1]),
+        ];
+        for (index, record) in records.iter_mut().enumerate() {
+            record.partial = bill_carrier_partial(
+                101 + index as u32,
+                100,
+                Some(7 + index as u32),
+                None,
+                None,
+                Value::Integer(1),
+            );
+            record.partial.boolean_values[1].value = Value::Boolean(true);
+        }
+        assert_eq!(
+            bill_lifecycle_states(&records, Some(&schema)).unwrap(),
+            BTreeMap::from([(100, (true, false))])
+        );
+        records[1].partial.boolean_values[1].value = Value::Boolean(false);
+        assert!(bill_lifecycle_states(&records, Some(&schema)).is_err());
+        records[1].partial.boolean_values[1].value = Value::Boolean(true);
+        records[1].partial.boolean_values.clear();
+        assert!(bill_lifecycle_states(&records, Some(&schema)).is_err());
+        assert!(bill_lifecycle_states(&records, None).is_err());
     }
 
     #[test]

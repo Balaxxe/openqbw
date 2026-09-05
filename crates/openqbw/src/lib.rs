@@ -122,6 +122,7 @@ pub use enterprise24_accounting_pipeline::{
     build_enterprise24_accounting_pipeline_with_general_journal_header_witnesses,
     collect_enterprise24_bill_header_master_witnesses, collect_enterprise24_bill_table_rows,
     collect_enterprise24_bill_table_rows_with_context,
+    collect_enterprise24_bill_table_rows_with_lifecycle_schema,
     collect_enterprise24_check_prefix_table_rows,
     collect_enterprise24_general_journal_header_metadata_witnesses,
     collect_enterprise24_general_journal_table_rows, collect_enterprise24_partial_table_rows,

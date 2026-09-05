@@ -6,10 +6,10 @@
 //! observed header/trailer relocation, and accepts the result only when one
 //! distinct candidate satisfies the complete materialized type-4 contract.
 //!
-//! The high word of the transform key is a file-level property.  It is learned
-//! only from several independent, decisive type-4 pages; callers can then use
-//! that context to decode sparse pages which do not carry enough structure to
-//! select it safely by themselves.
+//! The key direction and magnitude's high word are learned from independent
+//! type-4 pages. Callers reuse that context for sparse pages. A broader context
+//! can retain two adjacent high words only as candidates; the accounting
+//! layer must independently attest its catalog, coverage, and unique ledger.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -30,11 +30,13 @@ const MIN_DECISIVE_KEY_WITNESSES: usize = 3;
 /// A file-wide Enterprise sector-transform key context.
 ///
 /// The low two bytes vary by physical page and are recovered from its known
-/// page key.  The high word is stable for the observed Enterprise file format
-/// and is deliberately obtained from multiple table-page witnesses.
+/// page key. Direction and high-word candidates come from table-page witnesses;
+/// structural discovery alone is not sufficient to select an accounting key.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct EnterprisePageTransformKey {
     high_word: u16,
+    negative: bool,
+    adjacent_high_word: bool,
     decisive_witness_count: usize,
 }
 
@@ -43,11 +45,40 @@ impl EnterprisePageTransformKey {
     pub const fn from_high_word(high_word: u16) -> Self {
         Self {
             high_word,
+            negative: false,
+            adjacent_high_word: false,
             decisive_witness_count: 0,
         }
     }
 
-    /// The stable high word of the positive sector-transform key.
+    /// Construct an independently established negative-key context.
+    /// The high word belongs to the key magnitude, not its two's complement.
+    pub const fn from_negative_high_word(high_word: u16) -> Self {
+        Self {
+            high_word,
+            negative: true,
+            adjacent_high_word: false,
+            decisive_witness_count: 0,
+        }
+    }
+
+    /// Whether the recovered sector transformation uses a negative key.
+    pub const fn is_negative(self) -> bool {
+        self.negative
+    }
+
+    /// Retain both parity variants of this high word as candidates only.
+    /// Callers must independently attest the catalog and complete accounting
+    /// coverage before using this broader context to produce any output.
+    pub const fn with_adjacent_high_word(self) -> Self {
+        Self {
+            high_word: self.high_word & !1,
+            adjacent_high_word: true,
+            ..self
+        }
+    }
+
+    /// The stable high word of the sector-transform key magnitude.
     pub const fn high_word(self) -> u16 {
         self.high_word
     }
@@ -92,7 +123,7 @@ pub fn materialize_enterprise_table_page(
 ) -> Result<EnterpriseMaterializedTablePage, EnterprisePageMaterializationError> {
     let page_key = checked_page_key(raw_page, page_number)?;
     let header = exactly_one_header_transform(raw_page, page_key)?;
-    materialize_with_signed_keys(raw_page, page_key, positive_signed_key_candidates(header))
+    materialize_with_signed_keys(raw_page, page_key, signed_key_candidates(header))
 }
 
 /// Materialize one raw Enterprise 24 page using a file-wide key context.
@@ -222,7 +253,7 @@ where
             continue;
         }
         let header = header_candidates[0];
-        let candidate_high_words = valid_high_words(raw_page, page_key, header)?;
+        let candidate_high_words = valid_key_contexts(raw_page, page_key, header)?;
         if candidate_high_words.len() != 1 {
             continue;
         }
@@ -245,11 +276,13 @@ where
             },
         );
     }
-    let high_word = *high_words
+    let (high_word, negative) = *high_words
         .first()
         .expect("enough decisive witnesses imply one key context");
     Ok(EnterprisePageTransformKey {
         high_word,
+        negative,
+        adjacent_high_word: false,
         decisive_witness_count: witnesses.len(),
     })
 }
@@ -277,14 +310,14 @@ pub fn discover_enterprise_page_transform_key_candidates<'a, I>(
 where
     I: IntoIterator<Item = (u64, &'a [u8])>,
 {
-    let mut witnesses = BTreeMap::<u16, BTreeSet<u32>>::new();
+    let mut witnesses = BTreeMap::<(u16, bool), BTreeSet<u32>>::new();
     for (page_number, raw_page) in raw_pages {
         let page_key = checked_page_key(raw_page, page_number)?;
         let header_candidates = recover_header_candidates(&raw_page[..SECTOR_LEN], page_key);
         if header_candidates.len() != 1 {
             continue;
         }
-        let candidate_high_words = valid_high_words(raw_page, page_key, header_candidates[0])?;
+        let candidate_high_words = valid_key_contexts(raw_page, page_key, header_candidates[0])?;
         if candidate_high_words.len() != 1 {
             continue;
         }
@@ -296,10 +329,14 @@ where
 
     let candidates = witnesses
         .into_iter()
-        .map(|(high_word, page_keys)| EnterprisePageTransformKey {
-            high_word,
-            decisive_witness_count: page_keys.len(),
-        })
+        .map(
+            |((high_word, negative), page_keys)| EnterprisePageTransformKey {
+                high_word,
+                negative,
+                adjacent_high_word: false,
+                decisive_witness_count: page_keys.len(),
+            },
+        )
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return Err(
@@ -388,18 +425,19 @@ fn materialized_pages_with_signed_keys(
         .collect())
 }
 
-fn valid_high_words(
+fn valid_key_contexts(
     raw_page: &[u8],
     page_key: u32,
     header: HeaderTransform,
-) -> Result<BTreeSet<u16>, EnterprisePageMaterializationError> {
-    let mut high_words = BTreeSet::new();
-    for signed_key in positive_signed_key_candidates(header) {
+) -> Result<BTreeSet<(u16, bool)>, EnterprisePageMaterializationError> {
+    let mut contexts = BTreeSet::new();
+    for signed_key in signed_key_candidates(header) {
         if materialize_with_signed_keys(raw_page, page_key, [signed_key]).is_ok() {
-            high_words.insert((signed_key >> 16) as u16);
+            let key = signed_key as i32;
+            contexts.insert(((key.unsigned_abs() >> 16) as u16, key < 0));
         }
     }
-    Ok(high_words)
+    Ok(contexts)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -542,23 +580,45 @@ fn positive_signed_key_candidates(header: HeaderTransform) -> Vec<u32> {
     candidates
 }
 
+/// Recover both signs from the observed cycle equations. For a negative
+/// key the first full-sector seed is increment minus magnitude's low byte,
+/// and the cycle stride is the negation of the magnitude-derived stride.
+fn signed_key_candidates(header: HeaderTransform) -> Vec<u32> {
+    let mut candidates = positive_signed_key_candidates(header);
+    let low = header.increment.wrapping_sub(header.initial_seed);
+    let stride = SECTOR_LEN.wrapping_sub(usize::from(header.step_mod_512)) & 511;
+    for byte_one in [header.increment & !1, header.increment] {
+        for before_or in [stride, stride.wrapping_sub(1) & 511] {
+            let high_word = before_or.wrapping_sub(usize::from(low)) & 511;
+            let magnitude =
+                ((high_word as u32) << 16) | (u32::from(byte_one) << 8) | u32::from(low);
+            if magnitude != 0 {
+                candidates.push(magnitude.wrapping_neg());
+            }
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
 fn signed_key_candidates_for_context(
     header: HeaderTransform,
     transform_key: EnterprisePageTransformKey,
 ) -> Vec<u32> {
-    // No global byte-one policy is established. Retain both raw candidates;
-    // callers receive an ambiguity error when they produce distinct valid
-    // type-4 pages rather than silently losing data.
-    let mut candidates = Vec::with_capacity(2);
-    for byte_one in [header.increment & !1, header.increment] {
-        let candidate = (u32::from(transform_key.high_word) << 16)
-            | (u32::from(byte_one) << 8)
-            | u32::from(header.initial_seed);
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-    candidates
+    // Preserve both byte-one candidates. A context includes direction so
+    // opposite transformations are never merged merely by high word.
+    signed_key_candidates(header)
+        .into_iter()
+        .filter(|candidate| {
+            let key = *candidate as i32;
+            let high_word = (key.unsigned_abs() >> 16) as u16;
+            (key < 0) == transform_key.negative
+                && (high_word == transform_key.high_word
+                    || (transform_key.adjacent_high_word
+                        && high_word == (transform_key.high_word ^ 1)))
+        })
+        .collect()
 }
 
 fn transform_page(
@@ -716,6 +776,100 @@ mod tests {
             .expect("materialized page");
         assert_eq!(recovered.bytes(), &materialized);
         assert_eq!(recovered.table_page().record_count(), 8);
+    }
+
+    #[test]
+    fn negative_transform_recovers_full_pages_across_sector_key_carries() {
+        for magnitude in [0x013f_7bfe_u32, 0x0034_7b01, 0x012c_25ff] {
+            let context =
+                EnterprisePageTransformKey::from_negative_high_word((magnitude >> 16) as u16);
+            for page_key in [13, 271, 4099] {
+                let expected = synthetic_page_for_key(page_key);
+                let raw = encode_raw_with_key(expected, magnitude.wrapping_neg());
+                let recovered = materialize_enterprise_table_page_candidates_with_key(
+                    &raw,
+                    u64::from(page_key),
+                    context,
+                )
+                .unwrap();
+                assert_eq!(recovered.len(), 1);
+                assert_eq!(recovered[0].bytes(), &expected);
+                assert!(
+                    materialize_enterprise_table_page_candidates_with_key(
+                        &raw,
+                        u64::from(page_key),
+                        EnterprisePageTransformKey::from_high_word(context.high_word()),
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_keeps_opposite_directions_distinct_at_the_same_high_word() {
+        let mut raws = Vec::new();
+        for (negative, start) in [(false, PAGE_KEY), (true, PAGE_KEY + 3)] {
+            let key = if negative {
+                SIGNED_KEY.wrapping_neg()
+            } else {
+                SIGNED_KEY
+            };
+            for page_key in start..start + 3 {
+                raws.push((
+                    page_key,
+                    encode_raw_with_key(synthetic_page_for_key(page_key), key),
+                ));
+            }
+        }
+        let candidates = discover_enterprise_page_transform_key_candidates(
+            raws.iter()
+                .map(|(key, raw)| (u64::from(*key), raw.as_slice())),
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|key| key.is_negative())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([false, true])
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|key| key.decisive_witness_count() == 3)
+        );
+        assert!(
+            discover_enterprise_page_transform_key(
+                raws.iter()
+                    .map(|(key, raw)| (u64::from(*key), raw.as_slice())),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn adjacent_context_retains_both_witnessed_page_grammars_without_guessing() {
+        let pair = EnterprisePageTransformKey::from_high_word(101).with_adjacent_high_word();
+        assert_eq!(pair.high_word(), 100);
+        for (index, key) in [0x0064_2537_u32, 0x0065_259f].into_iter().enumerate() {
+            let page_key = 800 + index as u32;
+            let expected = synthetic_page_for_key(page_key);
+            let raw = encode_raw_with_key(expected, key);
+            let candidates = materialize_enterprise_table_page_candidates_with_key(
+                &raw,
+                u64::from(page_key),
+                pair,
+            )
+            .unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].bytes(), &expected);
+        }
+        let unrelated = encode_raw_with_key(synthetic_page_for_key(805), 0x0068_2537);
+        assert!(
+            materialize_enterprise_table_page_candidates_with_key(&unrelated, 805, pair).is_err()
+        );
     }
 
     #[test]

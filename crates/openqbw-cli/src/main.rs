@@ -69,8 +69,9 @@ use openqbw::{
     TransactionHeader, adapt_complete_schema, attest_enterprise24_r21_catalog,
     build_enterprise24_accounting_pipeline,
     build_enterprise24_accounting_pipeline_with_general_journal_header_witnesses,
-    collect_enterprise24_bill_header_master_witnesses, collect_enterprise24_bill_table_rows,
+    collect_enterprise24_bill_header_master_witnesses,
     collect_enterprise24_bill_table_rows_with_context,
+    collect_enterprise24_bill_table_rows_with_lifecycle_schema,
     collect_enterprise24_check_prefix_table_rows,
     collect_enterprise24_general_journal_header_metadata_witnesses,
     collect_enterprise24_general_journal_table_rows, collect_enterprise24_partial_table_rows,
@@ -1283,35 +1284,39 @@ fn build_local_enterprise24_ledger_from_attestation(
             .with_context(|| format!("selecting materialized table {}", policy.table.id()))?;
         let rows = match policy.table {
             Enterprise24AccountingTable::BillLine => {
-                let physical_rows = collect_enterprise24_bill_table_rows(&table_scan, expectation)
-                    .context("collecting dedicated Bill physical carriers")?;
+                let storage = policy
+                    .storage
+                    .with_context(|| "dedicated Bill collector requires a proven storage policy")?;
+                let expected_count = ENTERPRISE24_R21_SCHEMA_MANIFEST
+                    .iter()
+                    .find(|manifest| manifest.table_id == policy.table.id())
+                    .context("missing schema manifest for Bill table")?
+                    .column_count;
+                let columns = catalog
+                    .complete_materialized_schema_columns(policy.table.id(), expected_count)
+                    .context("attesting complete schema for Bill table")?;
+                let default_envelopes = validated_catalog
+                    .default_envelopes(policy.table.id())
+                    .context("collecting manifest-bound catalog defaults for Bill table")?;
+                let schema = adapt_complete_schema(
+                    &columns,
+                    CatalogCoverageAttestation::new(policy.table.id(), expected_count)?,
+                    storage,
+                    CatalogDefaultAttestation {
+                        envelopes: &default_envelopes,
+                    },
+                )
+                .context("building schema for Bill table")?;
+                schemas.insert(policy.table.id(), schema.clone());
+                let physical_rows = collect_enterprise24_bill_table_rows_with_lifecycle_schema(
+                    &table_scan,
+                    &schema,
+                    expectation,
+                )
+                .context("collecting Bill physical carriers and lifecycle evidence")?;
                 if physical_rows.coverage.is_complete() {
                     physical_rows
                 } else {
-                    let storage = policy.storage.with_context(
-                        || "dedicated Bill collector requires a proven storage policy",
-                    )?;
-                    let expected_count = ENTERPRISE24_R21_SCHEMA_MANIFEST
-                        .iter()
-                        .find(|manifest| manifest.table_id == policy.table.id())
-                        .context("missing schema manifest for Bill table")?
-                        .column_count;
-                    let columns = catalog
-                        .complete_materialized_schema_columns(policy.table.id(), expected_count)
-                        .context("attesting complete schema for Bill table")?;
-                    let default_envelopes = validated_catalog
-                        .default_envelopes(policy.table.id())
-                        .context("collecting manifest-bound catalog defaults for Bill table")?;
-                    let schema = adapt_complete_schema(
-                        &columns,
-                        CatalogCoverageAttestation::new(policy.table.id(), expected_count)?,
-                        storage,
-                        CatalogDefaultAttestation {
-                            envelopes: &default_envelopes,
-                        },
-                    )
-                    .context("building schema for Bill table")?;
-                    schemas.insert(policy.table.id(), schema.clone());
                     let bill_header_scan = scan
                         .for_table(Enterprise24AccountingTable::BillHeader.id())
                         .context("selecting materialized Bill header table for kind-64 repair")?;

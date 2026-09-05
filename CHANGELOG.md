@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Page-key discovery retains positive and negative sector transformations as
+  distinct candidates. A catalog-attested accounting-page deficit can try
+  independently witnessed adjacent high words, subject to the complete
+  catalog, page inventory, and unique balanced-ledger checks.
+- Bill exports honor consensus schema-bound no-post and memorized flags.
+  Conflicting lifecycle flags within a transaction or missing flag evidence
+  fail closed; monetary parsing and balance checks remain required.
 - Schema-bound Bill and Check link carriers with null principal fields can be
   excluded after complete family, reference, and balance validation. Check
   schema fallback retains the distinct proof required for void companions.
