@@ -777,6 +777,57 @@ pub enum MaterializedGeneralJournalDisposition {
         /// The metadata carrier record.
         target_record_number: u32,
     },
+    /// A family-64 source carrier corroborated by one General Journal header.
+    /// Its next field is header metadata rather than a table-3078 link.
+    HeaderMetadataCarrier {
+        /// The carrier's transaction master.
+        master_record_number: u32,
+        /// The corroborating header's group field.
+        header_group: u32,
+    },
+}
+
+/// One consensus-resolved table-3076 General Journal header witness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GeneralJournalHeaderMetadataWitness {
+    /// Header record identifier at byte offset 0x0b.
+    pub id: u32,
+    /// Header business-date bits at byte offset 0x0f.
+    pub date_raw: u32,
+    /// Header group at byte offset 0x13.
+    pub group: u32,
+}
+
+impl GeneralJournalHeaderMetadataWitness {
+    /// Parses the complete, fixed General Journal header framing.
+    pub fn parse(input: &[u8]) -> Result<Self, MaterializedGeneralJournalProductionRowError> {
+        if input.len() < 23
+            || usize::from(u16_at(input, 0)) != input.len()
+            || input.get(2) != Some(&MATERIALIZED_GENERAL_JOURNAL_FLAGS)
+            || input.get(3) != Some(&MATERIALIZED_GENERAL_JOURNAL_ROW_KIND)
+            || input.get(4..7) != Some(&[0xa7, 0xfe, 0][..])
+        {
+            return Err(MaterializedGeneralJournalProductionRowError::UnrecognizedCarrier);
+        }
+        let id = u32_at(input, 11);
+        let date_raw = u32_at(input, 15);
+        let group = u32_at(input, 19);
+        if id == 0 || group == 0 {
+            return Err(
+                MaterializedGeneralJournalProductionRowError::MissingRequiredReference {
+                    field: "header witness",
+                },
+            );
+        }
+        crate::MaterializedPostingDate::from_raw_bits(date_raw).map_err(|_| {
+            MaterializedGeneralJournalProductionRowError::InvalidPostingDate { raw: date_raw }
+        })?;
+        Ok(Self {
+            id,
+            date_raw,
+            group,
+        })
+    }
 }
 
 /// Classifies every consensus-resolved table-3078 row exactly once.
@@ -786,6 +837,15 @@ pub enum MaterializedGeneralJournalDisposition {
 /// auxiliary relationship chains cannot safely be identified row by row.
 pub fn classify_materialized_general_journal_rows(
     rows: &[Vec<u8>],
+) -> Result<Vec<MaterializedGeneralJournalDisposition>, MaterializedGeneralJournalProductionRowError>
+{
+    classify_materialized_general_journal_rows_with_header_witnesses(rows, &[])
+}
+
+/// Classifies a complete table-3078 collection with consensus header context.
+pub fn classify_materialized_general_journal_rows_with_header_witnesses(
+    rows: &[Vec<u8>],
+    witnesses: &[GeneralJournalHeaderMetadataWitness],
 ) -> Result<Vec<MaterializedGeneralJournalDisposition>, MaterializedGeneralJournalProductionRowError>
 {
     let mut result = Vec::with_capacity(rows.len());
@@ -903,6 +963,97 @@ pub fn classify_materialized_general_journal_rows(
                 == 1
         };
     for (index, source) in sources {
+        // Preserve the established source/link grammar whenever it resolves.
+        // Header metadata is a fallback grammar for a source whose ordinary
+        // same-master traversal is impossible, never an override for it.
+        let ordinary_topology_succeeds = || {
+            let Some(mut next_target) = source.next_target_record_number else {
+                return has_unique_terminal_source_destination(&source);
+            };
+            let mut visited = std::collections::BTreeSet::new();
+            loop {
+                if !visited.insert(next_target) {
+                    return false;
+                }
+                if let Some(posting) = postings.get(&next_target) {
+                    return posting.master_record_number == source.master_record_number
+                        && posting.date_raw == source.date_raw;
+                }
+                if let Some(zero) = canonical_zeroes.get(&next_target) {
+                    return zero.master_record_number == source.master_record_number
+                        && zero.date_raw == source.date_raw;
+                }
+                if let Some(&(master, date_raw)) = auxiliary_cores.get(&next_target) {
+                    return master == source.master_record_number && date_raw == source.date_raw;
+                }
+                if visited.len() > source_nodes.len() {
+                    return false;
+                }
+                let Some(next_source) = source_nodes.get(&next_target) else {
+                    return false;
+                };
+                if next_source.master_record_number != source.master_record_number
+                    || next_source.date_raw != source.date_raw
+                {
+                    return false;
+                }
+                let Some(next) = next_source.next_target_record_number else {
+                    return has_unique_terminal_source_destination(next_source);
+                };
+                next_target = next;
+            }
+        };
+        let is_header_metadata_family = (rows[index].len() == 151
+            && rows[index].get(4..11) == Some(&[0x64, 0x93, 0xff, 0xc0, 0x40, 0x80, 0x20][..]))
+            || (rows[index].len() == 201
+                && rows[index].get(4..11) == Some(&[0x64, 0x13, 0xff, 0x80, 0x60, 0x00, 0x20][..]));
+        if is_header_metadata_family && !witnesses.is_empty() && !ordinary_topology_succeeds() {
+            let expected_id = source
+                .master_record_number
+                .checked_add(1)
+                .ok_or(MaterializedGeneralJournalProductionRowError::SourceTopologyMismatch)?;
+            let matching = witnesses
+                .iter()
+                .filter(|witness| {
+                    witness.date_raw == source.date_raw
+                        && Some(witness.group) == source.next_target_record_number
+                })
+                .collect::<Vec<_>>();
+            let expected_id_count = witnesses
+                .iter()
+                .filter(|witness| witness.id == expected_id)
+                .count();
+            let master_postings = postings
+                .values()
+                .filter(|posting| posting.master_record_number == source.master_record_number)
+                .collect::<Vec<_>>();
+            let all_same_date = !master_postings.is_empty()
+                && master_postings
+                    .iter()
+                    .all(|posting| posting.date_raw == source.date_raw);
+            let balanced = master_postings
+                .iter()
+                .map(|posting| i128::from(posting.signed_cents))
+                .sum::<i128>()
+                == 0;
+            if matching.len() != 1
+                || matching[0].id != expected_id
+                || expected_id_count != 1
+                || !all_same_date
+                || !balanced
+            {
+                return Err(MaterializedGeneralJournalProductionRowError::SourceTopologyMismatch);
+            }
+            result[index] = Some(
+                MaterializedGeneralJournalDisposition::HeaderMetadataCarrier {
+                    master_record_number: source.master_record_number,
+                    header_group: source
+                        .next_target_record_number
+                        .expect("a matching header requires a nonzero group"),
+                },
+            );
+            continue;
+        }
         let Some(mut next_target) = source.next_target_record_number else {
             if !has_unique_terminal_source_destination(&source) {
                 return Err(MaterializedGeneralJournalProductionRowError::SourceTopologyMismatch);
@@ -2518,6 +2669,166 @@ mod tests {
         assert!(
             classify_materialized_general_journal_rows(&[positive, negative, terminal_source,])
                 .is_err()
+        );
+    }
+
+    fn header_witness(id: u32, date_raw: u32, group: u32) -> Vec<u8> {
+        let mut header = vec![0_u8; 23];
+        let declared_length = header.len() as u16;
+        header[..2].copy_from_slice(&declared_length.to_le_bytes());
+        header[2] = MATERIALIZED_GENERAL_JOURNAL_FLAGS;
+        header[3] = MATERIALIZED_GENERAL_JOURNAL_ROW_KIND;
+        header[4..7].copy_from_slice(&[0xa7, 0xfe, 0]);
+        header[11..15].copy_from_slice(&id.to_le_bytes());
+        header[15..19].copy_from_slice(&date_raw.to_le_bytes());
+        header[19..23].copy_from_slice(&group.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn header_metadata_family_requires_one_exact_balanced_header_witness() {
+        let positive = production_row(&[1, 0xbf, 7]);
+        let mut negative = production_row(&[1, 0x3f, 7]);
+        negative[PRODUCTION_TARGET..PRODUCTION_TARGET + 4]
+            .copy_from_slice(&0x0100_0004_u32.to_le_bytes());
+        let mut source = production_source(0x0100_0100, 77);
+        source.resize(151, 0);
+        source[..2].copy_from_slice(&151_u16.to_le_bytes());
+        source[4..11].copy_from_slice(&[0x64, 0x93, 0xff, 0xc0, 0x40, 0x80, 0x20]);
+        let date_raw = u32_at(&source, SOURCE_DATE);
+        let header =
+            GeneralJournalHeaderMetadataWitness::parse(&header_witness(0x0100_0003, date_raw, 77))
+                .unwrap();
+
+        assert!(
+            classify_materialized_general_journal_rows(&[
+                positive.clone(),
+                negative.clone(),
+                source.clone(),
+            ])
+            .is_err()
+        );
+        let dispositions = classify_materialized_general_journal_rows_with_header_witnesses(
+            &[positive.clone(), negative.clone(), source.clone()],
+            &[header],
+        )
+        .unwrap();
+        assert!(matches!(
+            dispositions[2],
+            MaterializedGeneralJournalDisposition::HeaderMetadataCarrier {
+                master_record_number: 0x0100_0002,
+                header_group: 77,
+            }
+        ));
+
+        assert!(
+            classify_materialized_general_journal_rows_with_header_witnesses(
+                &[positive, negative, source],
+                &[header, header],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn header_witness_rejects_malformed_framing_and_unbalanced_context() {
+        let date = crate::MaterializedPostingDate::from_ymd(2026, 8, 27)
+            .unwrap()
+            .raw_bits();
+        let mut malformed = header_witness(3, date, 77);
+        malformed.push(0);
+        assert!(GeneralJournalHeaderMetadataWitness::parse(&malformed).is_err());
+
+        let mut source = production_source(0x0100_0100, 77);
+        source.resize(151, 0);
+        source[..2].copy_from_slice(&151_u16.to_le_bytes());
+        source[4..11].copy_from_slice(&[0x64, 0x93, 0xff, 0xc0, 0x40, 0x80, 0x20]);
+        let witness = GeneralJournalHeaderMetadataWitness::parse(&header_witness(
+            0x0100_0003,
+            u32_at(&source, SOURCE_DATE),
+            77,
+        ))
+        .unwrap();
+        assert!(
+            classify_materialized_general_journal_rows_with_header_witnesses(
+                &[production_row(&[1, 0xbf, 7]), source],
+                &[witness],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn header_context_does_not_override_a_resolved_legacy_source() {
+        let posting = production_row(&[1, 0xbf, 7]);
+        let mut source = production_source(0x0100_0100, 0x0100_0001);
+        source.resize(151, 0);
+        source[..2].copy_from_slice(&151_u16.to_le_bytes());
+        source[4..11].copy_from_slice(&[0x64, 0x93, 0xff, 0xc0, 0x40, 0x80, 0x20]);
+        let unrelated = GeneralJournalHeaderMetadataWitness::parse(&header_witness(
+            0x0100_0003,
+            u32_at(&source, SOURCE_DATE),
+            77,
+        ))
+        .unwrap();
+        let dispositions = classify_materialized_general_journal_rows_with_header_witnesses(
+            &[posting, source],
+            &[unrelated],
+        )
+        .unwrap();
+        assert!(matches!(
+            dispositions[1],
+            MaterializedGeneralJournalDisposition::SourceOrLink(_)
+        ));
+    }
+
+    #[test]
+    fn header_metadata_rejects_conflicting_id_and_different_date_master_posting() {
+        let positive = production_row(&[1, 0xbf, 7]);
+        let mut negative = production_row(&[1, 0x3f, 7]);
+        negative[PRODUCTION_TARGET..PRODUCTION_TARGET + 4]
+            .copy_from_slice(&0x0100_0004_u32.to_le_bytes());
+        let mut source = production_source(0x0100_0100, 77);
+        source.resize(151, 0);
+        source[..2].copy_from_slice(&151_u16.to_le_bytes());
+        source[4..11].copy_from_slice(&[0x64, 0x93, 0xff, 0xc0, 0x40, 0x80, 0x20]);
+        let date_raw = u32_at(&source, SOURCE_DATE);
+        let expected =
+            GeneralJournalHeaderMetadataWitness::parse(&header_witness(0x0100_0003, date_raw, 77))
+                .unwrap();
+        let conflicting =
+            GeneralJournalHeaderMetadataWitness::parse(&header_witness(0x0100_0005, date_raw, 77))
+                .unwrap();
+        assert!(
+            classify_materialized_general_journal_rows_with_header_witnesses(
+                &[positive.clone(), negative.clone(), source.clone()],
+                &[expected, conflicting],
+            )
+            .is_err()
+        );
+
+        let duplicate_expected_id =
+            GeneralJournalHeaderMetadataWitness::parse(&header_witness(0x0100_0003, date_raw, 78))
+                .unwrap();
+        assert!(
+            classify_materialized_general_journal_rows_with_header_witnesses(
+                &[positive.clone(), negative.clone(), source.clone()],
+                &[expected, duplicate_expected_id],
+            )
+            .is_err()
+        );
+
+        let different_date = crate::MaterializedPostingDate::from_ymd(2026, 8, 28)
+            .unwrap()
+            .raw_bits();
+        negative[PRODUCTION_DATE..PRODUCTION_DATE + 4]
+            .copy_from_slice(&different_date.to_le_bytes());
+        assert!(
+            classify_materialized_general_journal_rows_with_header_witnesses(
+                &[positive, negative, source],
+                &[expected],
+            )
+            .is_err()
         );
     }
 

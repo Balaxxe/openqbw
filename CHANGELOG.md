@@ -20,6 +20,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Page-key discovery retains positive and negative sector transformations as
+  distinct candidates. A catalog-attested accounting-page deficit can try
+  independently witnessed adjacent high words, subject to the complete
+  catalog, page inventory, and unique balanced-ledger checks.
+- Bill exports honor consensus schema-bound no-post and memorized flags.
+  Conflicting lifecycle flags within a transaction or missing flag evidence
+  fail closed; monetary parsing and balance checks remain required.
+- Schema-bound Bill and Check link carriers with null principal fields can be
+  excluded after complete family, reference, and balance validation. Check
+  schema fallback retains the distinct proof required for void companions.
+- General Journal source rows can use unique consensus header witnesses when
+  the established line-link grammar does not resolve. Ordinary source paths
+  retain precedence, and ambiguous headers or mixed-date families fail closed.
+- Bill and General Journal coverage validates forwarding destinations instead
+  of relying on a fixed physical page address. Bounded external text and empty
+  surplus-page evidence can satisfy accounting coverage while preserving
+  observed and catalog counts and requiring every logical row to resolve.
+- Native General Ledger reconciliation recognizes unique ` - Other` account
+  sections while preserving exact-name precedence and ambiguity rejection.
 - Validated canonical-zero Bill, bill-payment, and Check rows can remain
   neutral accounting exclusions without claiming a void or deletion. Complete
   transaction topology and account/date validation still gate output.

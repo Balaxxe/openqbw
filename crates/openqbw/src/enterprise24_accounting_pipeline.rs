@@ -22,14 +22,16 @@ use crate::{
     AccountId, AccountRowStateEvidence, CheckVoidCompanionMasterEvidence, CompleteCoverage,
     CurrentState, DebitCredit, DebitCreditAmount, DecodedAccounts, DecodedPostings,
     DecoderIdentity, Enterprise24AccountingTable, EnterprisePostingAdaptation,
-    EnterprisePostingExclusion, EnterpriseTableScan, Ledger, LedgerAdapter, MaterializedAccountRow,
-    MaterializedBillPostingRow, MaterializedCheckPostingRow, MaterializedCheckVoidCompanionCarrier,
+    EnterprisePostingExclusion, EnterpriseTableScan, GeneralJournalHeaderMetadataWitness, Ledger,
+    LedgerAdapter, MaterializedAccountRow, MaterializedBillHeaderRow, MaterializedBillPostingRow,
+    MaterializedCheckPostingRow, MaterializedCheckVoidCompanionCarrier,
     MaterializedGeneralJournalDisposition, Posting, PostingDisposition, PostingExclusion,
     PostingExclusionReason, PostingId, PostingProvenance, RowStorageAttestation, SourceSnapshotId,
     SysColumn, SysTableEntry, TransactionId, adapt_enterprise_posting_row_partial,
     adapt_materialized_bill_posting_row, adapt_materialized_check_posting_row,
     adapt_materialized_general_journal_posting_row, boolean_value_by_column_name,
-    classify_materialized_check_void_companion, classify_materialized_general_journal_rows,
+    classify_materialized_check_void_companion,
+    classify_materialized_general_journal_rows_with_header_witnesses,
     decode_schema_account_row_partial, prefix_value_by_column_name,
     resolve_enterprise24_account_type18, validate_enterprise24_r21_schema_manifest,
 };
@@ -138,7 +140,7 @@ pub const ENTERPRISE24_R21_PARTIAL_TABLE_POLICIES: [Enterprise24PartialTablePoli
     },
     Enterprise24PartialTablePolicy {
         table: Enterprise24AccountingTable::BillLine,
-        version: "enterprise24-r21-bill-prefix-v1",
+        version: "enterprise24-r21-bill-lifecycle-prefix-v2",
         through_ordinal: Some(34),
         status: Enterprise24PartialPolicyStatus::Partial,
         storage: Some(PREFIX_TWO_U8),
@@ -266,6 +268,16 @@ pub struct Enterprise24PartialTableCoverage {
     /// Bounded directory carriers proven not to be rows in this table's
     /// logical row domain. They remain counted rather than being discarded.
     pub non_row_artifacts: u64,
+    /// Schema-decoded kind-64 Bill carriers proven to be non-posting logical
+    /// rows by the table-3040 header witness and a complete retained family.
+    pub logical_non_row_carriers: u64,
+    /// Empty continuation segments whose same-table destination is retained.
+    pub forwarding_alias_records: u64,
+    /// Isolated text-payload pages corroborated by external-page coverage.
+    pub external_text_payload_pages: u64,
+    /// A bounded surplus of candidate pages with no declared directory rows.
+    /// Observed and catalogued page counts remain separately available.
+    pub certified_empty_surplus_page_groups: u64,
     /// Explicitly unsupported policy, if applicable.
     pub unsupported: bool,
     /// The prefix is known but storage facts required for decoding are absent.
@@ -273,17 +285,37 @@ pub struct Enterprise24PartialTableCoverage {
 }
 
 impl Enterprise24PartialTableCoverage {
+    /// Whether this table's physical and logical coverage attestation is
+    /// complete for its policy.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.complete()
+    }
+
     fn complete(&self) -> bool {
         !self.unsupported
             && !self.layout_pending
             && self.unresolved_records == 0
             && self.decode_failures == 0
             && self.candidate_directory_disagreements == 0
-            && self.expected_logical_records == Some(self.resolved_records)
+            && self.expected_logical_records.is_some_and(|expected| {
+                self.resolved_records
+                    .checked_add(self.logical_non_row_carriers)
+                    == Some(expected)
+            })
+            && (self.logical_non_row_carriers == 0
+                || self.table_id == Enterprise24AccountingTable::BillLine.id())
+            && (self.certified_empty_surplus_page_groups == 0
+                || (self.table_id == Enterprise24AccountingTable::GeneralJournalLine.id()
+                    && self.certified_empty_surplus_page_groups == 1
+                    && self.resolved_records > 0))
             && self.expected_table_pages.is_none_or(|primary| {
-                primary
-                    .checked_add(self.expected_external_table_pages.unwrap_or(0))
-                    .is_some_and(|expected| expected == self.candidate_page_groups as u32)
+                u64::from(primary)
+                    .checked_add(u64::from(self.expected_external_table_pages.unwrap_or(0)))
+                    .and_then(|expected| {
+                        expected.checked_add(self.certified_empty_surplus_page_groups)
+                    })
+                    .is_some_and(|expected| expected == self.candidate_page_groups)
             })
     }
 }
@@ -482,16 +514,31 @@ pub fn collect_enterprise24_partial_table_rows(
 
 /// Collects table-3042 Bill carriers with the complete bounded Bill grammar.
 ///
-/// SYSTABLE's logical row count for this family counts the 2,349 semantic
-/// Bill lines, rather than every nonzero physical directory slot.  The R21
-/// corpus also contains one bounded, nine-byte non-row carrier.  It is kept
-/// in `non_row_artifacts` and is accepted only after the strict Bill rows
-/// independently meet the persisted logical-row count.  This collector never
-/// chooses a materialization candidate: candidates must parse to equal Bill
-/// semantics, or agree on the exact bounded non-row artifact shape.
+/// Forwarding aliases are resolved against retained same-table rows. An
+/// isolated external text segment requires a complete catalogued page and
+/// logical-row partition. Candidates must agree on Bill semantics or the
+/// exact continuation locator; no unknown record is dropped to fit a count.
 pub fn collect_enterprise24_bill_table_rows(
     scan: &EnterpriseTableScan,
     expectation: Enterprise24TableCoverageExpectation,
+) -> Result<Enterprise24PartialTableRows, Enterprise24AccountingPipelineError> {
+    collect_bill_table_rows(scan, expectation, None)
+}
+
+/// Collect Bill monetary rows with consensus schema-bound lifecycle flags.
+/// Forwarding and external text retain their separate coverage proofs.
+pub fn collect_enterprise24_bill_table_rows_with_lifecycle_schema(
+    scan: &EnterpriseTableScan,
+    schema: &RowSchema,
+    expectation: Enterprise24TableCoverageExpectation,
+) -> Result<Enterprise24PartialTableRows, Enterprise24AccountingPipelineError> {
+    collect_bill_table_rows(scan, expectation, Some(schema))
+}
+
+fn collect_bill_table_rows(
+    scan: &EnterpriseTableScan,
+    expectation: Enterprise24TableCoverageExpectation,
+    schema: Option<&RowSchema>,
 ) -> Result<Enterprise24PartialTableRows, Enterprise24AccountingPipelineError> {
     let policy = enterprise24_r21_partial_table_policy(Enterprise24AccountingTable::BillLine)
         .expect("Bill policy is static");
@@ -499,6 +546,11 @@ pub fn collect_enterprise24_bill_table_rows(
         return Err(Enterprise24AccountingPipelineError::ScanTableMismatch {
             scan_table_id: scan.target_table_id,
             policy_table_id: policy.table.id(),
+        });
+    }
+    if schema.is_some_and(|schema| !policy_schema_matches(policy, schema)) {
+        return Err(Enterprise24AccountingPipelineError::PolicyStorageMismatch {
+            table_id: policy.table.id(),
         });
     }
     let mut coverage = Enterprise24PartialTableCoverage {
@@ -510,6 +562,8 @@ pub fn collect_enterprise24_bill_table_rows(
         ..Enterprise24PartialTableCoverage::default()
     };
     let mut records = Vec::new();
+    let mut aliases = Vec::new();
+    let mut external_text_candidates = 0_u64;
     for group in &scan.candidate_groups {
         let counts = group
             .candidates
@@ -524,6 +578,8 @@ pub fn collect_enterprise24_bill_table_rows(
         });
         coverage.missing_records += directory.agreed_empty_record_ids.len() as u64;
         coverage.candidate_directory_disagreements += directory.disagreement_record_count;
+        let isolated_single_record_group =
+            group.candidates.len() == 1 && counts == [1] && directory.common_record_ids.len() == 1;
         for record_id in directory.common_record_ids {
             let candidates = group
                 .candidates
@@ -550,27 +606,79 @@ pub fn collect_enterprise24_bill_table_rows(
                     coverage.unresolved_records += 1;
                     continue;
                 }
+                let partial = if let Some(schema) = schema {
+                    let decoded = candidates
+                        .iter()
+                        .map(|bytes| {
+                            decode_row_prefix_and_boolean_tail(
+                                bytes,
+                                schema,
+                                policy.through_ordinal.expect("Bill prefix"),
+                            )
+                            .map(|partial| {
+                                Enterprise24PartialRecordCandidate {
+                                    bytes: bytes.clone(),
+                                    partial,
+                                }
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>();
+                    let resolved = decoded.ok().and_then(|decoded| {
+                        resolve_enterprise24_partial_record_candidates(&decoded)
+                    });
+                    let Some(resolved) = resolved else {
+                        coverage.decode_failures += 1;
+                        coverage.unresolved_records += 1;
+                        continue;
+                    };
+                    resolved.partial
+                } else {
+                    empty_physical_partial(&candidates[0])
+                };
                 let bytes = candidates[0].clone();
                 coverage.resolved_records += 1;
                 records.push(Enterprise24PartialRecord {
                     raw_page_number: group.raw_page_number,
                     record_id,
-                    partial: empty_physical_partial(&bytes),
+                    partial,
                     bytes,
                 });
-            } else if parsed.iter().all(Result::is_err)
-                && candidates
-                    .iter()
-                    .all(|bytes| is_r21_bill_non_row_artifact(bytes))
+            } else if let Some(destination) = consensus_forwarding_locator(&candidates) {
+                aliases.push(((group.raw_page_number, record_id), destination));
+            } else if isolated_single_record_group
+                && is_r21_bill_external_text_payload(&candidates[0])
             {
-                // This remains a counted physical carrier. Its exclusion is
-                // validated by the independent semantic-row count in
-                // `Enterprise24PartialTableCoverage::complete`.
-                coverage.non_row_artifacts += 1;
+                external_text_candidates += 1;
             } else {
                 coverage.decode_failures += 1;
                 coverage.unresolved_records += 1;
             }
+        }
+    }
+    if validate_forwarding_aliases(&records, &aliases, |bytes| {
+        MaterializedBillPostingRow::parse(bytes).is_ok()
+    }) {
+        coverage.forwarding_alias_records = aliases.len() as u64;
+        coverage.non_row_artifacts += aliases.len() as u64;
+    } else {
+        coverage.decode_failures += aliases.len() as u64;
+        coverage.unresolved_records += aliases.len() as u64;
+    }
+    if external_text_candidates != 0 {
+        let expected_pages =
+            u64::from(expectation.table_pages) + u64::from(expectation.external_table_pages);
+        if external_text_candidates == 1
+            && expectation.external_table_pages == 1
+            && coverage.candidate_page_groups == expected_pages
+            && coverage.resolved_records == expectation.logical_records
+            && coverage.unresolved_records == 0
+            && coverage.decode_failures == 0
+            && coverage.candidate_directory_disagreements == 0
+        {
+            coverage.external_text_payload_pages = 1;
+        } else {
+            coverage.decode_failures += external_text_candidates;
+            coverage.unresolved_records += external_text_candidates;
         }
     }
     Ok(Enterprise24PartialTableRows {
@@ -578,6 +686,294 @@ pub fn collect_enterprise24_bill_table_rows(
         records,
         coverage,
     })
+}
+
+/// Collects Bill lines with the complete Bill schema and consensus-resolved
+/// table-3040 master witnesses. This additionally recognizes the narrow
+/// non-posting kind-64 split/link carrier; it never adapts that carrier into a
+/// posting or monetary amount.
+pub fn collect_enterprise24_bill_table_rows_with_context(
+    scan: &EnterpriseTableScan,
+    schema: &RowSchema,
+    bill_header_masters: &BTreeSet<u32>,
+    expectation: Enterprise24TableCoverageExpectation,
+) -> Result<Enterprise24PartialTableRows, Enterprise24AccountingPipelineError> {
+    let policy = enterprise24_r21_partial_table_policy(Enterprise24AccountingTable::BillLine)
+        .expect("Bill policy is static");
+    if scan.target_table_id != policy.table.id() {
+        return Err(Enterprise24AccountingPipelineError::ScanTableMismatch {
+            scan_table_id: scan.target_table_id,
+            policy_table_id: policy.table.id(),
+        });
+    }
+    if !policy_schema_matches(policy, schema) {
+        return Err(Enterprise24AccountingPipelineError::PolicyStorageMismatch {
+            table_id: policy.table.id(),
+        });
+    }
+    let through = policy
+        .through_ordinal
+        .expect("Bill policy has a bounded prefix");
+    let mut coverage = Enterprise24PartialTableCoverage {
+        table_id: policy.table.id(),
+        candidate_page_groups: scan.candidate_groups.len() as u64,
+        expected_logical_records: Some(expectation.logical_records),
+        expected_table_pages: Some(expectation.table_pages),
+        expected_external_table_pages: Some(expectation.external_table_pages),
+        ..Enterprise24PartialTableCoverage::default()
+    };
+    let mut records = Vec::new();
+    let mut pending_carriers = Vec::new();
+    for group in &scan.candidate_groups {
+        let counts = group
+            .candidates
+            .iter()
+            .map(|page| page.table_page().record_count())
+            .collect::<Vec<_>>();
+        let directory = candidate_directory_consensus(&counts, |candidate, record| {
+            group.candidates[candidate]
+                .table_page()
+                .record(record)
+                .is_ok()
+        });
+        coverage.missing_records += directory.agreed_empty_record_ids.len() as u64;
+        coverage.candidate_directory_disagreements += directory.disagreement_record_count;
+        for record_id in directory.common_record_ids {
+            let decoded = group
+                .candidates
+                .iter()
+                .map(|page| {
+                    let bytes = page
+                        .table_page()
+                        .record(record_id)
+                        .expect("consensus presence")
+                        .bytes()
+                        .to_vec();
+                    decode_row_prefix_and_boolean_tail(&bytes, schema, through)
+                        .map(|partial| Enterprise24PartialRecordCandidate { bytes, partial })
+                })
+                .collect::<Vec<_>>();
+            if decoded.iter().any(Result::is_err) {
+                coverage.decode_failures += 1;
+                coverage.unresolved_records += 1;
+                continue;
+            }
+            let decoded = decoded.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+            let Some(first) = resolve_enterprise24_partial_record_candidates(&decoded) else {
+                coverage.unresolved_records += 1;
+                continue;
+            };
+            let parsed = decoded
+                .iter()
+                .map(|candidate| MaterializedBillPostingRow::parse(&candidate.bytes))
+                .collect::<Vec<_>>();
+            if parsed.iter().all(Result::is_ok) {
+                let first_posting = parsed[0].as_ref().expect("all postings parsed");
+                if !parsed
+                    .iter()
+                    .skip(1)
+                    .all(|posting| posting.as_ref() == Ok(first_posting))
+                {
+                    coverage.unresolved_records += 1;
+                    continue;
+                }
+                coverage.resolved_records += 1;
+                records.push(Enterprise24PartialRecord {
+                    raw_page_number: group.raw_page_number,
+                    record_id,
+                    bytes: first.bytes,
+                    partial: first.partial,
+                });
+            } else if is_bill_kind64_framing(&first.bytes) {
+                pending_carriers.push(first);
+            } else {
+                coverage.decode_failures += 1;
+                coverage.unresolved_records += 1;
+            }
+        }
+    }
+    let mut pending_targets = BTreeSet::new();
+    for carrier in pending_carriers {
+        let unique_target = named_u32(schema, &carrier.partial, "target_id")
+            .is_some_and(|target| pending_targets.insert(target));
+        if unique_target
+            && is_attested_bill_nonposting_carrier(&carrier, &records, schema, bill_header_masters)
+        {
+            coverage.non_row_artifacts += 1;
+            coverage.logical_non_row_carriers += 1;
+        } else {
+            coverage.decode_failures += 1;
+            coverage.unresolved_records += 1;
+        }
+    }
+    Ok(Enterprise24PartialTableRows {
+        policy,
+        records,
+        coverage,
+    })
+}
+
+/// Resolves distinct table-3040 Bill-header master witnesses only when every
+/// materialization candidate for the same physical slot agrees.
+pub fn collect_enterprise24_bill_header_master_witnesses(
+    scan: &EnterpriseTableScan,
+) -> Result<BTreeSet<u32>, Enterprise24AccountingPipelineError> {
+    if scan.target_table_id != Enterprise24AccountingTable::BillHeader.id() {
+        return Err(Enterprise24AccountingPipelineError::ScanTableMismatch {
+            scan_table_id: scan.target_table_id,
+            policy_table_id: Enterprise24AccountingTable::BillHeader.id(),
+        });
+    }
+    let mut witnesses = BTreeSet::new();
+    for group in &scan.candidate_groups {
+        let counts = group
+            .candidates
+            .iter()
+            .map(|page| page.table_page().record_count())
+            .collect::<Vec<_>>();
+        let directory = candidate_directory_consensus(&counts, |candidate, record| {
+            group.candidates[candidate]
+                .table_page()
+                .record(record)
+                .is_ok()
+        });
+        if directory.disagreement_record_count != 0 {
+            return Err(Enterprise24AccountingPipelineError::BillHeaderWitnessResolutionFailed);
+        }
+        for record_id in directory.common_record_ids {
+            let headers = group
+                .candidates
+                .iter()
+                .map(|page| {
+                    MaterializedBillHeaderRow::parse(
+                        page.table_page()
+                            .record(record_id)
+                            .expect("consensus presence")
+                            .bytes(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !headers.iter().all(Result::is_ok) {
+                return Err(Enterprise24AccountingPipelineError::BillHeaderWitnessResolutionFailed);
+            }
+            let first = headers[0].as_ref().expect("all headers parsed");
+            if !headers
+                .iter()
+                .skip(1)
+                .all(|header| header.as_ref() == Ok(first))
+                || !witnesses.insert(first.bill_master_record_number())
+            {
+                return Err(Enterprise24AccountingPipelineError::BillHeaderWitnessResolutionFailed);
+            }
+        }
+    }
+    Ok(witnesses)
+}
+
+fn is_bill_kind64_framing(bytes: &[u8]) -> bool {
+    bytes.len() >= 5
+        && usize::from(u16::from_le_bytes([bytes[0], bytes[1]])) == bytes.len()
+        && bytes[2] == 0x40
+        && bytes[3] == 0x02
+        && bytes[4] == 0x64
+}
+
+fn named_u32(schema: &RowSchema, partial: &PartialDecodedRow, name: &str) -> Option<u32> {
+    match prefix_value_by_column_name(schema, partial, name).ok()?? {
+        Value::Integer(value) => u32::try_from(*value).ok().filter(|value| *value != 0),
+        _ => None,
+    }
+}
+
+fn named_null(schema: &RowSchema, partial: &PartialDecodedRow, name: &str) -> bool {
+    matches!(
+        prefix_value_by_column_name(schema, partial, name),
+        Ok(Some(Value::Null))
+    )
+}
+
+fn named_bool(schema: &RowSchema, partial: &PartialDecodedRow, name: &str) -> Option<bool> {
+    match boolean_value_by_column_name(schema, partial, name).ok()?? {
+        Value::Boolean(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn is_attested_bill_nonposting_carrier(
+    carrier: &Enterprise24PartialRecordCandidate,
+    records: &[Enterprise24PartialRecord],
+    schema: &RowSchema,
+    headers: &BTreeSet<u32>,
+) -> bool {
+    if !is_bill_kind64_framing(&carrier.bytes)
+        || !named_null(schema, &carrier.partial, "account_id")
+        || !named_null(schema, &carrier.partial, "amount_amt")
+        || named_bool(schema, &carrier.partial, "is_source_bool") != Some(false)
+        || named_bool(schema, &carrier.partial, "is_no_post_bool") != Some(false)
+        || named_bool(schema, &carrier.partial, "is_memorized_transaction_bool") != Some(false)
+        || named_bool(schema, &carrier.partial, "is_split_bool") != Some(true)
+        || named_bool(schema, &carrier.partial, "is_arap_bool") != Some(true)
+    {
+        return false;
+    }
+    let (Some(target), Some(master), Some(next), Some(sibling)) = (
+        named_u32(schema, &carrier.partial, "target_id"),
+        named_u32(schema, &carrier.partial, "transaction_id"),
+        named_u32(schema, &carrier.partial, "next_target_id"),
+        named_u32(schema, &carrier.partial, "sibling_account_id"),
+    ) else {
+        return false;
+    };
+    let (Ok(Some(date)), Ok(Some(view))) = (
+        prefix_value_by_column_name(schema, &carrier.partial, "transaction_date"),
+        prefix_value_by_column_name(schema, &carrier.partial, "transaction_view_type"),
+    ) else {
+        return false;
+    };
+    if !headers.contains(&master)
+        || records
+            .iter()
+            .any(|record| named_u32(schema, &record.partial, "target_id") == Some(target))
+    {
+        return false;
+    }
+    let family = records
+        .iter()
+        .filter(|record| named_u32(schema, &record.partial, "transaction_id") == Some(master))
+        .collect::<Vec<_>>();
+    if family.len() != 5
+        || family.iter().any(|record| {
+            prefix_value_by_column_name(schema, &record.partial, "transaction_date")
+                .ok()
+                .flatten()
+                != Some(date)
+                || prefix_value_by_column_name(schema, &record.partial, "transaction_view_type")
+                    .ok()
+                    .flatten()
+                    != Some(view)
+        })
+        || family
+            .iter()
+            .filter(|record| named_u32(schema, &record.partial, "target_id") == Some(next))
+            .count()
+            != 1
+    {
+        return false;
+    }
+    let mut accounts = BTreeSet::new();
+    let mut targets = BTreeSet::new();
+    let mut balance = 0_i128;
+    for record in family {
+        let Ok(posting) = MaterializedBillPostingRow::parse(&record.bytes) else {
+            return false;
+        };
+        if posting.has_canonical_zero_amount() || !targets.insert(posting.target_record_number()) {
+            return false;
+        }
+        accounts.insert(posting.account_record_number());
+        balance += i128::from(posting.signed_cents());
+    }
+    accounts.len() == 2 && accounts.contains(&sibling) && balance == 0
 }
 
 fn empty_physical_partial(bytes: &[u8]) -> PartialDecodedRow {
@@ -591,17 +987,68 @@ fn empty_physical_partial(bytes: &[u8]) -> PartialDecodedRow {
     }
 }
 
-/// The sole R21 table-3042 directory artifact observed outside SYSTABLE's
-/// logical row domain.  It is deliberately narrow: a future compact Bill row
-/// does not become an artifact merely because the full Bill parser rejects it.
-fn is_r21_bill_non_row_artifact(bytes: &[u8]) -> bool {
-    bytes.len() == 9
-        && bytes
-            .get(..2)
-            .is_some_and(|length| u16::from_le_bytes([length[0], length[1]]) == 9)
-        && bytes.get(2).copied() == Some(0x44)
-        && bytes.get(3).copied() == Some(0x08)
-        && bytes.get(4).copied() == Some(0x4a)
+type RecordLocation = (u64, u16);
+
+/// A payload-free continuation. Its resolver key becomes a page reference
+/// only after the table-local destination is independently retained below.
+fn forwarding_locator(bytes: &[u8]) -> Option<RecordLocation> {
+    let segment = opensqlany::parse_row_segment(bytes).ok()?;
+    if bytes.len() != 9 || segment.declared_len() != bytes.len() || segment.flags() != 0x44 {
+        return None;
+    }
+    let target = segment.next_target()?;
+    (target.resolver_key() != 0).then_some((u64::from(target.resolver_key()), target.record_id()))
+}
+
+fn consensus_forwarding_locator(candidates: &[Vec<u8>]) -> Option<RecordLocation> {
+    let first = forwarding_locator(candidates.first()?)?;
+    candidates
+        .iter()
+        .all(|bytes| forwarding_locator(bytes) == Some(first))
+        .then_some(first)
+}
+
+fn validate_forwarding_aliases(
+    records: &[Enterprise24PartialRecord],
+    aliases: &[(RecordLocation, RecordLocation)],
+    is_posting: impl Fn(&[u8]) -> bool,
+) -> bool {
+    if aliases.is_empty() {
+        return true;
+    }
+    let mut retained = BTreeMap::new();
+    for record in records {
+        if retained
+            .insert((record.raw_page_number, record.record_id), &record.bytes)
+            .is_some()
+        {
+            return false;
+        }
+    }
+    let mut sources = BTreeSet::new();
+    let mut destinations = BTreeSet::new();
+    aliases.iter().all(|(source, destination)| {
+        source != destination
+            && !retained.contains_key(source)
+            && sources.insert(*source)
+            && destinations.insert(*destination)
+            && retained
+                .get(destination)
+                .is_some_and(|bytes| forwarding_locator(bytes).is_none() && is_posting(bytes))
+    })
+}
+
+fn is_r21_bill_external_text_payload(bytes: &[u8]) -> bool {
+    let Ok(segment) = opensqlany::parse_row_segment(bytes) else {
+        return false;
+    };
+    let payload = segment.payload();
+    segment.declared_len() == bytes.len()
+        && segment.flags() == 0
+        && payload.iter().any(u8::is_ascii_graphic)
+        && payload
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
 }
 
 /// Collects table-3047 using semantic prefix consensus for e4 accounting rows
@@ -760,6 +1207,8 @@ pub fn collect_enterprise24_general_journal_table_rows(
         ..Enterprise24PartialTableCoverage::default()
     };
     let mut records = Vec::new();
+    let mut aliases = Vec::new();
+    let mut zero_slot_groups = 0_u64;
     for group in &scan.candidate_groups {
         let counts = group
             .candidates
@@ -774,6 +1223,9 @@ pub fn collect_enterprise24_general_journal_table_rows(
         });
         coverage.missing_records += directory.agreed_empty_record_ids.len() as u64;
         coverage.candidate_directory_disagreements += directory.disagreement_record_count;
+        if !counts.is_empty() && counts.iter().all(|&count| count == 0) {
+            zero_slot_groups += 1;
+        }
         for record_id in directory.common_record_ids {
             let bytes = group
                 .candidates
@@ -794,6 +1246,10 @@ pub fn collect_enterprise24_general_journal_table_rows(
                 coverage.unresolved_records += 1;
                 continue;
             }
+            if let Some(destination) = forwarding_locator(first) {
+                aliases.push(((group.raw_page_number, record_id), destination));
+                continue;
+            }
             coverage.resolved_records += 1;
             records.push(Enterprise24PartialRecord {
                 raw_page_number: group.raw_page_number,
@@ -810,11 +1266,101 @@ pub fn collect_enterprise24_general_journal_table_rows(
             });
         }
     }
+    if validate_forwarding_aliases(&records, &aliases, |bytes| {
+        crate::MaterializedGeneralJournalPostingRow::parse(bytes).is_ok()
+    }) {
+        coverage.forwarding_alias_records = aliases.len() as u64;
+        coverage.non_row_artifacts += aliases.len() as u64;
+    } else {
+        coverage.decode_failures += aliases.len() as u64;
+        coverage.unresolved_records += aliases.len() as u64;
+    }
+    let expected_pages =
+        u64::from(expectation.table_pages) + u64::from(expectation.external_table_pages);
+    if coverage.candidate_page_groups == expected_pages + 1
+        && zero_slot_groups > 0
+        && coverage.resolved_records > 0
+        && coverage.resolved_records == expectation.logical_records
+        && coverage.unresolved_records == 0
+        && coverage.decode_failures == 0
+        && coverage.candidate_directory_disagreements == 0
+    {
+        coverage.certified_empty_surplus_page_groups = 1;
+    }
     Ok(Enterprise24PartialTableRows {
         policy,
         records,
         coverage,
     })
+}
+
+/// Collects exact General Journal header witnesses from byte-identical candidates.
+///
+/// The headers are used only to corroborate the separate family-64 metadata
+/// grammar; they are not decoded into ledger postings.
+pub fn collect_enterprise24_general_journal_header_metadata_witnesses(
+    scan: &EnterpriseTableScan,
+) -> Result<Vec<GeneralJournalHeaderMetadataWitness>, Enterprise24AccountingPipelineError> {
+    let table_id = Enterprise24AccountingTable::GeneralJournalHeader.id();
+    if scan.target_table_id != table_id {
+        return Err(Enterprise24AccountingPipelineError::ScanTableMismatch {
+            scan_table_id: scan.target_table_id,
+            policy_table_id: table_id,
+        });
+    }
+    let mut witnesses = Vec::new();
+    for group in &scan.candidate_groups {
+        let counts = group
+            .candidates
+            .iter()
+            .map(|page| page.table_page().record_count())
+            .collect::<Vec<_>>();
+        let directory = candidate_directory_consensus(&counts, |candidate, record| {
+            group.candidates[candidate]
+                .table_page()
+                .record(record)
+                .is_ok()
+        });
+        if directory.disagreement_record_count != 0 {
+            return Err(Enterprise24AccountingPipelineError::HeaderWitnessConsensusFailed);
+        }
+        for record_id in directory.common_record_ids {
+            let candidates = group
+                .candidates
+                .iter()
+                .map(|page| {
+                    page.table_page()
+                        .record(record_id)
+                        .expect("candidate-directory consensus established presence")
+                        .bytes()
+                })
+                .collect::<Vec<_>>();
+            let Some(first) = candidates.first() else {
+                return Err(Enterprise24AccountingPipelineError::HeaderWitnessConsensusFailed);
+            };
+            if !candidates
+                .iter()
+                .skip(1)
+                .all(|candidate| *candidate == *first)
+            {
+                return Err(Enterprise24AccountingPipelineError::HeaderWitnessConsensusFailed);
+            }
+            let has_header_framing = first.len() >= 23
+                && first.get(0..2).is_some_and(|declared| {
+                    u16::from_le_bytes([declared[0], declared[1]]) as usize == first.len()
+                })
+                && first.get(2) == Some(&crate::MATERIALIZED_GENERAL_JOURNAL_FLAGS)
+                && first.get(3) == Some(&crate::MATERIALIZED_GENERAL_JOURNAL_ROW_KIND)
+                && first.get(4..7) == Some(&[0xa7, 0xfe, 0][..]);
+            if !has_header_framing {
+                continue;
+            }
+            let witness = GeneralJournalHeaderMetadataWitness::parse(first)
+                .map_err(|_| Enterprise24AccountingPipelineError::HeaderWitnessParseFailed)?;
+            witnesses.push(witness);
+        }
+    }
+    Ok(witnesses)
 }
 
 /// Structured evidence returned by the production scaffold.
@@ -900,6 +1446,25 @@ pub fn build_enterprise24_accounting_pipeline(
     account_rows: &Enterprise24PartialTableRows,
     posting_rows: &[Enterprise24PartialTableRows],
     schemas: &BTreeMap<u32, RowSchema>,
+) -> Enterprise24AccountingPipelineResult {
+    build_enterprise24_accounting_pipeline_with_general_journal_header_witnesses(
+        snapshot,
+        catalog_columns,
+        account_rows,
+        posting_rows,
+        schemas,
+        &[],
+    )
+}
+
+/// Builds the accounting pipeline with consensus table-3076 header context.
+pub fn build_enterprise24_accounting_pipeline_with_general_journal_header_witnesses(
+    snapshot: SourceSnapshotId,
+    catalog_columns: &[SysColumn],
+    account_rows: &Enterprise24PartialTableRows,
+    posting_rows: &[Enterprise24PartialTableRows],
+    schemas: &BTreeMap<u32, RowSchema>,
+    general_journal_header_witnesses: &[GeneralJournalHeaderMetadataWitness],
 ) -> Enterprise24AccountingPipelineResult {
     let mut diagnostics = Enterprise24AccountingCoverageDiagnostics::default();
     if validate_enterprise24_r21_schema_manifest(catalog_columns).is_err() {
@@ -1035,12 +1600,13 @@ pub fn build_enterprise24_accounting_pipeline(
             continue;
         }
         if table == Enterprise24AccountingTable::GeneralJournalLine {
-            let carriers = match classify_materialized_general_journal_rows(
+            let carriers = match classify_materialized_general_journal_rows_with_header_witnesses(
                 &rows
                     .records
                     .iter()
                     .map(|record| record.bytes.clone())
                     .collect::<Vec<_>>(),
+                general_journal_header_witnesses,
             ) {
                 Ok(carriers) if carriers.len() == rows.records.len() => carriers,
                 Err(_) => {
@@ -1088,6 +1654,7 @@ pub fn build_enterprise24_accounting_pipeline(
                     MaterializedGeneralJournalDisposition::SourceOrLink(_)
                     | MaterializedGeneralJournalDisposition::AuxiliaryLinkChain { .. }
                     | MaterializedGeneralJournalDisposition::TerminalMetadataCarrier { .. }
+                    | MaterializedGeneralJournalDisposition::HeaderMetadataCarrier { .. }
                     | MaterializedGeneralJournalDisposition::CanonicalZeroAmount(_) => {
                         let provenance = match PostingProvenance::new(
                             format!(
@@ -1186,6 +1753,18 @@ pub fn build_enterprise24_accounting_pipeline(
             continue;
         }
         if table == Enterprise24AccountingTable::BillLine {
+            let lifecycle = match bill_lifecycle_states(&rows.records, schemas.get(&table.id())) {
+                Ok(states) => states,
+                Err(()) => {
+                    diagnostics.blockers.push(
+                        Enterprise24AccountingPipelineBlocker::PostingStrategyRejected {
+                            table_id: table.id(),
+                        },
+                    );
+                    continue;
+                }
+            };
+
             if validate_materialized_bill_zero_families(&rows.records).is_err() {
                 diagnostics.blockers.push(
                     Enterprise24AccountingPipelineBlocker::PostingStrategyRejected {
@@ -1223,7 +1802,32 @@ pub fn build_enterprise24_accounting_pipeline(
                 diagnostics.posting_candidates += 1;
                 let adaptation = MaterializedBillPostingRow::parse(&record.bytes)
                     .map_err(|_| ())
-                    .and_then(|row| adapt_materialized_bill_posting_row(&row).map_err(|_| ()));
+                    .and_then(|row| {
+                        let adaptation =
+                            adapt_materialized_bill_posting_row(&row).map_err(|_| ())?;
+                        if !identity_map.contains_key(&row.account_record_number()) {
+                            return Err(());
+                        }
+                        let (no_post, memorized) =
+                            lifecycle.get(&row.master_record_number()).ok_or(())?;
+                        Ok(if *no_post {
+                            EnterprisePostingAdaptation::Excluded(
+                                EnterprisePostingExclusion::NoPost {
+                                    target_id: u64::from(row.target_record_number()),
+                                    transaction_id: u64::from(row.master_record_number()),
+                                },
+                            )
+                        } else if *memorized {
+                            EnterprisePostingAdaptation::Excluded(
+                                EnterprisePostingExclusion::MemorizedTransaction {
+                                    target_id: u64::from(row.target_record_number()),
+                                    transaction_id: u64::from(row.master_record_number()),
+                                },
+                            )
+                        } else {
+                            adaptation
+                        })
+                    });
                 match adaptation {
                     Ok(adaptation) => match normalized_disposition(
                         table,
@@ -1788,7 +2392,7 @@ fn try_materialized_check_dispositions(
     schema: &RowSchema,
     identity_map: &BTreeMap<u32, AccountId>,
 ) -> Result<Vec<PostingDisposition>, ()> {
-    prepare_check_dispositions(rows, identity_map, |record| {
+    prepare_check_dispositions(rows, schema, identity_map, |record| {
         adapt_check_observation(record, schema)
     })
 }
@@ -1868,13 +2472,7 @@ fn try_partial_check_dispositions(
     schema: &RowSchema,
     identity_map: &BTreeMap<u32, AccountId>,
 ) -> Result<Vec<PostingDisposition>, ()> {
-    if rows.records.iter().any(|record| {
-        MaterializedCheckVoidCompanionCarrier::parse(&record.bytes)
-            .is_ok_and(MaterializedCheckVoidCompanionCarrier::is_long_envelope)
-    }) {
-        return Err(());
-    }
-    prepare_check_dispositions(rows, identity_map, |record| {
+    prepare_check_dispositions(rows, schema, identity_map, |record| {
         adapt_enterprise_posting_row_partial(
             Enterprise24AccountingTable::CheckLine,
             schema,
@@ -1882,6 +2480,185 @@ fn try_partial_check_dispositions(
         )
         .map_err(|_| ())
     })
+}
+
+#[derive(Clone, Copy)]
+struct CompactCheckSourceLink {
+    target_id: u64,
+    transaction_id: u64,
+    transaction_date: crate::AccountingDate,
+    next_target_id: u64,
+    sibling_account_id: u64,
+}
+
+/// The compact kind-64 source row is an observed, schema-bound link carrier.
+/// Its nullable principal fields cannot be interpreted as a posting.  Admission
+/// is deliberately deferred until its named next target is retained in the
+/// same balanced Check family.
+fn compact_check_source_link(
+    record: &Enterprise24PartialRecord,
+    schema: &RowSchema,
+) -> Result<Option<CompactCheckSourceLink>, ()> {
+    let bytes = &record.bytes;
+    if bytes.len() != 151
+        || usize::from(u16::from_le_bytes([bytes[0], bytes[1]])) != bytes.len()
+        || bytes[2] != 0
+        || bytes[3] != crate::MATERIALIZED_CHECK_VOID_COMPANION_KIND
+    {
+        return Ok(None);
+    }
+    let target_id = check_partial_id(record, schema, "target_id")?;
+    let transaction_id = check_partial_id(record, schema, "transaction_id")?;
+    let next_target_id = check_partial_id(record, schema, "next_target_id")?;
+    let sibling_account_id = check_partial_id(record, schema, "sibling_account_id")?;
+    let transaction_date = check_partial_date(record, schema, "transaction_date")?;
+    if bytes
+        .get(0x0c..0x10)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_le_bytes)
+        != u32::try_from(target_id).ok()
+        || bytes
+            .get(0x10..0x14)
+            .and_then(|value| value.try_into().ok())
+            .map(u32::from_le_bytes)
+            != u32::try_from(transaction_id).ok()
+        || !check_partial_is_null(record, schema, "account_id")?
+        || !check_partial_is_null(record, schema, "amount_amt")?
+        || check_partial_small_int(record, schema, "transaction_view_type")? != 3
+        || check_partial_bool(record, schema, "is_source_bool")?
+        || check_partial_bool(record, schema, "is_no_post_bool")?
+        || check_partial_bool(record, schema, "is_memorized_transaction_bool")?
+        || !check_partial_bool(record, schema, "is_split_bool")?
+        || target_id == transaction_id
+        || target_id == next_target_id
+    {
+        return Err(());
+    }
+    Ok(Some(CompactCheckSourceLink {
+        target_id,
+        transaction_id,
+        transaction_date,
+        next_target_id,
+        sibling_account_id,
+    }))
+}
+
+fn check_partial_value<'a>(
+    record: &'a Enterprise24PartialRecord,
+    schema: &'a RowSchema,
+    name: &str,
+) -> Result<(&'a opensqlany::ColumnDef, &'a Value), ()> {
+    let columns = schema
+        .columns
+        .iter()
+        .filter(|column| column.name == name)
+        .collect::<Vec<_>>();
+    let [column] = columns.as_slice() else {
+        return Err(());
+    };
+    let value = if column.column_type == ColumnType::Boolean {
+        boolean_value_by_column_name(schema, &record.partial, name).map_err(|_| ())?
+    } else {
+        prefix_value_by_column_name(schema, &record.partial, name).map_err(|_| ())?
+    }
+    .ok_or(())?;
+    Ok((column, value))
+}
+
+fn check_partial_id(
+    record: &Enterprise24PartialRecord,
+    schema: &RowSchema,
+    name: &str,
+) -> Result<u64, ()> {
+    let (column, value) = check_partial_value(record, schema, name)?;
+    if !matches!(
+        column.column_type,
+        ColumnType::Integer
+            | ColumnType::Integer2
+            | ColumnType::UInt32
+            | ColumnType::UInt64
+            | ColumnType::Int64
+    ) {
+        return Err(());
+    }
+    match value {
+        Value::Integer(value) if *value > 0 => u64::try_from(*value).map_err(|_| ()),
+        Value::Unsigned(value) if *value != 0 => Ok(*value),
+        _ => Err(()),
+    }
+}
+
+fn check_partial_date(
+    record: &Enterprise24PartialRecord,
+    schema: &RowSchema,
+    name: &str,
+) -> Result<crate::AccountingDate, ()> {
+    let (column, value) = check_partial_value(record, schema, name)?;
+    let Value::Date(value) = value else {
+        return Err(());
+    };
+    (column.column_type == ColumnType::Date)
+        .then(|| crate::MaterializedPostingDate::from_raw_minutes(value.raw_minutes))
+        .ok_or(())?
+        .map_err(|_| ())
+        .map(|value| value.accounting_date())
+}
+
+fn check_partial_small_int(
+    record: &Enterprise24PartialRecord,
+    schema: &RowSchema,
+    name: &str,
+) -> Result<i64, ()> {
+    let (column, value) = check_partial_value(record, schema, name)?;
+    if column.column_type != ColumnType::SmallInt {
+        return Err(());
+    }
+    match value {
+        Value::Integer(value) => Ok(*value),
+        Value::Unsigned(value) => i64::try_from(*value).map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
+fn check_partial_bool(
+    record: &Enterprise24PartialRecord,
+    schema: &RowSchema,
+    name: &str,
+) -> Result<bool, ()> {
+    let (column, value) = check_partial_value(record, schema, name)?;
+    matches!(column.column_type, ColumnType::Boolean)
+        .then_some(())
+        .ok_or(())?;
+    match value {
+        Value::Boolean(value) => Ok(*value),
+        _ => Err(()),
+    }
+}
+
+fn check_partial_is_null(
+    record: &Enterprise24PartialRecord,
+    schema: &RowSchema,
+    name: &str,
+) -> Result<bool, ()> {
+    Ok(matches!(
+        check_partial_value(record, schema, name)?.1,
+        Value::Null
+    ))
+}
+
+fn check_adaptation_target(adaptation: &EnterprisePostingAdaptation) -> Result<u64, ()> {
+    match adaptation {
+        EnterprisePostingAdaptation::Posting(row) => Ok(row.target_id),
+        EnterprisePostingAdaptation::Excluded(
+            EnterprisePostingExclusion::CanonicalZeroAmount { target_id, .. }
+            | EnterprisePostingExclusion::NoPost { target_id, .. }
+            | EnterprisePostingExclusion::MemorizedTransaction { target_id, .. }
+            | EnterprisePostingExclusion::SourceOrLink { target_id, .. },
+        ) => Ok(*target_id),
+        EnterprisePostingAdaptation::Excluded(
+            EnterprisePostingExclusion::CanonicalZeroVoided { .. },
+        ) => Err(()),
+    }
 }
 
 #[derive(Default)]
@@ -1896,20 +2673,22 @@ struct CheckMasterObservation {
 /// accidentally use different decoders or skip a zero-only observation.
 fn prepare_check_dispositions(
     rows: &Enterprise24PartialTableRows,
+    schema: &RowSchema,
     identity_map: &BTreeMap<u32, AccountId>,
     adapt: impl Fn(&Enterprise24PartialRecord) -> Result<EnterprisePostingAdaptation, ()>,
 ) -> Result<Vec<PostingDisposition>, ()> {
     let mut observations = Vec::with_capacity(rows.records.len());
+    let mut compact_sources = BTreeMap::new();
     let mut carriers = BTreeMap::<usize, MaterializedCheckVoidCompanionCarrier>::new();
     let mut carrier_counts = BTreeMap::<u64, usize>::new();
     let mut carrier_targets = BTreeSet::new();
-    let mut targets = BTreeSet::new();
+    let mut all_targets = BTreeSet::new();
     let mut masters = BTreeMap::<u64, CheckMasterObservation>::new();
     for (index, record) in rows.records.iter().enumerate() {
         if let Ok(carrier) = MaterializedCheckVoidCompanionCarrier::parse(&record.bytes) {
             let master = u64::from(carrier.master_record_number());
             let target = u64::from(carrier.target_record_number());
-            if target == master || !carrier_targets.insert(target) {
+            if target == master || !carrier_targets.insert(target) || !all_targets.insert(target) {
                 return Err(());
             }
             *carrier_counts.entry(master).or_default() += 1;
@@ -1917,7 +2696,87 @@ fn prepare_check_dispositions(
             observations.push(None);
             continue;
         }
+        if record.bytes.len() == 151
+            && record.bytes.get(3) == Some(&crate::MATERIALIZED_CHECK_VOID_COMPANION_KIND)
+        {
+            let source = compact_check_source_link(record, schema)?.ok_or(())?;
+            if !all_targets.insert(source.target_id) {
+                return Err(());
+            }
+            compact_sources.insert(index, source);
+            observations.push(None);
+            continue;
+        }
         let adaptation = adapt(record)?;
+        let target = check_adaptation_target(&adaptation)?;
+        if !all_targets.insert(target) {
+            return Err(());
+        }
+        observations.push(Some(adaptation));
+    }
+
+    let retained = observations
+        .iter()
+        .flatten()
+        .filter_map(|adaptation| match adaptation {
+            EnterprisePostingAdaptation::Posting(row) => Some((
+                row.target_id,
+                (row.transaction_id, row.transaction_date, row.account_id),
+            )),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut compact_next_targets = BTreeSet::new();
+    for (index, source) in compact_sources {
+        let next = retained.get(&source.next_target_id).ok_or(())?;
+        if next.0 != source.transaction_id
+            || next.1 != source.transaction_date
+            || next.2 == source.sibling_account_id
+            || !identity_map.contains_key(&u32::try_from(next.2).map_err(|_| ())?)
+            || !identity_map
+                .contains_key(&u32::try_from(source.sibling_account_id).map_err(|_| ())?)
+            || !compact_next_targets.insert(source.next_target_id)
+        {
+            return Err(());
+        }
+        let mut sibling_present = false;
+        for adaptation in observations.iter().flatten() {
+            let (master, date, account) = match adaptation {
+                EnterprisePostingAdaptation::Posting(row) => (
+                    row.transaction_id,
+                    row.transaction_date,
+                    Some(row.account_id),
+                ),
+                EnterprisePostingAdaptation::Excluded(
+                    EnterprisePostingExclusion::CanonicalZeroAmount {
+                        transaction_id,
+                        transaction_date,
+                        account_id,
+                        ..
+                    },
+                ) => (*transaction_id, *transaction_date, Some(*account_id)),
+                _ => continue,
+            };
+            if master == source.transaction_id {
+                if date != source.transaction_date {
+                    return Err(());
+                }
+                sibling_present |= account == Some(source.sibling_account_id);
+            }
+        }
+        if !sibling_present {
+            return Err(());
+        }
+        observations[index] = Some(EnterprisePostingAdaptation::Excluded(
+            EnterprisePostingExclusion::SourceOrLink {
+                target_id: source.target_id,
+                transaction_id: source.transaction_id,
+            },
+        ));
+    }
+
+    let mut targets = BTreeSet::new();
+    for adaptation in observations.iter().flatten() {
         let monetary = match &adaptation {
             EnterprisePostingAdaptation::Posting(row) => {
                 let master = masters.entry(row.transaction_id).or_default();
@@ -1953,15 +2812,11 @@ fn prepare_check_dispositions(
         if monetary.is_some_and(|target| !targets.insert(target)) {
             return Err(());
         }
-        observations.push(Some(adaptation));
     }
-    if !targets.is_disjoint(&carrier_targets)
-        || carrier_counts.values().any(|count| *count != 1)
-        || masters.values().any(|master| {
-            master.nonzero_net != 0
-                || (!master.zero_targets.is_empty() && master.nonzero_count != 0)
-        })
-    {
+    let target_collision = !targets.is_disjoint(&carrier_targets);
+    let carrier_count_invalid = carrier_counts.values().any(|count| *count != 1);
+    let master_invalid = masters.values().any(|master| master.nonzero_net != 0);
+    if target_collision || carrier_count_invalid || master_invalid {
         return Err(());
     }
     let mut evidence = BTreeMap::new();
@@ -2011,11 +2866,39 @@ fn validate_check_master_balances(rows: &[Enterprise24PartialRecord]) -> Result<
         records: rows.to_vec(),
         coverage: Enterprise24PartialTableCoverage::default(),
     };
-    prepare_check_dispositions(&table, &accounts, |record| {
+    prepare_check_dispositions(&table, &RowSchema::new(Vec::new()), &accounts, |record| {
         let row = MaterializedCheckPostingRow::parse(&record.bytes).map_err(|_| ())?;
         adapt_materialized_check_posting_row(&row).map_err(|_| ())
     })
     .map(|_| ())
+}
+
+/// Lifecycle flags must be present and agree across every retained line of
+/// a Bill master. Monetary/date/view parsing and balance validation still run
+/// before a no-post or memorized exclusion can reach the final ledger.
+fn bill_lifecycle_states(
+    records: &[Enterprise24PartialRecord],
+    schema: Option<&RowSchema>,
+) -> Result<BTreeMap<u32, (bool, bool)>, ()> {
+    let mut states = BTreeMap::new();
+    if records.is_empty() {
+        return Ok(states);
+    }
+    let schema = schema.ok_or(())?;
+    for record in records {
+        let row = MaterializedBillPostingRow::parse(&record.bytes).map_err(|_| ())?;
+        let state = (
+            named_bool(schema, &record.partial, "is_no_post_bool").ok_or(())?,
+            named_bool(schema, &record.partial, "is_memorized_transaction_bool").ok_or(())?,
+        );
+        if states
+            .insert(row.master_record_number(), state)
+            .is_some_and(|prior| prior != state)
+        {
+            return Err(());
+        }
+    }
+    Ok(states)
 }
 
 fn validate_materialized_bill_zero_families(rows: &[Enterprise24PartialRecord]) -> Result<(), ()> {
@@ -2265,6 +3148,16 @@ pub enum Enterprise24AccountingPipelineError {
     /// the generic schema-prefix collector.
     #[error("Enterprise 24 table {table_id} requires its dedicated collector")]
     PolicyRequiresDedicatedCollector { table_id: u32 },
+    /// General Journal header candidates did not agree on one physical row.
+    #[error("General Journal header candidates did not reach byte consensus")]
+    HeaderWitnessConsensusFailed,
+    /// A consensus General Journal header did not satisfy its fixed framing.
+    #[error("General Journal header witness did not satisfy its fixed framing")]
+    HeaderWitnessParseFailed,
+    /// Table-3040 header candidates did not yield one unique Bill master
+    /// witness per physical header carrier.
+    #[error("Bill header witnesses could not be resolved by candidate consensus")]
+    BillHeaderWitnessResolutionFailed,
 }
 
 #[cfg(test)]
@@ -2272,6 +3165,34 @@ mod tests {
     use super::*;
     use crate::{Account, AccountType};
     use opensqlany::{ColumnDef, EnterpriseNumericToken, PartialRowValue, SaDate, Value};
+
+    #[test]
+    fn logical_carrier_coverage_requires_an_explicit_nonoverflowing_count() {
+        let coverage = Enterprise24PartialTableCoverage {
+            table_id: Enterprise24AccountingTable::BillLine.id(),
+            resolved_records: u64::MAX,
+            logical_non_row_carriers: 1,
+            ..Enterprise24PartialTableCoverage::default()
+        };
+        assert!(!coverage.is_complete());
+        assert!(
+            !Enterprise24PartialTableCoverage {
+                expected_logical_records: Some(0),
+                ..coverage
+            }
+            .is_complete()
+        );
+        assert!(
+            !Enterprise24PartialTableCoverage {
+                table_id: Enterprise24AccountingTable::CheckLine.id(),
+                resolved_records: 2,
+                logical_non_row_carriers: 1,
+                expected_logical_records: Some(3),
+                ..Enterprise24PartialTableCoverage::default()
+            }
+            .is_complete()
+        );
+    }
 
     fn partial(integer: i64) -> PartialDecodedRow {
         PartialDecodedRow {
@@ -2859,7 +3780,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_mixed_zero_and_nonzero_check_master_stays_blocked() {
+    fn materialized_unbalanced_check_master_with_zero_row_stays_blocked() {
         let rows = Enterprise24PartialTableRows {
             policy: enterprise24_r21_partial_table_policy(Enterprise24AccountingTable::CheckLine)
                 .unwrap(),
@@ -2873,6 +3794,41 @@ mod tests {
             try_materialized_check_dispositions(&rows, &deposit_schema(), &BTreeMap::new())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn ordinary_balanced_check_master_can_include_a_neutral_zero_row() {
+        let mut rows = Enterprise24PartialTableRows {
+            policy: enterprise24_r21_partial_table_policy(Enterprise24AccountingTable::CheckLine)
+                .unwrap(),
+            records: vec![
+                check_record(101, 100, 7, [0, 0x81]),
+                check_record(102, 100, 7, [2, 0xbf, 1, 23]),
+                check_record(103, 100, 8, [2, 0x3f, 1, 23]),
+            ],
+            coverage: Enterprise24PartialTableCoverage::default(),
+        };
+        let accounts = BTreeMap::from([
+            (7, AccountId::new("mixed-check-account-7").unwrap()),
+            (8, AccountId::new("mixed-check-account-8").unwrap()),
+        ]);
+        let dispositions =
+            try_materialized_check_dispositions(&rows, &deposit_schema(), &accounts).unwrap();
+        assert_eq!(dispositions.len(), 3);
+        assert_eq!(
+            dispositions
+                .iter()
+                .filter(|row| matches!(row, PostingDisposition::Excluded(_)))
+                .count(),
+            1
+        );
+        // The same balanced monetary legs cannot validate a void companion.
+        rows.records.push(check_companion_record(
+            104,
+            100,
+            crate::MATERIALIZED_CHECK_VOID_COMPANION_LONG_LEN,
+        ));
+        assert!(try_materialized_check_dispositions(&rows, &deposit_schema(), &accounts).is_err());
     }
 
     fn schema_check_record(
@@ -2903,6 +3859,299 @@ mod tests {
                 });
         }
         record
+    }
+
+    fn compact_check_schema() -> RowSchema {
+        let mut schema = RowSchema::new(vec![
+            ColumnDef::new(1, "target_id", ColumnType::Integer, 4, false),
+            ColumnDef::new(2, "transaction_id", ColumnType::Integer, 4, false),
+            ColumnDef::new(3, "account_id", ColumnType::Integer, 4, true),
+            ColumnDef::new(4, "transaction_date", ColumnType::Date, 4, true),
+            ColumnDef::new(5, "transaction_view_type", ColumnType::SmallInt, 2, true),
+            ColumnDef::new(11, "next_target_id", ColumnType::Integer, 4, true),
+            ColumnDef::new(14, "sibling_account_id", ColumnType::Integer, 4, true),
+            ColumnDef::new(25, "amount_amt", ColumnType::Numeric, 20, true),
+            ColumnDef::new(26, "is_source_bool", ColumnType::Boolean, 1, false),
+            ColumnDef::new(27, "is_no_post_bool", ColumnType::Boolean, 1, false),
+            ColumnDef::new(
+                28,
+                "is_memorized_transaction_bool",
+                ColumnType::Boolean,
+                1,
+                false,
+            ),
+            ColumnDef::new(33, "is_split_bool", ColumnType::Boolean, 1, false),
+        ]);
+        schema.numeric_layout = NumericLayout::EnterpriseMaterializedRaw;
+        schema
+    }
+
+    fn compact_check_record(
+        target: u32,
+        master: u32,
+        next: u32,
+        sibling: u32,
+    ) -> Enterprise24PartialRecord {
+        let mut bytes = vec![0_u8; 151];
+        bytes[..2].copy_from_slice(&151_u16.to_le_bytes());
+        bytes[3] = crate::MATERIALIZED_CHECK_VOID_COMPANION_KIND;
+        bytes[0x0c..0x10].copy_from_slice(&target.to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&master.to_le_bytes());
+        let prefix = vec![
+            (1, Value::Integer(i64::from(target))),
+            (2, Value::Integer(i64::from(master))),
+            (3, Value::Null),
+            (
+                4,
+                Value::Date(SaDate {
+                    raw_minutes: 194_516_640,
+                }),
+            ),
+            (5, Value::Integer(3)),
+            (11, Value::Integer(i64::from(next))),
+            (14, Value::Integer(i64::from(sibling))),
+            (25, Value::Null),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(column_index, (column_id, value))| PartialRowValue {
+            column_index,
+            column_id,
+            value,
+        })
+        .collect();
+        let boolean_values = [(26, false), (27, false), (28, false), (33, true)]
+            .into_iter()
+            .enumerate()
+            .map(|(offset, (column_id, value))| PartialRowValue {
+                column_index: offset + 8,
+                column_id,
+                value: Value::Boolean(value),
+            })
+            .collect();
+        Enterprise24PartialRecord {
+            raw_page_number: 1,
+            record_id: target as u16,
+            bytes,
+            partial: PartialDecodedRow {
+                declared_size: 151,
+                flags: 0,
+                through_ordinal: 33,
+                prefix_values: prefix,
+                boolean_values,
+                opaque_middle_len: 0,
+            },
+        }
+    }
+
+    fn compact_schema_posting(
+        target: u32,
+        master: u32,
+        account: u32,
+        marker: u8,
+    ) -> Enterprise24PartialRecord {
+        let mut record = compact_check_record(target, master, target + 100, account);
+        record.bytes.resize(85, 0);
+        record.bytes[..2].copy_from_slice(&85_u16.to_le_bytes());
+        record.bytes[3] = crate::MATERIALIZED_CHECK_POSTING_KIND;
+        record.partial.prefix_values = vec![
+            (1, Value::Integer(i64::from(target))),
+            (2, Value::Integer(i64::from(master))),
+            (3, Value::Integer(i64::from(account))),
+            (
+                4,
+                Value::Date(SaDate {
+                    raw_minutes: 194_516_640,
+                }),
+            ),
+            (5, Value::Integer(3)),
+            (11, Value::Null),
+            (14, Value::Null),
+            (
+                25,
+                Value::EnterpriseNumeric(EnterpriseNumericToken {
+                    marker,
+                    digits: vec![1],
+                }),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(column_index, (column_id, value))| PartialRowValue {
+            column_index,
+            column_id,
+            value,
+        })
+        .collect();
+        record.partial.boolean_values = [(26, false), (27, false), (28, false), (33, true)]
+            .into_iter()
+            .enumerate()
+            .map(|(offset, (column_id, value))| PartialRowValue {
+                column_index: offset + 8,
+                column_id,
+                value: Value::Boolean(value),
+            })
+            .collect();
+        record
+    }
+
+    #[test]
+    fn compact_check_source_link_requires_exact_schema_and_retained_balanced_target() {
+        let schema = compact_check_schema();
+        let accounts = BTreeMap::from([
+            (7, AccountId::new("compact-source-account").unwrap()),
+            (8, AccountId::new("compact-next-account").unwrap()),
+            (9, AccountId::new("compact-unrelated-account").unwrap()),
+        ]);
+        let rows = |records| Enterprise24PartialTableRows {
+            policy: enterprise24_r21_partial_table_policy(Enterprise24AccountingTable::CheckLine)
+                .unwrap(),
+            records,
+            coverage: Enterprise24PartialTableCoverage::default(),
+        };
+        let source = compact_check_record(1, 10, 2, 7);
+        let valid = rows(vec![
+            source.clone(),
+            compact_schema_posting(2, 10, 8, 0xbf),
+            compact_schema_posting(3, 10, 7, 0x3f),
+        ]);
+        assert!(try_partial_check_dispositions(&valid, &schema, &accounts).is_ok());
+
+        let mut wrong_kind = source.clone();
+        wrong_kind.bytes[3] = 0x63;
+        let mut missing_next = source.clone();
+        missing_next.partial.prefix_values[5].value = Value::Null;
+        let mut source_flag = source;
+        source_flag.partial.boolean_values[0].value = Value::Boolean(true);
+        for invalid in [wrong_kind, missing_next, source_flag] {
+            assert!(
+                try_partial_check_dispositions(
+                    &rows(vec![
+                        invalid,
+                        compact_schema_posting(2, 10, 8, 0xbf),
+                        compact_schema_posting(3, 10, 7, 0x3f)
+                    ]),
+                    &schema,
+                    &accounts
+                )
+                .is_err()
+            );
+        }
+        let mut nonnull_account = compact_check_record(1, 10, 2, 7);
+        nonnull_account.partial.prefix_values[2].value = Value::Integer(7);
+        let mut nonnull_amount = compact_check_record(1, 10, 2, 7);
+        nonnull_amount.partial.prefix_values[7].value =
+            Value::EnterpriseNumeric(EnterpriseNumericToken {
+                marker: 0xbf,
+                digits: vec![1],
+            });
+        for invalid in [nonnull_account, nonnull_amount] {
+            assert!(
+                try_partial_check_dispositions(
+                    &rows(vec![
+                        invalid,
+                        compact_schema_posting(2, 10, 8, 0xbf),
+                        compact_schema_posting(3, 10, 7, 0x3f),
+                    ]),
+                    &schema,
+                    &accounts
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            try_partial_check_dispositions(
+                &rows(vec![
+                    compact_check_record(1, 10, 2, 99),
+                    compact_schema_posting(2, 10, 8, 0xbf),
+                    compact_schema_posting(3, 10, 7, 0x3f)
+                ]),
+                &schema,
+                &accounts
+            )
+            .is_err()
+        );
+        // The counterpart cannot be the retained next row's account.
+        assert!(
+            try_partial_check_dispositions(
+                &rows(vec![
+                    compact_check_record(1, 10, 2, 8),
+                    compact_schema_posting(2, 10, 8, 0xbf),
+                    compact_schema_posting(3, 10, 7, 0x3f),
+                ]),
+                &schema,
+                &accounts
+            )
+            .is_err()
+        );
+        // Distinct compact sources cannot share a retained next target.
+        assert!(
+            try_partial_check_dispositions(
+                &rows(vec![
+                    compact_check_record(1, 10, 2, 7),
+                    compact_check_record(4, 10, 2, 7),
+                    compact_schema_posting(2, 10, 8, 0xbf),
+                    compact_schema_posting(3, 10, 7, 0x3f),
+                ]),
+                &schema,
+                &accounts
+            )
+            .is_err()
+        );
+        assert!(
+            try_partial_check_dispositions(
+                &rows(vec![
+                    compact_check_record(1, 10, 2, 7),
+                    compact_schema_posting(2, 10, 8, 0xbf),
+                    compact_schema_posting(2, 10, 7, 0x3f),
+                ]),
+                &schema,
+                &accounts
+            )
+            .is_err()
+        );
+        // A chart-resolved sibling still needs a retained row in this exact
+        // master/date family.
+        assert!(
+            try_partial_check_dispositions(
+                &rows(vec![
+                    compact_check_record(1, 10, 2, 9),
+                    compact_schema_posting(2, 10, 8, 0xbf),
+                    compact_schema_posting(3, 10, 7, 0x3f)
+                ]),
+                &schema,
+                &accounts
+            )
+            .is_err()
+        );
+        let mut wrong_date = compact_check_record(1, 10, 2, 7);
+        wrong_date.partial.prefix_values[3].value = Value::Date(SaDate {
+            raw_minutes: 194_518_080,
+        });
+        assert!(
+            try_partial_check_dispositions(
+                &rows(vec![
+                    wrong_date,
+                    compact_schema_posting(2, 10, 8, 0xbf),
+                    compact_schema_posting(3, 10, 7, 0x3f)
+                ]),
+                &schema,
+                &accounts
+            )
+            .is_err()
+        );
+        assert!(
+            try_partial_check_dispositions(
+                &rows(vec![
+                    compact_check_record(1, 10, 2, 7),
+                    compact_schema_posting(2, 10, 8, 0xbf),
+                    compact_schema_posting(3, 11, 7, 0x3f)
+                ]),
+                &schema,
+                &accounts
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3188,6 +4437,175 @@ mod tests {
         }
     }
 
+    fn bill_carrier_schema() -> RowSchema {
+        let names = [
+            "target_id",
+            "transaction_id",
+            "account_id",
+            "transaction_date",
+            "transaction_view_type",
+            "next_target_id",
+            "sibling_account_id",
+            "amount_amt",
+            "is_source_bool",
+            "is_no_post_bool",
+            "is_memorized_transaction_bool",
+            "is_split_bool",
+            "is_arap_bool",
+        ];
+        RowSchema::new(
+            names
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    ColumnDef::new((index + 1) as u32, name, ColumnType::Integer, 4, true)
+                })
+                .collect(),
+        )
+    }
+
+    fn bill_carrier_partial(
+        target: u32,
+        master: u32,
+        account: Option<u32>,
+        next: Option<u32>,
+        sibling: Option<u32>,
+        amount: Value,
+    ) -> PartialDecodedRow {
+        let values = [
+            Value::Integer(i64::from(target)),
+            Value::Integer(i64::from(master)),
+            account.map_or(Value::Null, |value| Value::Integer(i64::from(value))),
+            Value::Integer(77),
+            Value::Integer(9),
+            next.map_or(Value::Null, |value| Value::Integer(i64::from(value))),
+            sibling.map_or(Value::Null, |value| Value::Integer(i64::from(value))),
+            amount,
+        ];
+        PartialDecodedRow {
+            declared_size: 1,
+            flags: 0,
+            through_ordinal: 13,
+            prefix_values: values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| PartialRowValue {
+                    column_index: index,
+                    column_id: (index + 1) as u32,
+                    value,
+                })
+                .collect(),
+            boolean_values: [false, false, false, true, true]
+                .into_iter()
+                .enumerate()
+                .map(|(offset, value)| PartialRowValue {
+                    column_index: offset + 8,
+                    column_id: (offset + 9) as u32,
+                    value: Value::Boolean(value),
+                })
+                .collect(),
+            opaque_middle_len: 0,
+        }
+    }
+
+    #[test]
+    fn bill_kind64_carrier_requires_full_schema_and_complete_nonposting_relation() {
+        let schema = bill_carrier_schema();
+        let amounts: [&[u8]; 5] = [
+            &[1, 0xbf, 1],
+            &[1, 0xbf, 1],
+            &[1, 0xbf, 1],
+            &[1, 0x3f, 1],
+            &[1, 0x3f, 2],
+        ];
+        let accounts = [7, 8, 7, 8, 7];
+        let records = amounts
+            .into_iter()
+            .zip(accounts)
+            .enumerate()
+            .map(|(index, (amount, account))| {
+                let target = 101 + index as u32;
+                let mut record = bill_family_record(target, account, amount);
+                record.partial =
+                    bill_carrier_partial(target, 100, Some(account), None, None, Value::Integer(1));
+                record
+            })
+            .collect::<Vec<_>>();
+        let carrier = Enterprise24PartialRecordCandidate {
+            bytes: vec![0; 16],
+            partial: bill_carrier_partial(200, 100, None, Some(101), Some(8), Value::Null),
+        };
+        let mut carrier = carrier;
+        carrier.bytes[..2].copy_from_slice(&16_u16.to_le_bytes());
+        carrier.bytes[2..5].copy_from_slice(&[0x40, 0x02, 0x64]);
+        let headers = BTreeSet::from([100]);
+        assert!(is_attested_bill_nonposting_carrier(
+            &carrier, &records, &schema, &headers
+        ));
+        let mut present_amount = carrier.clone();
+        present_amount.partial.prefix_values[7].value = Value::Integer(1);
+        assert!(!is_attested_bill_nonposting_carrier(
+            &present_amount,
+            &records,
+            &schema,
+            &headers
+        ));
+        let mut wrong_sibling = carrier.clone();
+        wrong_sibling.partial.prefix_values[6].value = Value::Integer(99);
+        assert!(!is_attested_bill_nonposting_carrier(
+            &wrong_sibling,
+            &records,
+            &schema,
+            &headers
+        ));
+        let mut incomplete = records.clone();
+        incomplete.pop();
+        assert!(!is_attested_bill_nonposting_carrier(
+            &carrier,
+            &incomplete,
+            &schema,
+            &headers
+        ));
+        let mut wrong_view = records.clone();
+        wrong_view[4].partial.prefix_values[4].value = Value::Integer(12);
+        assert!(!is_attested_bill_nonposting_carrier(
+            &carrier,
+            &wrong_view,
+            &schema,
+            &headers
+        ));
+    }
+
+    #[test]
+    fn bill_lifecycle_requires_explicit_consistent_flags_for_the_whole_master() {
+        let schema = bill_carrier_schema();
+        let mut records = vec![
+            bill_family_record(101, 7, &[1, 0xbf, 1]),
+            bill_family_record(102, 8, &[1, 0x3f, 1]),
+        ];
+        for (index, record) in records.iter_mut().enumerate() {
+            record.partial = bill_carrier_partial(
+                101 + index as u32,
+                100,
+                Some(7 + index as u32),
+                None,
+                None,
+                Value::Integer(1),
+            );
+            record.partial.boolean_values[1].value = Value::Boolean(true);
+        }
+        assert_eq!(
+            bill_lifecycle_states(&records, Some(&schema)).unwrap(),
+            BTreeMap::from([(100, (true, false))])
+        );
+        records[1].partial.boolean_values[1].value = Value::Boolean(false);
+        assert!(bill_lifecycle_states(&records, Some(&schema)).is_err());
+        records[1].partial.boolean_values[1].value = Value::Boolean(true);
+        records[1].partial.boolean_values.clear();
+        assert!(bill_lifecycle_states(&records, Some(&schema)).is_err());
+        assert!(bill_lifecycle_states(&records, None).is_err());
+    }
+
     #[test]
     fn expected_empty_directory_slots_do_not_break_logical_table_coverage() {
         let coverage = Enterprise24PartialTableCoverage {
@@ -3219,13 +4637,137 @@ mod tests {
     }
 
     #[test]
-    fn bill_artifact_classifier_is_exact_and_bounded() {
-        let artifact = [9, 0, 0x44, 0x08, 0x4a, 0, 0, 0, 0];
-        assert!(is_r21_bill_non_row_artifact(&artifact));
-        let mut altered = artifact;
-        altered[4] = 0;
-        assert!(!is_r21_bill_non_row_artifact(&altered));
-        assert!(!is_r21_bill_non_row_artifact(&artifact[..8]));
+    fn forwarding_locators_decode_references_instead_of_matching_pointer_bytes() {
+        let mut locator = vec![9, 0, 0x44, 17, 0, 0, 0, 2, 0];
+        assert_eq!(forwarding_locator(&locator), Some((17, 2)));
+        locator[3..7].copy_from_slice(&401_u32.to_le_bytes());
+        locator[7..9].copy_from_slice(&12_u16.to_le_bytes());
+        assert_eq!(forwarding_locator(&locator), Some((401, 12)));
+        assert_eq!(
+            consensus_forwarding_locator(&[locator.clone(), locator.clone()]),
+            Some((401, 12))
+        );
+        let mut divergent = locator.clone();
+        divergent[7] += 1;
+        assert_eq!(
+            consensus_forwarding_locator(&[locator.clone(), divergent]),
+            None
+        );
+        for (offset, value) in [(0, 8), (1, 1), (2, 0x40)] {
+            let mut altered = locator.clone();
+            altered[offset] = value;
+            assert_eq!(forwarding_locator(&altered), None);
+        }
+        assert_eq!(forwarding_locator(&locator[..8]), None);
+        locator.push(0);
+        assert_eq!(forwarding_locator(&locator), None);
+    }
+
+    #[test]
+    fn forwarding_aliases_require_unique_retained_monetary_destinations() {
+        let mut debit = bill_family_record(101, 7, &[1, 0xbf, 1]);
+        debit.raw_page_number = 17;
+        debit.record_id = 2;
+        let mut credit = bill_family_record(102, 8, &[1, 0x3f, 1]);
+        credit.raw_page_number = 17;
+        credit.record_id = 3;
+        let rows = vec![debit, credit];
+        let is_bill = |bytes: &[u8]| MaterializedBillPostingRow::parse(bytes).is_ok();
+        assert!(validate_forwarding_aliases(
+            &rows,
+            &[((6, 0), (17, 2)), ((6, 1), (17, 3))],
+            is_bill
+        ));
+        for aliases in [
+            vec![((17, 2), (17, 2))],
+            vec![((6, 0), (99, 2))],
+            vec![((6, 0), (17, 8))],
+            vec![((6, 0), (17, 2)), ((6, 1), (17, 2))],
+            vec![((6, 0), (17, 2)), ((6, 0), (17, 3))],
+            vec![((6, 0), (6, 1)), ((6, 1), (6, 0))],
+        ] {
+            assert!(!validate_forwarding_aliases(&rows, &aliases, is_bill));
+        }
+        let mut invalid_destination = rows.clone();
+        invalid_destination[0].bytes = vec![9, 0, 0x44, 17, 0, 0, 0, 3, 0];
+        assert!(!validate_forwarding_aliases(
+            &invalid_destination,
+            &[((6, 0), (17, 2))],
+            is_bill
+        ));
+        let mut duplicate_location = rows;
+        duplicate_location[1].record_id = 2;
+        assert!(!validate_forwarding_aliases(
+            &duplicate_location,
+            &[((6, 0), (17, 2))],
+            is_bill
+        ));
+    }
+
+    #[test]
+    fn certified_empty_page_drift_cannot_cover_missing_rows_or_other_tables() {
+        let coverage = Enterprise24PartialTableCoverage {
+            table_id: 3078,
+            candidate_page_groups: 4,
+            expected_table_pages: Some(3),
+            expected_external_table_pages: Some(0),
+            expected_logical_records: Some(11),
+            resolved_records: 11,
+            certified_empty_surplus_page_groups: 1,
+            ..Enterprise24PartialTableCoverage::default()
+        };
+        assert!(coverage.complete());
+        for altered in [
+            Enterprise24PartialTableCoverage {
+                resolved_records: 10,
+                ..coverage.clone()
+            },
+            Enterprise24PartialTableCoverage {
+                candidate_directory_disagreements: 1,
+                ..coverage.clone()
+            },
+            Enterprise24PartialTableCoverage {
+                unresolved_records: 1,
+                ..coverage.clone()
+            },
+            Enterprise24PartialTableCoverage {
+                decode_failures: 1,
+                ..coverage.clone()
+            },
+            Enterprise24PartialTableCoverage {
+                candidate_page_groups: 2,
+                ..coverage.clone()
+            },
+            Enterprise24PartialTableCoverage {
+                candidate_page_groups: 5,
+                certified_empty_surplus_page_groups: 2,
+                ..coverage.clone()
+            },
+            Enterprise24PartialTableCoverage {
+                table_id: 3042,
+                ..coverage
+            },
+        ] {
+            assert!(!altered.complete());
+        }
+    }
+
+    #[test]
+    fn external_text_payload_must_fill_one_exact_uncontinued_segment() {
+        let mut segment = vec![7, 0, 0];
+        segment.extend_from_slice(b"memo");
+        assert!(is_r21_bill_external_text_payload(&segment));
+        let mut extra = segment.clone();
+        extra.push(b'x');
+        assert!(!is_r21_bill_external_text_payload(&extra));
+        for (offset, value) in [(0, 6), (1, 1), (2, 1), (3, 0)] {
+            let mut altered = segment.clone();
+            altered[offset] = value;
+            assert!(!is_r21_bill_external_text_payload(&altered));
+        }
+        assert!(!is_r21_bill_external_text_payload(&segment[..6]));
+        assert!(!is_r21_bill_external_text_payload(&[3, 0, 0]));
+        assert!(!is_r21_bill_external_text_payload(&[4, 0, 0, b' ']));
     }
 
     #[test]

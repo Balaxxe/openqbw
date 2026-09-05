@@ -100,8 +100,12 @@ pub fn discover_enterprise24_r21_transform_key_in_store(
     require_unique_semantic_candidate(structural_count, semantic_candidates)
 }
 
-/// Return every transform-key candidate with an actual global SYSCOLUMN
-/// carrier-page deficit whose only relaxed semantic condition is that floor.
+/// Return bounded accounting-readiness transform-key candidates.
+///
+/// The first profile admits an actual global SYSCOLUMN carrier-page deficit
+/// while retaining the complete supported schema contract. If none passes,
+/// a catalog-attested accounting-page deficit may additionally try two
+/// independently witnessed adjacent high words with the same direction.
 ///
 /// These attestations are not extraction-ready on their own. A caller must run
 /// the complete accounting collectors and pipeline for every returned
@@ -115,8 +119,9 @@ pub fn discover_enterprise24_r21_accounting_transform_key_candidates_in_store(
         discover_enterprise_page_transform_key_candidates_in_store(store)
             .map_err(|_| Enterprise24R21TransformKeyResolutionError::StructuralDiscoveryFailed)?;
     let structural_count = structural_candidates.len();
-    let candidates = structural_candidates
-        .into_iter()
+    let mut candidates = structural_candidates
+        .iter()
+        .copied()
         .filter_map(|transform_key| {
             attest_candidate(
                 store,
@@ -126,6 +131,44 @@ pub fn discover_enterprise24_r21_accounting_transform_key_candidates_in_store(
             .ok()
         })
         .collect::<Vec<_>>();
+    // A bounded fallback for stores whose fully attested catalog is available
+    // under one context but whose accounting inventory spans both witnessed
+    // parity variants. Neither a missing catalog nor a schema mismatch can
+    // trigger this path. The combined context must independently pass the
+    // entire catalog and page inventory contract before reaching the caller's
+    // complete accounting and unique-ledger gates.
+    if candidates.is_empty() {
+        let mut seen_pairs = BTreeSet::new();
+        for key in &structural_candidates {
+            if !adjacent_context_is_eligible(
+                *key,
+                &structural_candidates,
+                attest_candidate(
+                    store,
+                    *key,
+                    CandidateAttestationProfile::AccountingReadinessPageFloor,
+                )
+                .err(),
+            ) {
+                continue;
+            }
+            let pair = key.with_adjacent_high_word();
+            if !seen_pairs.insert((pair.high_word(), pair.is_negative())) {
+                continue;
+            }
+            if let Ok(attestation) =
+                attest_candidate(store, pair, CandidateAttestationProfile::Strict).or_else(|_| {
+                    attest_candidate(
+                        store,
+                        pair,
+                        CandidateAttestationProfile::AccountingReadinessPageFloor,
+                    )
+                })
+            {
+                candidates.push(attestation);
+            }
+        }
+    }
     if candidates.is_empty() {
         Err(
             Enterprise24R21TransformKeyResolutionError::NoSemanticCandidate {
@@ -135,6 +178,17 @@ pub fn discover_enterprise24_r21_accounting_transform_key_candidates_in_store(
     } else {
         Ok(candidates)
     }
+}
+
+fn adjacent_context_is_eligible(
+    key: EnterprisePageTransformKey,
+    witnessed: &[EnterprisePageTransformKey],
+    rejection: Option<CandidateRejection>,
+) -> bool {
+    rejection == Some(CandidateRejection::AccountingPageFloor)
+        && witnessed.iter().any(|other| {
+            other.is_negative() == key.is_negative() && other.high_word() == (key.high_word() ^ 1)
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,6 +379,39 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn adjacent_context_requires_a_witnessed_same_direction_accounting_deficit() {
+        let key = EnterprisePageTransformKey::from_high_word(100);
+        let neighbor = EnterprisePageTransformKey::from_high_word(101);
+        let deficit = Some(CandidateRejection::AccountingPageFloor);
+        assert!(adjacent_context_is_eligible(key, &[key, neighbor], deficit));
+        assert!(!adjacent_context_is_eligible(key, &[key, key], deficit));
+        assert!(!adjacent_context_is_eligible(
+            key,
+            &[EnterprisePageTransformKey::from_high_word(102)],
+            deficit
+        ));
+        assert!(!adjacent_context_is_eligible(
+            key,
+            &[EnterprisePageTransformKey::from_negative_high_word(101)],
+            deficit
+        ));
+        for rejection in [
+            None,
+            Some(CandidateRejection::RequiredTables),
+            Some(CandidateRejection::RequiredTableAmbiguity),
+            Some(CandidateRejection::SchemaManifest),
+            Some(CandidateRejection::SysColumnRequiredConflict),
+            Some(CandidateRejection::RequiredTableIdConflict),
+        ] {
+            assert!(!adjacent_context_is_eligible(
+                key,
+                &[key, neighbor],
+                rejection
+            ));
+        }
+    }
     use crate::{
         MaterializedSysColumnSkippedPages, MaterializedSysTableSkippedPages, SysTableEntry,
     };

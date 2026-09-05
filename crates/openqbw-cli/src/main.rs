@@ -62,12 +62,18 @@ use general_ledger_reconciliation::{
 use openqbw::{
     AccountId, AmountType, AttributionGap, CatalogCoverageAttestation, CatalogDefaultAttestation,
     ContentAttribution, CrossValidation, ENTERPRISE24_R21_PARTIAL_TABLE_POLICIES,
-    ENTERPRISE24_R21_SCHEMA_MANIFEST, Enterprise24AccountingTable,
-    Enterprise24R21TransformKeyAttestation, Enterprise24R21TransformKeyResolutionError, LineItem,
-    MaterializedPostingDate, PageAttribution, QuickBooksAccrualTrialBalancePolicy,
-    SourceSnapshotId, SysIndexEntry, SysTableEntry, TransactionHeader, adapt_complete_schema,
-    attest_enterprise24_r21_catalog, build_enterprise24_accounting_pipeline,
-    collect_enterprise24_bill_table_rows, collect_enterprise24_check_prefix_table_rows,
+    ENTERPRISE24_R21_SCHEMA_MANIFEST, Enterprise24AccountingPipelineBlocker,
+    Enterprise24AccountingTable, Enterprise24R21TransformKeyAttestation,
+    Enterprise24R21TransformKeyResolutionError, LineItem, MaterializedPostingDate, PageAttribution,
+    QuickBooksAccrualTrialBalancePolicy, SourceSnapshotId, SysIndexEntry, SysTableEntry,
+    TransactionHeader, adapt_complete_schema, attest_enterprise24_r21_catalog,
+    build_enterprise24_accounting_pipeline,
+    build_enterprise24_accounting_pipeline_with_general_journal_header_witnesses,
+    collect_enterprise24_bill_header_master_witnesses,
+    collect_enterprise24_bill_table_rows_with_context,
+    collect_enterprise24_bill_table_rows_with_lifecycle_schema,
+    collect_enterprise24_check_prefix_table_rows,
+    collect_enterprise24_general_journal_header_metadata_witnesses,
     collect_enterprise24_general_journal_table_rows, collect_enterprise24_partial_table_rows,
     discover_enterprise24_r21_accounting_transform_key_candidates_in_store,
     discover_enterprise24_r21_transform_key_in_store, iter_lineitems_with_attribution,
@@ -1265,7 +1271,6 @@ fn build_local_enterprise24_ledger_from_attestation(
     let mut schemas = BTreeMap::new();
     let mut account_rows = None;
     let mut posting_rows = Vec::new();
-
     for policy in ENTERPRISE24_R21_PARTIAL_TABLE_POLICIES {
         let expectation_entry = tables.table(policy.table.id()).with_context(|| {
             format!(
@@ -1279,8 +1284,56 @@ fn build_local_enterprise24_ledger_from_attestation(
             .with_context(|| format!("selecting materialized table {}", policy.table.id()))?;
         let rows = match policy.table {
             Enterprise24AccountingTable::BillLine => {
-                collect_enterprise24_bill_table_rows(&table_scan, expectation)
+                let storage = policy
+                    .storage
+                    .with_context(|| "dedicated Bill collector requires a proven storage policy")?;
+                let expected_count = ENTERPRISE24_R21_SCHEMA_MANIFEST
+                    .iter()
+                    .find(|manifest| manifest.table_id == policy.table.id())
+                    .context("missing schema manifest for Bill table")?
+                    .column_count;
+                let columns = catalog
+                    .complete_materialized_schema_columns(policy.table.id(), expected_count)
+                    .context("attesting complete schema for Bill table")?;
+                let default_envelopes = validated_catalog
+                    .default_envelopes(policy.table.id())
+                    .context("collecting manifest-bound catalog defaults for Bill table")?;
+                let schema = adapt_complete_schema(
+                    &columns,
+                    CatalogCoverageAttestation::new(policy.table.id(), expected_count)?,
+                    storage,
+                    CatalogDefaultAttestation {
+                        envelopes: &default_envelopes,
+                    },
+                )
+                .context("building schema for Bill table")?;
+                schemas.insert(policy.table.id(), schema.clone());
+                let physical_rows = collect_enterprise24_bill_table_rows_with_lifecycle_schema(
+                    &table_scan,
+                    &schema,
+                    expectation,
+                )
+                .context("collecting Bill physical carriers and lifecycle evidence")?;
+                if physical_rows.coverage.is_complete() {
+                    physical_rows
+                } else {
+                    let bill_header_scan = scan
+                        .for_table(Enterprise24AccountingTable::BillHeader.id())
+                        .context("selecting materialized Bill header table for kind-64 repair")?;
+                    let bill_header_masters = collect_enterprise24_bill_header_master_witnesses(
+                        &bill_header_scan,
+                    )
+                    .context(
+                        "resolving consensus Bill-header master witnesses for kind-64 repair",
+                    )?;
+                    collect_enterprise24_bill_table_rows_with_context(
+                        &table_scan,
+                        &schema,
+                        &bill_header_masters,
+                        expectation,
+                    )
                     .context("collecting dedicated Bill table carriers")?
+                }
             }
             Enterprise24AccountingTable::CheckLine => {
                 let storage = policy.storage.with_context(
@@ -1363,13 +1416,40 @@ fn build_local_enterprise24_ledger_from_attestation(
     }
     let account_rows = account_rows.context("Enterprise account table policy missing")?;
     let snapshot = SourceSnapshotId::new(snapshot_id).context("invalid --snapshot-id")?;
-    let result = build_enterprise24_accounting_pipeline(
-        snapshot,
+    let mut result = build_enterprise24_accounting_pipeline(
+        snapshot.clone(),
         &catalog.columns,
         &account_rows,
         &posting_rows,
         &schemas,
     );
+    let general_journal_classification_blocked =
+        result.diagnostics.blockers.iter().any(|blocker| {
+            matches!(
+                blocker,
+                Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed {
+                    table_id,
+                    page: 0,
+                    record: 0,
+                } if *table_id == Enterprise24AccountingTable::GeneralJournalLine.id()
+            )
+        });
+    if general_journal_classification_blocked {
+        let header_scan = scan
+            .for_table(Enterprise24AccountingTable::GeneralJournalHeader.id())
+            .context("selecting General Journal header carriers")?;
+        let general_journal_header_witnesses =
+            collect_enterprise24_general_journal_header_metadata_witnesses(&header_scan)
+                .context("collecting consensus General Journal header witnesses")?;
+        result = build_enterprise24_accounting_pipeline_with_general_journal_header_witnesses(
+            snapshot,
+            &catalog.columns,
+            &account_rows,
+            &posting_rows,
+            &schemas,
+            &general_journal_header_witnesses,
+        );
+    }
     result.ledger.with_context(|| {
         format!(
             "accounting extraction is incomplete; {} fail-closed blocker(s): {}; coverage: {}",
