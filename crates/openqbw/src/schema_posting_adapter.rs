@@ -125,6 +125,24 @@ pub fn adapt_materialized_bill_posting_row(
 pub fn adapt_materialized_general_journal_posting_row(
     row: &MaterializedGeneralJournalPostingRow,
 ) -> Result<EnterprisePostingAdaptation, EnterprisePostingAdapterError> {
+    let target_id = u64::from(row.target_record_number());
+    let transaction_id = u64::from(row.master_record_number());
+    if row.is_no_post() {
+        return Ok(EnterprisePostingAdaptation::Excluded(
+            EnterprisePostingExclusion::NoPost {
+                target_id,
+                transaction_id,
+            },
+        ));
+    }
+    if row.is_memorized_transaction() {
+        return Ok(EnterprisePostingAdaptation::Excluded(
+            EnterprisePostingExclusion::MemorizedTransaction {
+                target_id,
+                transaction_id,
+            },
+        ));
+    }
     let transaction_date = row
         .posting_date()
         .map(|date| date.accounting_date())
