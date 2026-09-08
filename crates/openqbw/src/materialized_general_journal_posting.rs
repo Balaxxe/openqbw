@@ -502,6 +502,7 @@ pub struct MaterializedGeneralJournalPostingRow {
     family: u8,
     amount_position: MaterializedGeneralJournalAmountPosition,
     signed_cents: i64,
+    lifecycle: (bool, bool),
 }
 
 impl MaterializedGeneralJournalPostingRow {
@@ -592,6 +593,7 @@ impl MaterializedGeneralJournalPostingRow {
             family,
             amount_position,
             signed_cents: amount.signed_cents(),
+            lifecycle: parse_posting_lifecycle(input)?,
         })
     }
 
@@ -645,6 +647,18 @@ impl MaterializedGeneralJournalPostingRow {
     #[must_use]
     pub const fn signed_cents(&self) -> i64 {
         self.signed_cents
+    }
+
+    /// Whether the materialized journal is explicitly non-posting.
+    #[must_use]
+    pub const fn is_no_post(&self) -> bool {
+        self.lifecycle.0
+    }
+
+    /// Whether the journal is a memorized template rather than a posted entry.
+    #[must_use]
+    pub const fn is_memorized_transaction(&self) -> bool {
+        self.lifecycle.1
     }
 }
 
@@ -1122,6 +1136,15 @@ pub fn classify_materialized_general_journal_rows_with_header_witnesses(
         }
         result[index] = Some(MaterializedGeneralJournalDisposition::SourceOrLink(source));
     }
+    let mut lifecycle_by_master = std::collections::BTreeMap::new();
+    for posting in postings.values() {
+        if lifecycle_by_master
+            .insert(posting.master_record_number, posting.lifecycle)
+            .is_some_and(|prior| prior != posting.lifecycle)
+        {
+            return Err(MaterializedGeneralJournalProductionRowError::ConflictingLifecycle);
+        }
+    }
     result
         .into_iter()
         .collect::<Option<Vec<_>>>()
@@ -1181,6 +1204,10 @@ pub fn validate_materialized_general_journal_master_balances(
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub enum MaterializedGeneralJournalProductionRowError {
+    #[error("materialized General Journal has invalid posting lifecycle flags")]
+    InvalidLifecycle,
+    #[error("materialized General Journal master has conflicting posting lifecycle flags")]
+    ConflictingLifecycle,
     #[error(
         "materialized General Journal production row is too short: {actual} bytes (need at least {minimum})"
     )]
@@ -1520,7 +1547,31 @@ fn parse_special_posting(
         family: 0xe0,
         amount_position: MaterializedGeneralJournalAmountPosition::SpecialEnvelope,
         signed_cents: amount.signed_cents(),
+        lifecycle: parse_posting_lifecycle(input)?,
     }))
+}
+
+/// The attested table-3078 carrier places target/master at 0x0b/0x0f.
+/// Catalog ordinals 3..=19 are nullable fixed-width fields, selected by
+/// MSB-first presence bits beginning at 0x04. Only ordinal 5 (view) is u16;
+/// the other sixteen fields are four bytes. Ordinals 20/21 are inline
+/// Boolean bytes for no-post and memorized. Later variable fields are opaque.
+/// The carrier's seven-byte map is not inferred from the generic SQL schema.
+fn parse_posting_lifecycle(
+    input: &[u8],
+) -> Result<(bool, bool), MaterializedGeneralJournalProductionRowError> {
+    if input.len() < PRODUCTION_FIXED_END || input[4] & 0xe0 != 0xe0 {
+        return Err(MaterializedGeneralJournalProductionRowError::InvalidLifecycle);
+    }
+    let offset = PRODUCTION_ACCOUNT
+        + (0..17)
+            .filter(|bit| input[4 + bit / 8] & (0x80 >> (bit % 8)) != 0)
+            .map(|bit| if bit == 2 { 2 } else { 4 })
+            .sum::<usize>();
+    match input.get(offset..offset + 2) {
+        Some([no_post @ 0..=1, memorized @ 0..=1]) => Ok((*no_post == 1, *memorized == 1)),
+        _ => Err(MaterializedGeneralJournalProductionRowError::InvalidLifecycle),
+    }
 }
 
 /// Returns the one attested amount location for a short special envelope.
@@ -2206,6 +2257,83 @@ mod tests {
         let length = row.len() as u16;
         row[..2].copy_from_slice(&length.to_le_bytes());
         row
+    }
+
+    #[test]
+    fn lifecycle_excludes_templates_and_no_post_without_deduplicating_postings() {
+        use crate::{
+            EnterprisePostingAdaptation, EnterprisePostingExclusion,
+            adapt_materialized_general_journal_posting_row,
+        };
+        for (flags, expected) in [([0, 0], 0), ([0, 1], 1), ([1, 0], 2), ([1, 1], 2)] {
+            let mut bytes = production_row(&[1, 0xbf, 7]);
+            bytes[45..47].copy_from_slice(&flags);
+            let row = MaterializedGeneralJournalPostingRow::parse(&bytes).unwrap();
+            let adaptation = adapt_materialized_general_journal_posting_row(&row).unwrap();
+            assert!(matches!(
+                (expected, adaptation),
+                (0, EnterprisePostingAdaptation::Posting(_))
+                    | (
+                        1,
+                        EnterprisePostingAdaptation::Excluded(
+                            EnterprisePostingExclusion::MemorizedTransaction { .. }
+                        )
+                    )
+                    | (
+                        2,
+                        EnterprisePostingAdaptation::Excluded(
+                            EnterprisePostingExclusion::NoPost { .. }
+                        )
+                    )
+            ));
+        }
+        let first = production_row(&[1, 0xbf, 7]);
+        let mut second = first.clone();
+        second[PRODUCTION_TARGET..PRODUCTION_TARGET + 4].copy_from_slice(&71_u32.to_le_bytes());
+        second[PRODUCTION_MASTER..PRODUCTION_MASTER + 4].copy_from_slice(&72_u32.to_le_bytes());
+        let rows = classify_materialized_general_journal_rows(&[first, second]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|r| matches!(r, MaterializedGeneralJournalDisposition::Posting(_)))
+        );
+    }
+
+    #[test]
+    fn lifecycle_rejects_invalid_bytes_and_disagreement_within_master() {
+        for offset in [45, 46] {
+            let mut bad = production_row(&[1, 0xbf, 7]);
+            bad[offset] = 2;
+            assert!(MaterializedGeneralJournalPostingRow::parse(&bad).is_err());
+            assert!(classify_materialized_general_journal_rows(&[bad]).is_err());
+        }
+        let first = production_row(&[1, 0xbf, 7]);
+        let mut second = production_row(&[1, 0x3f, 7]);
+        second[PRODUCTION_TARGET..PRODUCTION_TARGET + 4].copy_from_slice(&71_u32.to_le_bytes());
+        second[46] = 1;
+        assert_eq!(
+            classify_materialized_general_journal_rows(&[first, second]),
+            Err(MaterializedGeneralJournalProductionRowError::ConflictingLifecycle)
+        );
+    }
+
+    #[test]
+    fn lifecycle_tracks_nullable_prefix_fields_and_rejects_truncation() {
+        // Fixed prefix witnesses: ordinary terminal, linked, optional field,
+        // and short envelope. These offsets are independent of the decoder.
+        for (prefix, offset) in [
+            ([0xe0, 0x13, 0xff], 45),
+            ([0xe0, 0x93, 0xff], 49),
+            ([0xe4, 0x13, 0xff], 49),
+            ([0xe8, 0x93, 0xff], 53),
+            ([0xe0, 0x13, 0x9f], 45),
+        ] {
+            let mut row = vec![0; 80];
+            row[4..7].copy_from_slice(&prefix);
+            row[offset..offset + 2].copy_from_slice(&[0, 1]);
+            assert_eq!(parse_posting_lifecycle(&row).unwrap(), (false, true));
+            assert!(parse_posting_lifecycle(&row[..offset + 1]).is_err());
+        }
     }
 
     fn production_source(target: u32, next: u32) -> Vec<u8> {
