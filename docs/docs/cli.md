@@ -19,7 +19,7 @@ $ openqbw --help
 | `reconcile-trial-balance` | Compare two QuickBooks-style Trial Balance CSV files exactly. |
 | `reconcile-qbw-trial-balance` | Extract and reconcile a local QBW TB to a native CSV. |
 | `reconcile-qbw-general-ledger` | Extract and reconcile dated direct-QBW GL movements to a native CSV. |
-| `accounting-report` | Emit a validated Trial Balance or General Ledger. |
+| `accounting-report` | Emit Trial Balance, General Ledger, Profit & Loss, or Balance Sheet. |
 | `batch-extract` | Inspect copied QBW files in parallel. |
 | `batch-trial-balance` | Produce an all-or-nothing consolidated SQLite TB from a private manifest. |
 
@@ -28,6 +28,13 @@ COM, ODBC, or a GUI session. The direct accounting commands accept only a
 validated Enterprise 24 R21 schema/layout/family combination and fail closed
 on anything else. Use local QBW copies only. `reconcile-trial-balance`
 compares CSVs; the two `reconcile-qbw-*` commands perform direct QBW paths.
+
+`accounting-report --report profit-and-loss` requires an inclusive `--from`
+and `--as-of`. `--report balance-sheet` requires `--as-of`,
+`--fiscal-year-start`, and `--retained-earnings-account-id`, with an optional
+`--retained-earnings-report-name`. Both use the existing provenance and output
+flags and support `--include-zero-balance-accounts`. See
+[derived statements](derived-financial-statements.md) for examples and schema.
 
 Controlled fixture/oracle commands are deliberately excluded from the default
 binary. Development builds can opt in with `cargo run -p openqbw-cli --features

@@ -29,6 +29,7 @@ mod enterprise24_schema_manifest;
 mod enterprise24_transform_key;
 mod enterprise_page_materializer;
 mod enterprise_table_scan;
+mod financial_statements;
 mod fkgraph;
 mod index_root_map;
 mod lineitem;
@@ -141,6 +142,9 @@ pub use enterprise24_transform_key::{
     Enterprise24R21TransformKeyAttestation, Enterprise24R21TransformKeyResolutionError,
     discover_enterprise24_r21_accounting_transform_key_candidates_in_store,
     discover_enterprise24_r21_transform_key_in_store,
+};
+pub use financial_statements::{
+    FinancialStatement, FinancialStatementError, FinancialStatementKind, FinancialStatementRow,
 };
 pub use fkgraph::{FkEdge, FkGraphStats, build as build_fk_graph, stats as fk_graph_stats};
 pub use index_root_map::{

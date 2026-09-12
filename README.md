@@ -21,7 +21,8 @@ owners can keep independent access to accounting data they already own.
 OpenQBW now contains a direct, read-only accounting path for the validated
 QuickBooks Desktop Enterprise 24 R21 schema manifest. It extracts the Chart
 of Accounts and normalized posting ledger from a local QBW copy, then emits
-an accrual Trial Balance or General Ledger in CSV, JSON, or SQLite. The
+an accrual Trial Balance or General Ledger in CSV, JSON, or SQLite. The same
+ledger also produces accrual Profit & Loss and Balance Sheet reports. The
 extractor fails closed when the catalog/schema, materialized-row layout, or
 posting family is outside its evidence-bound support.
 
@@ -34,7 +35,7 @@ OpenSQLAnywhere: SA17 page store and page materialization
            (Bill / VendorCredit view, Bill-Payment Check, Check, Deposit,
             General Journal)
         -> normalized Ledger
-        -> accrual Trial Balance / General Ledger
+        -> accrual Trial Balance / General Ledger / Profit & Loss / Balance Sheet
         -> CSV, JSON, SQLite, reconciliation, and parallel batch output
 ```
 
@@ -59,6 +60,7 @@ that the local QBW content hash is unchanged. See the
 | Enterprise 24 R21 schema-manifest match | Supported, direct read-only extraction |
 | Accounts and five posting families above | Supported subject to row-level validation |
 | Accrual Trial Balance and General Ledger | Supported with explicit report policy inputs |
+| Accrual Profit & Loss and Balance Sheet | Derived from validated GL/TB; explicit period/fiscal policy |
 | CSV, JSON, SQLite, exact TB reconciliation, batch TB | Supported |
 | Other QB versions, unknown schemas/layouts/families | Rejected fail-closed |
 | Cash-basis reports; automatic company-preference or RE-label discovery | Not yet supported |
@@ -157,6 +159,8 @@ $ openqbw catalog SAMPLE_COMPANY.qbw
 ```
 
 See [docs/CLI reference](docs/docs/cli.md) for the full subcommand reference.
+See [derived statements](docs/docs/derived-financial-statements.md) for P&L,
+Balance Sheet, their acceptance checks, and their output schema.
 
 ## Library usage
 

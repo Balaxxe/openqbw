@@ -11,6 +11,9 @@ use std::fmt;
 use openqbw::{Account, AccountActivity, AccountType, CurrentState, GeneralLedger, TrialBalance};
 use rusqlite::{Connection, Transaction, params};
 
+#[path = "statement_output.rs"]
+pub(crate) mod statements;
+
 /// Caller-supplied provenance that accompanies every emitted report row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReportMetadata {

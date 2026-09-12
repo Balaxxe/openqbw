@@ -95,6 +95,7 @@ use record_number_bridge_probe::{
 use rename_structural_probe::{
     probe_account_rename_structure, to_json as rename_structural_probe_to_json,
 };
+use report_output::statements::{statement_csv, statement_json, write_statement_sqlite};
 use report_output::{
     ReportBundle, ReportMetadata, TrialBalancePolicyProvenance, account_display_names_with_catalog,
     account_full_names_with_catalog, general_ledger_csv_with_account_catalog,
@@ -401,19 +402,22 @@ enum Cmd {
         /// Inclusive report end date as strict ISO `YYYY-MM-DD`.
         #[arg(long)]
         as_of: String,
-        /// Required only for a QuickBooks accrual Trial Balance: first day of
+        /// Required only for Profit & Loss: inclusive period start, YYYY-MM-DD.
+        #[arg(long)]
+        from: Option<String>,
+        /// Required for Trial Balance and Balance Sheet: first day of
         /// the fiscal year containing --as-of.
         #[arg(long)]
         fiscal_year_start: Option<String>,
-        /// Required only for a QuickBooks accrual Trial Balance: stable decoded
+        /// Required for Trial Balance and Balance Sheet: stable decoded
         /// Retained Earnings account identifier.
         #[arg(long)]
         retained_earnings_account_id: Option<String>,
         /// Optional explicit native report label for the selected Retained
-        /// Earnings account. Applies only to Trial Balance presentation.
+        /// Earnings account. Applies to Trial Balance and Balance Sheet.
         #[arg(long)]
         retained_earnings_report_name: Option<String>,
-        /// Include zero-balance accounts in a Trial Balance output.
+        /// Include zero-balance accounts in TB, P&L, or Balance Sheet output.
         #[arg(long)]
         include_zero_balance_accounts: bool,
         /// Caller-controlled, non-secret entity label stored in the output.
@@ -693,6 +697,10 @@ enum AccountingReportKind {
     TrialBalance,
     /// Transaction-level General Ledger through the requested as-of day.
     GeneralLedger,
+    /// Accrual income and expenses over --from through --as-of, inclusive.
+    ProfitAndLoss,
+    /// Accrual assets, liabilities, and equity using the explicit fiscal policy.
+    BalanceSheet,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -770,6 +778,7 @@ fn main() -> Result<()> {
             input,
             report,
             as_of,
+            from,
             fiscal_year_start,
             retained_earnings_account_id,
             retained_earnings_report_name,
@@ -785,6 +794,7 @@ fn main() -> Result<()> {
             input,
             report,
             as_of,
+            from,
             fiscal_year_start,
             retained_earnings_account_id,
             retained_earnings_report_name,
@@ -986,6 +996,7 @@ fn run_accounting_report(
     input: PathBuf,
     report_kind: AccountingReportKind,
     as_of: String,
+    from: Option<String>,
     fiscal_year_start: Option<String>,
     retained_earnings_account_id: Option<String>,
     retained_earnings_report_name: Option<String>,
@@ -1001,12 +1012,21 @@ fn run_accounting_report(
     let as_of = MaterializedPostingDate::parse_iso_date(&as_of)
         .context("parsing --as-of as strict ISO YYYY-MM-DD")?;
     let as_of_day = as_of.accounting_date();
-    let mut metadata = ReportMetadata {
+    let report_policy = parse_accounting_report_policy(
+        report_kind,
+        as_of,
+        from.as_deref(),
+        fiscal_year_start.as_deref(),
+        retained_earnings_account_id.as_deref(),
+        retained_earnings_report_name.as_deref(),
+        include_zero_balance_accounts,
+    )?;
+    let metadata = ReportMetadata {
         entity_id,
         source_file: source_label,
         parser_version: env!("CARGO_PKG_VERSION").to_owned(),
         generated_at,
-        trial_balance_policy: None,
+        trial_balance_policy: report_policy.provenance,
     };
     metadata.validate().map_err(anyhow::Error::msg)?;
     let ledger = build_local_enterprise24_ledger(&input, snapshot_id)?;
@@ -1015,45 +1035,16 @@ fn run_accounting_report(
 
     match report_kind {
         AccountingReportKind::TrialBalance => {
-            let fiscal_year_start = fiscal_year_start.context(
-                "--fiscal-year-start is required for a QuickBooks accrual Trial Balance",
-            )?;
-            let fiscal_year_start = MaterializedPostingDate::parse_iso_date(&fiscal_year_start)
-                .context("parsing --fiscal-year-start as strict ISO YYYY-MM-DD")?;
-            if fiscal_year_start.accounting_date() > as_of_day {
-                anyhow::bail!("--fiscal-year-start must not be after --as-of");
-            }
-            let retained_earnings_account_id = retained_earnings_account_id.context(
-                "--retained-earnings-account-id is required for a QuickBooks accrual Trial Balance",
-            )?;
-            let retained_earnings_account_id = AccountId::new(retained_earnings_account_id)
-                .context("invalid --retained-earnings-account-id")?;
-            let policy = QuickBooksAccrualTrialBalancePolicy::new(
-                fiscal_year_start.accounting_date(),
-                retained_earnings_account_id.clone(),
-            );
-            metadata.trial_balance_policy = Some(TrialBalancePolicyProvenance {
-                source: "explicit".to_owned(),
-                fiscal_year_start: fiscal_year_start.to_iso_date(),
-                as_of: as_of.to_iso_date(),
-                retained_earnings_account_id: retained_earnings_account_id.as_str().to_owned(),
-                retained_earnings_report_name: retained_earnings_report_name.clone(),
-            });
+            let policy = report_policy.fiscal.as_ref().expect("validated TB policy");
             let trial_balance = ledger
                 .quickbooks_accrual_trial_balance_as_of(
                     as_of_day,
                     openqbw::TrialBalanceOptions {
                         include_zero_balance_accounts,
                     },
-                    &policy,
+                    policy,
                 )
                 .context("building validated QuickBooks accrual Trial Balance")?;
-            if retained_earnings_report_name
-                .as_deref()
-                .is_some_and(|name| name.trim().is_empty())
-            {
-                anyhow::bail!("--retained-earnings-report-name must not be empty");
-            }
             match format {
                 AccountingReportFormat::Csv => write_new_report(
                     &out,
@@ -1091,13 +1082,6 @@ fn run_accounting_report(
             }
         }
         AccountingReportKind::GeneralLedger => {
-            if fiscal_year_start.is_some()
-                || retained_earnings_account_id.is_some()
-                || retained_earnings_report_name.is_some()
-                || include_zero_balance_accounts
-            {
-                anyhow::bail!("Trial Balance policy options apply only to --report trial-balance");
-            }
             let general_ledger = ledger
                 .general_ledger_as_of(as_of_day)
                 .context("building validated General Ledger")?;
@@ -1137,9 +1121,375 @@ fn run_accounting_report(
                 )?,
             }
         }
+        AccountingReportKind::ProfitAndLoss | AccountingReportKind::BalanceSheet => {
+            let options = openqbw::TrialBalanceOptions {
+                include_zero_balance_accounts,
+            };
+            let statement = match report_kind {
+                AccountingReportKind::ProfitAndLoss => ledger.profit_and_loss(
+                    report_policy.from.expect("validated P&L start"),
+                    as_of_day,
+                    options,
+                ),
+                AccountingReportKind::BalanceSheet => ledger.balance_sheet_as_of(
+                    as_of_day,
+                    options,
+                    report_policy
+                        .fiscal
+                        .as_ref()
+                        .expect("validated Balance Sheet policy"),
+                ),
+                _ => unreachable!(),
+            }
+            .context("building a statement from the validated ledger")?;
+            write_financial_statement_report(&out, &statement, &metadata, format, force, &input)?;
+        }
     }
     println!("accounting report written (local read-only extraction)");
     Ok(())
+}
+
+struct AccountingReportPolicy {
+    from: Option<i32>,
+    fiscal: Option<QuickBooksAccrualTrialBalancePolicy>,
+    provenance: Option<TrialBalancePolicyProvenance>,
+}
+
+fn parse_accounting_report_policy(
+    kind: AccountingReportKind,
+    as_of: MaterializedPostingDate,
+    from: Option<&str>,
+    fiscal_year_start: Option<&str>,
+    retained_earnings_account_id: Option<&str>,
+    retained_earnings_report_name: Option<&str>,
+    include_zero_balance_accounts: bool,
+) -> Result<AccountingReportPolicy> {
+    let mut result = AccountingReportPolicy {
+        from: None,
+        fiscal: None,
+        provenance: None,
+    };
+    if matches!(kind, AccountingReportKind::ProfitAndLoss) {
+        let from = MaterializedPostingDate::parse_iso_date(
+            from.context("--from is required for Profit & Loss")?,
+        )
+        .context("parsing --from as strict ISO YYYY-MM-DD")?;
+        if from.accounting_date() > as_of.accounting_date() {
+            anyhow::bail!("--from must not be after --as-of");
+        }
+        result.from = Some(from.accounting_date());
+    } else if from.is_some() {
+        anyhow::bail!("--from applies only to --report profit-and-loss");
+    }
+    if matches!(
+        kind,
+        AccountingReportKind::TrialBalance | AccountingReportKind::BalanceSheet
+    ) {
+        let start = MaterializedPostingDate::parse_iso_date(
+            fiscal_year_start
+                .context("--fiscal-year-start is required for Trial Balance and Balance Sheet")?,
+        )
+        .context("parsing --fiscal-year-start as strict ISO YYYY-MM-DD")?;
+        if start.accounting_date() > as_of.accounting_date() {
+            anyhow::bail!("--fiscal-year-start must not be after --as-of");
+        }
+        let retained = AccountId::new(retained_earnings_account_id.context(
+            "--retained-earnings-account-id is required for Trial Balance and Balance Sheet",
+        )?)
+        .context("invalid --retained-earnings-account-id")?;
+        if retained_earnings_report_name.is_some_and(|name| name.trim().is_empty()) {
+            anyhow::bail!("--retained-earnings-report-name must not be empty");
+        }
+        result.provenance = Some(TrialBalancePolicyProvenance {
+            source: "explicit".into(),
+            fiscal_year_start: start.to_iso_date(),
+            as_of: as_of.to_iso_date(),
+            retained_earnings_account_id: retained.as_str().to_owned(),
+            retained_earnings_report_name: retained_earnings_report_name.map(str::to_owned),
+        });
+        result.fiscal = Some(QuickBooksAccrualTrialBalancePolicy::new(
+            start.accounting_date(),
+            retained,
+        ));
+    } else if fiscal_year_start.is_some()
+        || retained_earnings_account_id.is_some()
+        || retained_earnings_report_name.is_some()
+    {
+        anyhow::bail!("fiscal policy options apply only to Trial Balance and Balance Sheet");
+    }
+    if matches!(kind, AccountingReportKind::GeneralLedger) && include_zero_balance_accounts {
+        anyhow::bail!("--include-zero-balance-accounts does not apply to General Ledger");
+    }
+    Ok(result)
+}
+
+fn write_financial_statement_report(
+    path: &Path,
+    report: &openqbw::FinancialStatement,
+    metadata: &ReportMetadata,
+    format: AccountingReportFormat,
+    force: bool,
+    input: &Path,
+) -> Result<()> {
+    match format {
+        AccountingReportFormat::Csv => write_new_report(
+            path,
+            &statement_csv(report, metadata).map_err(anyhow::Error::msg)?,
+            force,
+            input,
+        ),
+        AccountingReportFormat::Json => write_new_report(
+            path,
+            &statement_json(report, metadata).map_err(anyhow::Error::msg)?,
+            force,
+            input,
+        ),
+        AccountingReportFormat::Sqlite => {
+            write_staged_file(path, force, Some(input), |_staged_path, mut file| {
+                let mut connection =
+                    Connection::open_in_memory().context("opening in-memory statement output")?;
+                write_statement_sqlite(&mut connection, report, metadata)
+                    .map_err(anyhow::Error::msg)?;
+                let serialized = connection
+                    .serialize(MAIN_DB)
+                    .context("serializing statement output")?;
+                file.write_all(&serialized)
+                    .context("writing statement output")?;
+                file.sync_all().context("syncing statement output")
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod financial_statement_cli_tests {
+    use super::*;
+
+    fn day(value: &str) -> MaterializedPostingDate {
+        MaterializedPostingDate::parse_iso_date(value).unwrap()
+    }
+
+    #[test]
+    fn report_options_require_exact_period_and_fiscal_policy_inputs() {
+        let end = day("2026-01-31");
+        assert!(
+            parse_accounting_report_policy(
+                AccountingReportKind::ProfitAndLoss,
+                end,
+                None,
+                None,
+                None,
+                None,
+                false
+            )
+            .is_err()
+        );
+        for start in ["2026-02-01", "2026-02-30", "01/01/2026"] {
+            assert!(
+                parse_accounting_report_policy(
+                    AccountingReportKind::ProfitAndLoss,
+                    end,
+                    Some(start),
+                    None,
+                    None,
+                    None,
+                    false
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            parse_accounting_report_policy(
+                AccountingReportKind::ProfitAndLoss,
+                end,
+                Some("2026-01-01"),
+                Some("2026-01-01"),
+                None,
+                None,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            parse_accounting_report_policy(
+                AccountingReportKind::BalanceSheet,
+                end,
+                None,
+                None,
+                Some("retained"),
+                None,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            parse_accounting_report_policy(
+                AccountingReportKind::BalanceSheet,
+                end,
+                None,
+                Some("2026-01-01"),
+                None,
+                None,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            parse_accounting_report_policy(
+                AccountingReportKind::BalanceSheet,
+                end,
+                Some("2026-01-01"),
+                Some("2026-01-01"),
+                Some("retained"),
+                None,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            parse_accounting_report_policy(
+                AccountingReportKind::BalanceSheet,
+                end,
+                None,
+                Some("2026-01-01"),
+                Some("retained"),
+                Some(" "),
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            parse_accounting_report_policy(
+                AccountingReportKind::GeneralLedger,
+                end,
+                None,
+                None,
+                None,
+                None,
+                true
+            )
+            .is_err()
+        );
+        let pnl = parse_accounting_report_policy(
+            AccountingReportKind::ProfitAndLoss,
+            end,
+            Some("2025-12-01"),
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(pnl.from, Some(day("2025-12-01").accounting_date()));
+        for kind in [
+            AccountingReportKind::TrialBalance,
+            AccountingReportKind::BalanceSheet,
+        ] {
+            let policy = parse_accounting_report_policy(
+                kind,
+                end,
+                None,
+                Some("2026-01-01"),
+                Some("retained"),
+                Some("SAMPLE Label"),
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                policy.fiscal.unwrap().retained_earnings_account_id.as_str(),
+                "retained"
+            );
+            assert_eq!(
+                policy
+                    .provenance
+                    .unwrap()
+                    .retained_earnings_report_name
+                    .as_deref(),
+                Some("SAMPLE Label")
+            );
+        }
+    }
+
+    #[test]
+    fn clap_exposes_the_new_report_names_and_period_start() {
+        for name in ["profit-and-loss", "balance-sheet"] {
+            let args = [
+                "openqbw",
+                "accounting-report",
+                "synthetic.qbw",
+                "--report",
+                name,
+                "--from",
+                "2026-01-01",
+                "--as-of",
+                "2026-01-31",
+                "--entity-id",
+                "SAMPLE",
+                "--source-label",
+                "synthetic",
+                "--generated-at",
+                "2026-01-31T00:00:00Z",
+                "--snapshot-id",
+                "synthetic",
+                "--format",
+                "json",
+                "--out",
+                "synthetic.json",
+            ];
+            let parsed = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(
+                parsed.cmd,
+                Cmd::AccountingReport { from: Some(_), .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn statement_publication_preserves_input_and_existing_destination() {
+        let ledger = openqbw::Ledger::new([], [], openqbw::LedgerCompleteness::Complete).unwrap();
+        let report = ledger
+            .profit_and_loss(1, 2, openqbw::TrialBalanceOptions::default())
+            .unwrap();
+        let metadata = ReportMetadata {
+            entity_id: "SAMPLE".into(),
+            source_file: "synthetic".into(),
+            parser_version: "test".into(),
+            generated_at: "2026-01-31T00:00:00Z".into(),
+            trial_balance_policy: None,
+        };
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("synthetic.qbw");
+        std::fs::write(&input, b"synthetic input").unwrap();
+        for (extension, format) in [
+            ("csv", AccountingReportFormat::Csv),
+            ("json", AccountingReportFormat::Json),
+            ("sqlite", AccountingReportFormat::Sqlite),
+        ] {
+            let output = temporary.path().join(format!("report.{extension}"));
+            write_financial_statement_report(&output, &report, &metadata, format, false, &input)
+                .unwrap();
+            let bytes = std::fs::read(&output).unwrap();
+            assert!(!bytes.is_empty());
+            assert!(
+                write_financial_statement_report(
+                    &output, &report, &metadata, format, false, &input
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&output).unwrap(), bytes);
+            write_financial_statement_report(&output, &report, &metadata, format, true, &input)
+                .unwrap();
+            assert!(
+                write_financial_statement_report(&input, &report, &metadata, format, true, &input)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&input).unwrap(), b"synthetic input");
+            if extension == "sqlite" {
+                let connection = Connection::open(&output).unwrap();
+                assert_eq!(connection.query_row("SELECT amount_cents FROM financial_statement_rows WHERE row_key='net_income'", [], |row| row.get::<_,i64>(0)).unwrap(), 0);
+            }
+        }
+    }
 }
 
 fn write_new_report(path: &Path, contents: &str, force: bool, input: &Path) -> Result<()> {

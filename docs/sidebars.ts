@@ -21,6 +21,7 @@ const sidebars: SidebarsConfig = {
                 'use-cases',
                 'migration-guide',
                 'accounting-acceptance',
+                'derived-financial-statements',
                 'cli',
                 'python-api',
             ],
