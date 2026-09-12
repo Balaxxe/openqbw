@@ -1,5 +1,24 @@
 # Accounting acceptance
 
+## Derived financial statements
+
+Accrual Profit & Loss and Balance Sheet are derived exclusively from the
+validated GL/TB. Their acceptance requires exact agreement with those source
+amounts and focused synthetic coverage for inclusive periods, fiscal-year
+boundaries, direct Retained Earnings postings, current-year net income, contra
+balances, losses, zero accounts, hierarchy, and overflow. CSV, JSON, and SQLite
+must preserve exact amounts, row identities, and explicit policy metadata.
+Existing completeness, lifecycle, balance, and classification checks remain
+mandatory. Additional native P&L or Balance Sheet reports are optional
+corroboration; they are not a prerequisite for these derived reports.
+
+This acceptance establishes accounting derivation and output semantics. It
+does not claim reproduction of every native report label, filter, or layout,
+nor does it establish subledger fields, cash basis, or new transaction types.
+See [derived statements](derived-financial-statements.md).
+
+## Source ledger and trial balance
+
 OpenQBW's Enterprise 24 R21 accounting path is release-gated against native
 QuickBooks Desktop reports. Acceptance uses a local copy of a company file and
 the production CLI build; the QBW is opened read-only.

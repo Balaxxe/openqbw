@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Accrual Profit & Loss and Balance Sheet reports derived from the validated
+  GL/TB, with inclusive period selection, explicit fiscal policy, source
+  account hierarchy, separate subtotal rows, and CSV/JSON/SQLite output.
+  Derived-report acceptance uses GL/TB reconciliation and synthetic invariants;
+  additional native statement exports are optional corroboration.
+
 ### Changed
 
 - Operational exports and migrations now reject input/output aliases, stage
