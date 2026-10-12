@@ -42,7 +42,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: Balaxxe/opensqlanywhere
-          ref: cb75087cef8f8e1d01f53e9f0d294663dfbfb6b7
+          ref: 358934041553d2be32e0f6ee88571894618334bc
           path: OpenSQLAnywhere
 
       - name: Patch OpenSQLAnywhere into Cargo
@@ -80,7 +80,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: Balaxxe/opensqlanywhere
-          ref: cb75087cef8f8e1d01f53e9f0d294663dfbfb6b7
+          ref: 358934041553d2be32e0f6ee88571894618334bc
           path: OpenSQLAnywhere
 
       - name: Patch OpenSQLAnywhere into Cargo
@@ -118,7 +118,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: Balaxxe/opensqlanywhere
-          ref: cb75087cef8f8e1d01f53e9f0d294663dfbfb6b7
+          ref: 358934041553d2be32e0f6ee88571894618334bc
           path: OpenSQLAnywhere
 
       - name: Patch OpenSQLAnywhere into Cargo

@@ -61,6 +61,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CSV reconciliation parsers reject malformed quote transitions, SDK-oracle
   TSV cells are spreadsheet-safe, and research occurrence counters now use
   genuinely non-overlapping matches.
+## Upstream reconciliation - 2026-10-11
+
+- Incorporated upstream history through `059f64e` and the OpenSQLAnywhere
+  0.2.0 page-trailer LSN correction.
+- Deliberately retained this fork's bounded Enterprise 24 SYSCOLUMN parser,
+  direct physical table-ID ownership, fail-closed ambiguity handling, and
+  research-only schema CLI. Upstream 0.1.6 owner-bridge recovery targets a
+  different legacy record grammar and is not enabled in this fork.
+- Preserved the operational accounting and statement regression suites.
+
+## [0.1.5] - 2026-09-09
+
+### Changed
+
+- Bumped the `opensqlany` dependency to 0.2.0. Its page-trailer model was
+  corrected there: the u32 at trailer `0xFF4..0xFF8` is a log sequence
+  number rather than two metadata bytes plus six reserved-zero bytes, so
+  `verify_trailer` no longer rejects valid pages on any file whose LSN
+  has passed 65 535. No OpenQBW API changes - the renamed
+  `PageTrailer`/`Superblock` fields aren't used here.
 
 ## [0.1.4] - 2026-08-12
 
@@ -196,5 +216,6 @@ First publication-ready release.
   $399,914,792.78, matching the value QuickBooks itself reports
   for the same file.
 
-[Unreleased]: https://github.com/Sigilweaver/OpenQBW/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Sigilweaver/OpenQBW/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/Sigilweaver/OpenQBW/releases/tag/v0.1.5
 [0.1.0]: https://github.com/Sigilweaver/OpenQBW/releases/tag/v0.1.0
