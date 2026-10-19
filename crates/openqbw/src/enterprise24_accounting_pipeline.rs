@@ -140,7 +140,7 @@ pub const ENTERPRISE24_R21_PARTIAL_TABLE_POLICIES: [Enterprise24PartialTablePoli
     },
     Enterprise24PartialTablePolicy {
         table: Enterprise24AccountingTable::BillLine,
-        version: "enterprise24-r21-bill-lifecycle-prefix-v2",
+        version: "enterprise24-r21-bill-lifecycle-prefix-v3",
         through_ordinal: Some(34),
         status: Enterprise24PartialPolicyStatus::Partial,
         storage: Some(PREFIX_TWO_U8),
@@ -156,7 +156,7 @@ pub const ENTERPRISE24_R21_PARTIAL_TABLE_POLICIES: [Enterprise24PartialTablePoli
     },
     Enterprise24PartialTablePolicy {
         table: Enterprise24AccountingTable::DepositLine,
-        version: "enterprise24-r21-deposit-prefix-v1",
+        version: "enterprise24-r21-deposit-prefix-v2",
         through_ordinal: Some(28),
         status: Enterprise24PartialPolicyStatus::Partial,
         storage: Some(PREFIX_ONE_U8),
@@ -690,7 +690,7 @@ fn collect_bill_table_rows(
 
 /// Collects Bill lines with the complete Bill schema and consensus-resolved
 /// table-3040 master witnesses. This additionally recognizes the narrow
-/// non-posting kind-64 split/link carrier; it never adapts that carrier into a
+/// non-posting kind-64 split/link carrier chain; it never adapts a carrier into a
 /// posting or monetary amount.
 pub fn collect_enterprise24_bill_table_rows_with_context(
     scan: &EnterpriseTableScan,
@@ -793,11 +793,17 @@ pub fn collect_enterprise24_bill_table_rows_with_context(
         }
     }
     let mut pending_targets = BTreeSet::new();
-    for carrier in pending_carriers {
+    for carrier in &pending_carriers {
         let unique_target = named_u32(schema, &carrier.partial, "target_id")
             .is_some_and(|target| pending_targets.insert(target));
         if unique_target
-            && is_attested_bill_nonposting_carrier(&carrier, &records, schema, bill_header_masters)
+            && is_attested_bill_nonposting_carrier(
+                carrier,
+                &records,
+                schema,
+                bill_header_masters,
+                &pending_carriers,
+            )
         {
             coverage.non_row_artifacts += 1;
             coverage.logical_non_row_carriers += 1;
@@ -899,12 +905,10 @@ fn named_bool(schema: &RowSchema, partial: &PartialDecodedRow, name: &str) -> Op
     }
 }
 
-fn is_attested_bill_nonposting_carrier(
+fn bill_nonposting_carrier_identity(
     carrier: &Enterprise24PartialRecordCandidate,
-    records: &[Enterprise24PartialRecord],
     schema: &RowSchema,
-    headers: &BTreeSet<u32>,
-) -> bool {
+) -> Option<(u32, u32, u32, u32)> {
     if !is_bill_kind64_framing(&carrier.bytes)
         || !named_null(schema, &carrier.partial, "account_id")
         || !named_null(schema, &carrier.partial, "amount_amt")
@@ -914,14 +918,26 @@ fn is_attested_bill_nonposting_carrier(
         || named_bool(schema, &carrier.partial, "is_split_bool") != Some(true)
         || named_bool(schema, &carrier.partial, "is_arap_bool") != Some(true)
     {
-        return false;
+        return None;
     }
-    let (Some(target), Some(master), Some(next), Some(sibling)) = (
-        named_u32(schema, &carrier.partial, "target_id"),
-        named_u32(schema, &carrier.partial, "transaction_id"),
-        named_u32(schema, &carrier.partial, "next_target_id"),
-        named_u32(schema, &carrier.partial, "sibling_account_id"),
-    ) else {
+    Some((
+        named_u32(schema, &carrier.partial, "target_id")?,
+        named_u32(schema, &carrier.partial, "transaction_id")?,
+        named_u32(schema, &carrier.partial, "next_target_id")?,
+        named_u32(schema, &carrier.partial, "sibling_account_id")?,
+    ))
+}
+
+fn is_attested_bill_nonposting_carrier(
+    carrier: &Enterprise24PartialRecordCandidate,
+    records: &[Enterprise24PartialRecord],
+    schema: &RowSchema,
+    headers: &BTreeSet<u32>,
+    carriers: &[Enterprise24PartialRecordCandidate],
+) -> bool {
+    let Some((target, master, mut next, sibling)) =
+        bill_nonposting_carrier_identity(carrier, schema)
+    else {
         return false;
     };
     let (Ok(Some(date)), Ok(Some(view))) = (
@@ -941,7 +957,7 @@ fn is_attested_bill_nonposting_carrier(
         .iter()
         .filter(|record| named_u32(schema, &record.partial, "transaction_id") == Some(master))
         .collect::<Vec<_>>();
-    if family.len() != 5
+    if family.len() < 2
         || family.iter().any(|record| {
             prefix_value_by_column_name(schema, &record.partial, "transaction_date")
                 .ok()
@@ -952,11 +968,6 @@ fn is_attested_bill_nonposting_carrier(
                     .flatten()
                     != Some(view)
         })
-        || family
-            .iter()
-            .filter(|record| named_u32(schema, &record.partial, "target_id") == Some(next))
-            .count()
-            != 1
     {
         return false;
     }
@@ -973,7 +984,54 @@ fn is_attested_bill_nonposting_carrier(
         accounts.insert(posting.account_record_number());
         balance += i128::from(posting.signed_cents());
     }
-    accounts.len() == 2 && accounts.contains(&sibling) && balance == 0
+    if accounts.len() < 2 || !accounts.contains(&sibling) || balance != 0 {
+        return false;
+    }
+    // A split/link carrier has no account or amount. Its counted presence is
+    // proven by a bounded, acyclic path to one retained monetary line of the
+    // same balanced, header-witnessed master, not by an example's row count.
+    let mut visited = BTreeSet::from([target]);
+    loop {
+        if !visited.insert(next) {
+            return false;
+        }
+        if targets.contains(&next) {
+            return records
+                .iter()
+                .filter(|record| named_u32(schema, &record.partial, "target_id") == Some(next))
+                .count()
+                == 1;
+        }
+        let matches = carriers
+            .iter()
+            .filter(|candidate| named_u32(schema, &candidate.partial, "target_id") == Some(next))
+            .collect::<Vec<_>>();
+        let [candidate] = matches.as_slice() else {
+            return false;
+        };
+        let Some((_, candidate_master, candidate_next, candidate_sibling)) =
+            bill_nonposting_carrier_identity(candidate, schema)
+        else {
+            return false;
+        };
+        if candidate_master != master
+            || candidate_sibling != sibling
+            || prefix_value_by_column_name(schema, &candidate.partial, "transaction_date")
+                .ok()
+                .flatten()
+                != Some(date)
+            || prefix_value_by_column_name(schema, &candidate.partial, "transaction_view_type")
+                .ok()
+                .flatten()
+                != Some(view)
+            || records
+                .iter()
+                .any(|record| named_u32(schema, &record.partial, "target_id") == Some(next))
+        {
+            return false;
+        }
+        next = candidate_next;
+    }
 }
 
 fn empty_physical_partial(bytes: &[u8]) -> PartialDecodedRow {
@@ -2954,6 +3012,9 @@ fn validate_partial_zero_families(
     schema: &RowSchema,
     proven_headers: &BTreeSet<(u64, u16)>,
 ) -> Result<(), ()> {
+    if table == Enterprise24AccountingTable::DepositLine {
+        return validate_deposit_zero_families(rows, schema, proven_headers);
+    }
     let mut families = BTreeMap::<u64, (u32, u32)>::new();
     let mut targets = BTreeSet::new();
     for record in rows {
@@ -2995,6 +3056,71 @@ fn validate_partial_zero_families(
         .all(|(zeros, nonzeros)| zeros == 0 || nonzeros == 0)
         .then_some(())
         .ok_or(())
+}
+
+fn validate_deposit_zero_families(
+    rows: &[Enterprise24PartialRecord],
+    schema: &RowSchema,
+    proven_headers: &BTreeSet<(u64, u16)>,
+) -> Result<(), ()> {
+    let mut families = BTreeMap::<u64, Vec<(crate::AccountingDate, i64, bool)>>::new();
+    let mut targets = BTreeSet::new();
+    for record in rows {
+        if proven_headers.contains(&(record.raw_page_number, record.record_id)) {
+            continue;
+        }
+        let adaptation = adapt_enterprise_posting_row_partial(
+            Enterprise24AccountingTable::DepositLine,
+            schema,
+            &record.partial,
+        )
+        .map_err(|_| ())?;
+        let (target, master, date, amount, zero) = match adaptation {
+            EnterprisePostingAdaptation::Posting(row) => (
+                row.target_id,
+                row.transaction_id,
+                row.transaction_date,
+                row.amount_cents,
+                false,
+            ),
+            EnterprisePostingAdaptation::Excluded(
+                EnterprisePostingExclusion::CanonicalZeroAmount {
+                    target_id,
+                    transaction_id,
+                    transaction_date,
+                    ..
+                },
+            ) => (target_id, transaction_id, transaction_date, 0, true),
+            EnterprisePostingAdaptation::Excluded(
+                EnterprisePostingExclusion::CanonicalZeroVoided { .. },
+            ) => return Err(()),
+            EnterprisePostingAdaptation::Excluded(_) => continue,
+        };
+        if !targets.insert(target) {
+            return Err(());
+        }
+        families
+            .entry(master)
+            .or_default()
+            .push((date, amount, zero));
+    }
+    for family in families.values() {
+        if family.iter().any(|(_, _, zero)| *zero) {
+            // Zero is a neutral monetary line, not evidence that a deposit is
+            // void. Keep all nonzero siblings and require the complete family
+            // to balance on one date. Account joins still occur downstream.
+            if family.iter().any(|(date, _, _)| *date != family[0].0)
+                || family
+                    .iter()
+                    .map(|(_, amount, _)| i128::from(*amount))
+                    .sum::<i128>()
+                    != 0
+            {
+                return Err(());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn add_table_coverage(
@@ -3602,6 +3728,71 @@ mod tests {
             validate_deposit_master_balances(&records, &schema, &BTreeSet::new()),
             Err(DepositTableValidationError::Unbalanced)
         );
+    }
+
+    #[test]
+    fn deposit_neutral_zero_can_share_a_balanced_monetary_family() {
+        let schema = deposit_schema();
+        let mut zero = deposit_record(1, 101, 100, 0xe1, 80, Some(7), None, true, true);
+        zero.partial.prefix_values[4].value = Value::EnterpriseNumeric(EnterpriseNumericToken {
+            marker: 0x81,
+            digits: vec![],
+        });
+        let debit = deposit_record(2, 102, 100, 0xf1, 80, Some(8), Some((0xbf, 1)), false, true);
+        let credit = deposit_record(3, 103, 100, 0xf1, 80, Some(9), Some((0x3f, 1)), false, true);
+        let valid = vec![zero, debit, credit];
+        let check = |rows: &[Enterprise24PartialRecord]| {
+            validate_partial_zero_families(
+                Enterprise24AccountingTable::DepositLine,
+                rows,
+                &schema,
+                &BTreeSet::new(),
+            )
+        };
+        assert!(check(&valid).is_ok());
+        assert!(check(&valid[..1]).is_ok());
+        assert!(check(&valid[..2]).is_err());
+        let mut duplicate = valid.clone();
+        duplicate.push(valid[0].clone());
+        assert!(check(&duplicate).is_err());
+        let mut wrong_date = valid.clone();
+        wrong_date[1].partial.prefix_values[3].value = Value::Date(SaDate {
+            raw_minutes: 194_518_080,
+        });
+        assert!(check(&wrong_date).is_err());
+        let mut across_masters = valid.clone();
+        across_masters[2].partial.prefix_values[1].value = Value::Integer(200);
+        assert!(check(&across_masters).is_err());
+        let mut malformed = valid.clone();
+        malformed[0].partial.prefix_values[4].value = Value::Null;
+        malformed[0].partial.boolean_values[2].value = Value::Boolean(false);
+        assert!(check(&malformed).is_err());
+        let accounts = BTreeMap::from([(7, AccountId::new("sample-zero-account").unwrap())]);
+        let adaptation = adapt_enterprise_posting_row_partial(
+            Enterprise24AccountingTable::DepositLine,
+            &schema,
+            &valid[0].partial,
+        )
+        .unwrap();
+        let disposition = normalized_disposition(
+            Enterprise24AccountingTable::DepositLine,
+            &valid[0],
+            adaptation.clone(),
+            &accounts,
+            "sample-decoder",
+        )
+        .unwrap();
+        assert!(matches!(disposition, PostingDisposition::Excluded(_)));
+        assert!(matches!(
+            normalized_disposition(
+                Enterprise24AccountingTable::DepositLine,
+                &valid[0],
+                adaptation,
+                &BTreeMap::new(),
+                "sample-decoder"
+            ),
+            Err(NormalizationFailure::MissingAccountIdentity)
+        ));
     }
 
     #[test]
@@ -4540,7 +4731,11 @@ mod tests {
         carrier.bytes[2..5].copy_from_slice(&[0x40, 0x02, 0x64]);
         let headers = BTreeSet::from([100]);
         assert!(is_attested_bill_nonposting_carrier(
-            &carrier, &records, &schema, &headers
+            &carrier,
+            &records,
+            &schema,
+            &headers,
+            std::slice::from_ref(&carrier)
         ));
         let mut present_amount = carrier.clone();
         present_amount.partial.prefix_values[7].value = Value::Integer(1);
@@ -4548,7 +4743,8 @@ mod tests {
             &present_amount,
             &records,
             &schema,
-            &headers
+            &headers,
+            std::slice::from_ref(&present_amount)
         ));
         let mut wrong_sibling = carrier.clone();
         wrong_sibling.partial.prefix_values[6].value = Value::Integer(99);
@@ -4556,7 +4752,8 @@ mod tests {
             &wrong_sibling,
             &records,
             &schema,
-            &headers
+            &headers,
+            std::slice::from_ref(&wrong_sibling)
         ));
         let mut incomplete = records.clone();
         incomplete.pop();
@@ -4564,7 +4761,8 @@ mod tests {
             &carrier,
             &incomplete,
             &schema,
-            &headers
+            &headers,
+            std::slice::from_ref(&carrier)
         ));
         let mut wrong_view = records.clone();
         wrong_view[4].partial.prefix_values[4].value = Value::Integer(12);
@@ -4572,7 +4770,149 @@ mod tests {
             &carrier,
             &wrong_view,
             &schema,
-            &headers
+            &headers,
+            std::slice::from_ref(&carrier)
+        ));
+    }
+
+    #[test]
+    fn bill_kind64_accepts_a_balanced_family_without_fixed_line_or_account_counts() {
+        let schema = bill_carrier_schema();
+        let amounts: [&[u8]; 3] = [&[1, 0xbf, 1], &[1, 0xbf, 1], &[1, 0x3f, 2]];
+        let records = amounts
+            .into_iter()
+            .enumerate()
+            .map(|(i, amount)| {
+                let target = 101 + i as u32;
+                let account = 7 + i as u32;
+                let mut record = bill_family_record(target, account, amount);
+                record.partial =
+                    bill_carrier_partial(target, 100, Some(account), None, None, Value::Integer(1));
+                record
+            })
+            .collect::<Vec<_>>();
+        let mut bytes = vec![0; 16];
+        bytes[..2].copy_from_slice(&16_u16.to_le_bytes());
+        bytes[2..5].copy_from_slice(&[0x40, 0x02, 0x64]);
+        let carrier = Enterprise24PartialRecordCandidate {
+            bytes,
+            partial: bill_carrier_partial(200, 100, None, Some(101), Some(7), Value::Null),
+        };
+        assert!(is_attested_bill_nonposting_carrier(
+            &carrier,
+            &records,
+            &schema,
+            &BTreeSet::from([100]),
+            std::slice::from_ref(&carrier)
+        ));
+    }
+
+    #[test]
+    fn bill_link_chain_requires_unique_acyclic_links_to_the_same_balanced_master() {
+        let schema = bill_carrier_schema();
+        let headers = BTreeSet::from([100]);
+        let records = [&[1, 0xbf, 1][..], &[1, 0xbf, 1][..], &[1, 0x3f, 2][..]]
+            .into_iter()
+            .enumerate()
+            .map(|(i, amount)| {
+                let target = 101 + i as u32;
+                let account = 7 + i as u32;
+                let mut row = bill_family_record(target, account, amount);
+                row.partial =
+                    bill_carrier_partial(target, 100, Some(account), None, None, Value::Integer(1));
+                row
+            })
+            .collect::<Vec<_>>();
+        let carriers = [(200, 201), (201, 202), (202, 101)]
+            .into_iter()
+            .map(|(target, next)| {
+                let mut bytes = vec![0; 16];
+                bytes[..2].copy_from_slice(&16_u16.to_le_bytes());
+                bytes[2..5].copy_from_slice(&[0x40, 0x02, 0x64]);
+                Enterprise24PartialRecordCandidate {
+                    bytes,
+                    partial: bill_carrier_partial(
+                        target,
+                        100,
+                        None,
+                        Some(next),
+                        Some(7),
+                        Value::Null,
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
+        for carrier in &carriers {
+            assert!(is_attested_bill_nonposting_carrier(
+                carrier, &records, &schema, &headers, &carriers
+            ));
+        }
+        // A valid end row alone cannot bless an invalid intermediate carrier.
+        for (index, value) in [
+            (1, Value::Integer(999)), // different master
+            (2, Value::Integer(7)),   // monetary account on a link carrier
+            (3, Value::Integer(78)),  // different date
+            (4, Value::Integer(12)),  // different view
+            (5, Value::Integer(999)), // dangling next target
+            (5, Value::Integer(200)), // cycle back to the start
+            (6, Value::Integer(99)),  // sibling absent from monetary family
+            (7, Value::Integer(1)),   // link must have a SQL-null amount
+        ] {
+            let mut invalid = carriers.clone();
+            invalid[1].partial.prefix_values[index].value = value;
+            assert!(!is_attested_bill_nonposting_carrier(
+                &invalid[0],
+                &records,
+                &schema,
+                &headers,
+                &invalid
+            ));
+        }
+        for index in 0..5 {
+            let mut invalid = carriers.clone();
+            let Value::Boolean(flag) = &mut invalid[1].partial.boolean_values[index].value else {
+                panic!()
+            };
+            *flag = !*flag;
+            assert!(!is_attested_bill_nonposting_carrier(
+                &invalid[0],
+                &records,
+                &schema,
+                &headers,
+                &invalid
+            ));
+        }
+        let mut duplicate = carriers.clone();
+        duplicate.push(carriers[1].clone());
+        assert!(!is_attested_bill_nonposting_carrier(
+            &carriers[0],
+            &records,
+            &schema,
+            &headers,
+            &duplicate
+        ));
+        assert!(!is_attested_bill_nonposting_carrier(
+            &carriers[0],
+            &records,
+            &schema,
+            &BTreeSet::new(),
+            &carriers
+        ));
+        assert!(!is_attested_bill_nonposting_carrier(
+            &carriers[0],
+            &records[..2],
+            &schema,
+            &headers,
+            &carriers
+        ));
+        let mut duplicate_posting = records.clone();
+        duplicate_posting.push(records[0].clone());
+        assert!(!is_attested_bill_nonposting_carrier(
+            &carriers[0],
+            &duplicate_posting,
+            &schema,
+            &headers,
+            &carriers
         ));
     }
 
