@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Native General Ledger reconciliation retains serialized transaction types
+  and compares their multiplicity when both inputs provide complete types.
+  Output lists fields actually compared and fields excluded from comparison.
+- Short materialized Deposit headers return a bounds error before reading
+  fixed reference fields.
+
 - Deposit extraction accepts neutral zero-amount lines within a complete,
   balanced transaction while retaining date, identity and account checks.
 - Bill extraction recognizes acyclic non-posting split/link chains anchored

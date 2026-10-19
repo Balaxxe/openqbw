@@ -190,6 +190,8 @@ impl MaterializedDepositPostingRow {
             return Err(MaterializedDepositPostingRowError::UnexpectedFlags { actual: input[2] });
         }
 
+        // Validate the complete fixed header before reading any reference.
+        ensure_minimum(input, VIEW_TYPE_OFFSET + 2)?;
         require_reference(u32_at(input, TARGET_OFFSET), "target")?;
         require_reference(u32_at(input, MASTER_OFFSET), "master")?;
         require_reference(u32_at(input, ACCOUNT_OFFSET), "account")?;
@@ -546,6 +548,29 @@ mod tests {
         assert_eq!(terminal.signed_cents(), -175);
         assert_eq!(terminal.next_target_record_number(), None);
         assert_eq!(terminal.source_account_record_number(), 10);
+    }
+
+    #[test]
+    fn short_deposit_headers_return_errors_without_panicking() {
+        for kind in [
+            MATERIALIZED_DEPOSIT_POSTING_KIND,
+            MATERIALIZED_DEPOSIT_TERMINAL_POSTING_KIND,
+        ] {
+            for length in 0..VIEW_TYPE_OFFSET + 2 {
+                let mut input = vec![1; length];
+                if length >= 2 {
+                    input[..2].copy_from_slice(&(length as u16).to_le_bytes());
+                }
+                if length >= 4 {
+                    input[2] = EXPECTED_FLAGS;
+                    input[3] = kind;
+                }
+                assert!(matches!(
+                    MaterializedDepositPostingRow::parse(&input),
+                    Err(MaterializedDepositPostingRowError::SegmentTooShort { .. })
+                ));
+            }
+        }
     }
 
     #[test]

@@ -372,8 +372,8 @@ enum Cmd {
     /// Read a local QBW directly, serialize its normalized General Ledger,
     /// and reconcile every dated debit/credit movement with a native
     /// QuickBooks Desktop General Ledger CSV. No SDK, GUI, COM, or ODBC is
-    /// used. Transaction type/number are reported as unavailable rather than
-    /// guessed until their on-disk fields are independently established.
+    /// used. Transaction types are compared when complete in both inputs.
+    /// Output identifies compared fields and explicitly excludes document numbers.
     ReconcileQbwGeneralLedger {
         /// Local QBW input, opened read-only.
         #[arg(long)]
@@ -2279,15 +2279,10 @@ fn run_reconcile_qbw_general_ledger(
         &generated_report.entries,
     )
     .context("resolving native General Ledger account sections against decoded chart identities")?;
-    let reconciliation = reconcile_general_ledger_postings(
-        &native,
-        generated.postings,
-        generated.transaction_type_complete,
-        false,
-    );
+    let reconciliation = reconcile_general_ledger_postings(&native, generated.postings);
     println!("{}", reconciliation.status_line());
     println!(
-        "postings compared={} generated={} matched={} date_amount_matched={} shared_accounts={} native_only_accounts={} generated_only_accounts={} missing={} extra={} native_neutral_zero_rows={} semantic_fields_unavailable={}",
+        "postings compared={} generated={} matched={} date_amount_matched={} shared_accounts={} native_only_accounts={} generated_only_accounts={} missing={} extra={} native_neutral_zero_rows={} fields_compared={} fields_not_compared={}",
         reconciliation.native_postings,
         reconciliation.generated_postings,
         reconciliation.matching_postings,
@@ -2298,11 +2293,8 @@ fn run_reconcile_qbw_general_ledger(
         reconciliation.missing_postings,
         reconciliation.extra_postings,
         native_neutral_zero_rows,
-        if reconciliation.unavailable_semantic_fields.is_empty() {
-            "none".to_owned()
-        } else {
-            reconciliation.unavailable_semantic_fields.join(",")
-        },
+        reconciliation.compared_fields.join(","),
+        reconciliation.not_compared_fields.join(","),
     );
     if !reconciliation.passes_posting_multiset() {
         // Business labels and document numbers are intentionally not emitted
