@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Deposit extraction accepts neutral zero-amount lines within a complete,
+  balanced transaction while retaining date, identity and account checks.
+- Bill extraction recognizes acyclic non-posting split/link chains anchored
+  to a retained balanced master, without fixed line or account counts.
 - Page-key discovery retains positive and negative sector transformations as
   distinct candidates. A catalog-attested accounting-page deficit can try
   independently witnessed adjacent high words, subject to the complete
