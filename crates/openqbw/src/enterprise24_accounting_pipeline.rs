@@ -792,18 +792,15 @@ pub fn collect_enterprise24_bill_table_rows_with_context(
             }
         }
     }
+    let accepted_carriers =
+        attested_bill_carrier_targets(&pending_carriers, &records, schema, bill_header_masters);
     let mut pending_targets = BTreeSet::new();
     for carrier in &pending_carriers {
         let unique_target = named_u32(schema, &carrier.partial, "target_id")
             .is_some_and(|target| pending_targets.insert(target));
         if unique_target
-            && is_attested_bill_nonposting_carrier(
-                carrier,
-                &records,
-                schema,
-                bill_header_masters,
-                &pending_carriers,
-            )
+            && named_u32(schema, &carrier.partial, "target_id")
+                .is_some_and(|target| accepted_carriers.contains(&target))
         {
             coverage.non_row_artifacts += 1;
             coverage.logical_non_row_carriers += 1;
@@ -928,6 +925,181 @@ fn bill_nonposting_carrier_identity(
     ))
 }
 
+fn bill_carrier_context(schema: &RowSchema, row: &PartialDecodedRow) -> Option<(Value, Value)> {
+    Some((
+        prefix_value_by_column_name(schema, row, "transaction_date")
+            .ok()??
+            .clone(),
+        prefix_value_by_column_name(schema, row, "transaction_view_type")
+            .ok()??
+            .clone(),
+    ))
+}
+
+struct BillCarrierFamily {
+    context: (Value, Value),
+    accounts: BTreeSet<u32>,
+    targets: BTreeSet<u32>,
+}
+
+fn attested_bill_carrier_family(
+    family: &[&Enterprise24PartialRecord],
+    schema: &RowSchema,
+) -> Option<BillCarrierFamily> {
+    if family.len() < 2 {
+        return None;
+    }
+    let context = bill_carrier_context(schema, &family[0].partial)?;
+    let mut accounts = BTreeSet::new();
+    let mut targets = BTreeSet::new();
+    let mut balance = 0_i128;
+    for record in family {
+        let posting = MaterializedBillPostingRow::parse(&record.bytes).ok()?;
+        if posting.has_canonical_zero_amount()
+            || !targets.insert(posting.target_record_number())
+            || bill_carrier_context(schema, &record.partial)? != context
+        {
+            return None;
+        }
+        accounts.insert(posting.account_record_number());
+        balance += i128::from(posting.signed_cents());
+    }
+    (accounts.len() >= 2 && balance == 0).then_some(BillCarrierFamily {
+        context,
+        accounts,
+        targets,
+    })
+}
+
+struct BillCarrierNode {
+    master: u32,
+    next: u32,
+    sibling: u32,
+    context: (Value, Value),
+}
+
+enum BillCarrierLink {
+    Monetary,
+    Carrier(u32),
+    Invalid,
+}
+
+fn attested_bill_carrier_targets(
+    carriers: &[Enterprise24PartialRecordCandidate],
+    records: &[Enterprise24PartialRecord],
+    schema: &RowSchema,
+    headers: &BTreeSet<u32>,
+) -> BTreeSet<u32> {
+    if carriers.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut record_targets = BTreeMap::<u32, usize>::new();
+    let mut by_master = BTreeMap::<u32, Vec<&Enterprise24PartialRecord>>::new();
+    for record in records {
+        if let Some(target) = named_u32(schema, &record.partial, "target_id") {
+            *record_targets.entry(target).or_default() += 1;
+        }
+        if let Some(master) = named_u32(schema, &record.partial, "transaction_id") {
+            by_master.entry(master).or_default().push(record);
+        }
+    }
+    let families = by_master
+        .into_iter()
+        .filter_map(|(master, family)| {
+            headers
+                .contains(&master)
+                .then(|| attested_bill_carrier_family(&family, schema))
+                .flatten()
+                .map(|family| (master, family))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut indexed = BTreeMap::<u32, Option<&Enterprise24PartialRecordCandidate>>::new();
+    for carrier in carriers {
+        if let Some(target) = named_u32(schema, &carrier.partial, "target_id") {
+            indexed
+                .entry(target)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(carrier));
+        }
+    }
+    let nodes = indexed
+        .into_iter()
+        .filter_map(|(target, carrier)| {
+            let carrier = carrier?;
+            let (_, master, next, sibling) = bill_nonposting_carrier_identity(carrier, schema)?;
+            if record_targets.contains_key(&target) {
+                return None;
+            }
+            Some((
+                target,
+                BillCarrierNode {
+                    master,
+                    next,
+                    sibling,
+                    context: bill_carrier_context(schema, &carrier.partial)?,
+                },
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let links = nodes
+        .iter()
+        .map(|(&target, node)| {
+            let link = match families.get(&node.master) {
+                Some(family)
+                    if family.context == node.context
+                        && family.accounts.contains(&node.sibling) =>
+                {
+                    if family.targets.contains(&node.next)
+                        && record_targets.get(&node.next) == Some(&1)
+                    {
+                        BillCarrierLink::Monetary
+                    } else if nodes.get(&node.next).is_some_and(|next| {
+                        next.master == node.master
+                            && next.sibling == node.sibling
+                            && next.context == node.context
+                    }) {
+                        BillCarrierLink::Carrier(node.next)
+                    } else {
+                        BillCarrierLink::Invalid
+                    }
+                }
+                _ => BillCarrierLink::Invalid,
+            };
+            (target, link)
+        })
+        .collect::<BTreeMap<_, _>>();
+    // Each family and link is checked once. Iterative path memoization shares
+    // already checked suffixes and bounds long-chain work to O(N log N).
+    let mut classified = BTreeMap::<u32, bool>::new();
+    for &start in links.keys() {
+        let mut path = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut current = start;
+        let valid = loop {
+            if let Some(&known) = classified.get(&current) {
+                break known;
+            }
+            if !visited.insert(current) {
+                break false;
+            }
+            path.push(current);
+            match links.get(&current) {
+                Some(BillCarrierLink::Monetary) => break true,
+                Some(BillCarrierLink::Carrier(next)) => current = *next,
+                _ => break false,
+            }
+        };
+        for target in path {
+            classified.insert(target, valid);
+        }
+    }
+    classified
+        .into_iter()
+        .filter_map(|(target, valid)| valid.then_some(target))
+        .collect()
+}
+
+#[cfg(test)]
 fn is_attested_bill_nonposting_carrier(
     carrier: &Enterprise24PartialRecordCandidate,
     records: &[Enterprise24PartialRecord],
@@ -935,103 +1107,9 @@ fn is_attested_bill_nonposting_carrier(
     headers: &BTreeSet<u32>,
     carriers: &[Enterprise24PartialRecordCandidate],
 ) -> bool {
-    let Some((target, master, mut next, sibling)) =
-        bill_nonposting_carrier_identity(carrier, schema)
-    else {
-        return false;
-    };
-    let (Ok(Some(date)), Ok(Some(view))) = (
-        prefix_value_by_column_name(schema, &carrier.partial, "transaction_date"),
-        prefix_value_by_column_name(schema, &carrier.partial, "transaction_view_type"),
-    ) else {
-        return false;
-    };
-    if !headers.contains(&master)
-        || records
-            .iter()
-            .any(|record| named_u32(schema, &record.partial, "target_id") == Some(target))
-    {
-        return false;
-    }
-    let family = records
-        .iter()
-        .filter(|record| named_u32(schema, &record.partial, "transaction_id") == Some(master))
-        .collect::<Vec<_>>();
-    if family.len() < 2
-        || family.iter().any(|record| {
-            prefix_value_by_column_name(schema, &record.partial, "transaction_date")
-                .ok()
-                .flatten()
-                != Some(date)
-                || prefix_value_by_column_name(schema, &record.partial, "transaction_view_type")
-                    .ok()
-                    .flatten()
-                    != Some(view)
-        })
-    {
-        return false;
-    }
-    let mut accounts = BTreeSet::new();
-    let mut targets = BTreeSet::new();
-    let mut balance = 0_i128;
-    for record in family {
-        let Ok(posting) = MaterializedBillPostingRow::parse(&record.bytes) else {
-            return false;
-        };
-        if posting.has_canonical_zero_amount() || !targets.insert(posting.target_record_number()) {
-            return false;
-        }
-        accounts.insert(posting.account_record_number());
-        balance += i128::from(posting.signed_cents());
-    }
-    if accounts.len() < 2 || !accounts.contains(&sibling) || balance != 0 {
-        return false;
-    }
-    // A split/link carrier has no account or amount. Its counted presence is
-    // proven by a bounded, acyclic path to one retained monetary line of the
-    // same balanced, header-witnessed master, not by an example's row count.
-    let mut visited = BTreeSet::from([target]);
-    loop {
-        if !visited.insert(next) {
-            return false;
-        }
-        if targets.contains(&next) {
-            return records
-                .iter()
-                .filter(|record| named_u32(schema, &record.partial, "target_id") == Some(next))
-                .count()
-                == 1;
-        }
-        let matches = carriers
-            .iter()
-            .filter(|candidate| named_u32(schema, &candidate.partial, "target_id") == Some(next))
-            .collect::<Vec<_>>();
-        let [candidate] = matches.as_slice() else {
-            return false;
-        };
-        let Some((_, candidate_master, candidate_next, candidate_sibling)) =
-            bill_nonposting_carrier_identity(candidate, schema)
-        else {
-            return false;
-        };
-        if candidate_master != master
-            || candidate_sibling != sibling
-            || prefix_value_by_column_name(schema, &candidate.partial, "transaction_date")
-                .ok()
-                .flatten()
-                != Some(date)
-            || prefix_value_by_column_name(schema, &candidate.partial, "transaction_view_type")
-                .ok()
-                .flatten()
-                != Some(view)
-            || records
-                .iter()
-                .any(|record| named_u32(schema, &record.partial, "target_id") == Some(next))
-        {
-            return false;
-        }
-        next = candidate_next;
-    }
+    named_u32(schema, &carrier.partial, "target_id").is_some_and(|target| {
+        attested_bill_carrier_targets(carriers, records, schema, headers).contains(&target)
+    })
 }
 
 fn empty_physical_partial(bytes: &[u8]) -> PartialDecodedRow {
@@ -4944,6 +5022,53 @@ mod tests {
         records[1].partial.boolean_values.clear();
         assert!(bill_lifecycle_states(&records, Some(&schema)).is_err());
         assert!(bill_lifecycle_states(&records, None).is_err());
+    }
+
+    #[test]
+    fn bill_long_chain_reuses_checked_paths_and_rejects_a_long_cycle() {
+        let schema = bill_carrier_schema();
+        let headers = BTreeSet::from([100]);
+        let records = [&[1, 0xbf, 1][..], &[1, 0x3f, 1][..]]
+            .into_iter()
+            .enumerate()
+            .map(|(i, amount)| {
+                let target = 101 + i as u32;
+                let account = 7 + i as u32;
+                let mut row = bill_family_record(target, account, amount);
+                row.partial =
+                    bill_carrier_partial(target, 100, Some(account), None, None, Value::Integer(1));
+                row
+            })
+            .collect::<Vec<_>>();
+        let mut carriers = (200..4296)
+            .map(|target| {
+                let mut bytes = vec![0; 16];
+                bytes[..2].copy_from_slice(&16_u16.to_le_bytes());
+                bytes[2..5].copy_from_slice(&[0x40, 0x02, 0x64]);
+                Enterprise24PartialRecordCandidate {
+                    bytes,
+                    partial: bill_carrier_partial(
+                        target,
+                        100,
+                        None,
+                        Some(if target == 4295 { 101 } else { target + 1 }),
+                        Some(7),
+                        Value::Null,
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attested_bill_carrier_targets(&carriers, &records, &schema, &headers),
+            (200..4296).collect()
+        );
+        carriers.reverse();
+        assert_eq!(
+            attested_bill_carrier_targets(&carriers, &records, &schema, &headers).len(),
+            4096
+        );
+        carriers[0].partial.prefix_values[5].value = Value::Integer(200);
+        assert!(attested_bill_carrier_targets(&carriers, &records, &schema, &headers).is_empty());
     }
 
     #[test]
