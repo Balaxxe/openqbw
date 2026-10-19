@@ -1,5 +1,5 @@
 //! Exact, line-level reconciliation of a native QuickBooks Desktop General
-//! //! Ledger CSV with the normalized direct-QBW ledger.
+//! Ledger CSV with the normalized direct-QBW ledger.
 //!
 //! QuickBooks Desktop presents a General Ledger as account sections with
 //! running balances.  The balance column is presentation state, not a posting
@@ -31,10 +31,9 @@ pub struct GeneralLedgerPostingIdentity {
     pub signed_cents: i64,
 }
 
-/// A native QuickBooks Desktop GL row.  `transaction_type` and
-/// `transaction_number` are retained for future strict semantic matching, but
-/// are not silently included in the identity until the direct table decoders
-/// prove corresponding fields.
+/// A native QuickBooks Desktop GL row. Transaction types participate in
+/// comparison when both inputs provide a type for every posting. Document
+/// numbers are retained for account resolution but are not compared.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeGeneralLedgerPosting {
     pub identity: GeneralLedgerPostingIdentity,
@@ -54,8 +53,13 @@ pub struct ParsedNativeGeneralLedger {
 /// general-ledger --format csv`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedGeneralLedger {
-    pub postings: Vec<GeneralLedgerPostingIdentity>,
-    pub transaction_type_complete: bool,
+    pub postings: Vec<GeneratedGeneralLedgerPosting>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedGeneralLedgerPosting {
+    pub identity: GeneralLedgerPostingIdentity,
+    pub transaction_type: Option<String>,
 }
 
 /// Parses the public generated GL serialization before reconciliation.  This
@@ -70,7 +74,6 @@ pub fn parse_generated_general_ledger_csv(
     let rows = parse_csv_records(&text).map_err(|_| GeneralLedgerError::InvalidCsv)?;
     let header = find_generated_header(&rows)?;
     let mut postings = Vec::new();
-    let mut transaction_type_complete = true;
     for row in rows.iter().skip(header.data_start) {
         let account = cell(row, header.account).trim();
         let posting_day = cell(row, header.posting_day).trim();
@@ -96,22 +99,19 @@ pub fn parse_generated_general_ledger_csv(
         if signed_cents == 0 {
             return Err(GeneralLedgerError::GeneratedZeroMovement);
         }
-        if cell(row, header.transaction_type).trim().is_empty() {
-            transaction_type_complete = false;
-        }
-        postings.push(GeneralLedgerPostingIdentity {
-            date,
-            account_full_name: canonical_native_account_full_name(account),
-            signed_cents,
+        postings.push(GeneratedGeneralLedgerPosting {
+            identity: GeneralLedgerPostingIdentity {
+                date,
+                account_full_name: canonical_native_account_full_name(account),
+                signed_cents,
+            },
+            transaction_type: nonempty(cell(row, header.transaction_type)),
         });
     }
     if postings.is_empty() {
         return Err(GeneralLedgerError::NoPostingRows);
     }
-    Ok(GeneratedGeneralLedger {
-        postings,
-        transaction_type_complete,
-    })
+    Ok(GeneratedGeneralLedger { postings })
 }
 
 /// Aggregate-only outcome of a deterministic posting multiset comparison.
@@ -130,10 +130,10 @@ pub struct GeneralLedgerReconciliation {
     pub shared_account_identities: usize,
     pub native_only_account_identities: usize,
     pub generated_only_account_identities: usize,
-    /// Semantic columns present in native Desktop GL but not yet established
-    /// by the direct QBW posting contract.  A caller can therefore distinguish
-    /// a line-level amount/account/date PASS from a future TxnID-grade proof.
-    pub unavailable_semantic_fields: Vec<&'static str>,
+    /// Fields actually included in the multiplicity-preserving comparison.
+    pub compared_fields: Vec<&'static str>,
+    /// Fields excluded from comparison, independently of their availability.
+    pub not_compared_fields: Vec<&'static str>,
 }
 
 impl GeneralLedgerReconciliation {
@@ -143,7 +143,7 @@ impl GeneralLedgerReconciliation {
 
     pub fn status_line(&self) -> &'static str {
         if self.passes_posting_multiset() {
-            "PASS: native and direct-QBW General Ledger posting multisets reconcile exactly"
+            "PASS: native and direct-QBW General Ledger posting multisets match on the compared fields"
         } else {
             "FAIL: native and direct-QBW General Ledger posting multisets differ"
         }
@@ -245,13 +245,35 @@ pub fn parse_quickbooks_general_ledger_csv(
 /// same-account amounts.  This is deliberately not a totals comparison.
 pub fn reconcile_general_ledger_postings(
     native: &[NativeGeneralLedgerPosting],
-    generated: impl IntoIterator<Item = GeneralLedgerPostingIdentity>,
-    direct_has_transaction_type: bool,
-    direct_has_transaction_number: bool,
+    generated: impl IntoIterator<Item = GeneratedGeneralLedgerPosting>,
 ) -> GeneralLedgerReconciliation {
     let generated = generated.into_iter().collect::<Vec<_>>();
-    let mut native_counts = multiset(native.iter().map(|row| row.identity.clone()));
-    let mut generated_counts = multiset(generated.iter().cloned());
+    let has_type = |value: Option<&str>| value.is_some_and(|value| !value.trim().is_empty());
+    let compare_types = !native.is_empty()
+        && !generated.is_empty()
+        && native
+            .iter()
+            .all(|row| has_type(row.transaction_type.as_deref()))
+        && generated
+            .iter()
+            .all(|row| has_type(row.transaction_type.as_deref()));
+    let key = |identity: &GeneralLedgerPostingIdentity, kind: Option<&str>| {
+        (
+            identity.clone(),
+            compare_types
+                .then(|| normalized_comparison_type(kind.expect("complete types checked"))),
+        )
+    };
+    let mut native_counts = multiset(
+        native
+            .iter()
+            .map(|row| key(&row.identity, row.transaction_type.as_deref())),
+    );
+    let mut generated_counts = multiset(
+        generated
+            .iter()
+            .map(|row| key(&row.identity, row.transaction_type.as_deref())),
+    );
     let native_postings = native.len();
     let generated_postings: usize = generated_counts.values().sum();
     let mut matching_postings = 0;
@@ -270,7 +292,9 @@ pub fn reconcile_general_ledger_postings(
         native
             .iter()
             .map(|row| (row.identity.date, row.identity.signed_cents)),
-        generated.iter().map(|row| (row.date, row.signed_cents)),
+        generated
+            .iter()
+            .map(|row| (row.identity.date, row.identity.signed_cents)),
     );
     let native_accounts = native
         .iter()
@@ -278,18 +302,19 @@ pub fn reconcile_general_ledger_postings(
         .collect::<std::collections::BTreeSet<_>>();
     let generated_accounts = generated
         .iter()
-        .map(|row| row.account_full_name.as_str())
+        .map(|row| row.identity.account_full_name.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     let shared_account_identities = native_accounts.intersection(&generated_accounts).count();
     let native_only_account_identities = native_accounts.difference(&generated_accounts).count();
     let generated_only_account_identities = generated_accounts.difference(&native_accounts).count();
-    let mut unavailable_semantic_fields = Vec::new();
-    if !direct_has_transaction_type && native.iter().any(|row| row.transaction_type.is_some()) {
-        unavailable_semantic_fields.push("transaction_type");
+    let mut compared_fields = vec!["account_full_name", "posting_day", "signed_cents"];
+    let mut not_compared_fields = Vec::new();
+    if compare_types {
+        compared_fields.push("transaction_type");
+    } else {
+        not_compared_fields.push("transaction_type");
     }
-    if !direct_has_transaction_number && native.iter().any(|row| row.transaction_number.is_some()) {
-        unavailable_semantic_fields.push("transaction_number");
-    }
+    not_compared_fields.push("transaction_number");
     GeneralLedgerReconciliation {
         native_postings,
         generated_postings,
@@ -300,7 +325,8 @@ pub fn reconcile_general_ledger_postings(
         shared_account_identities,
         native_only_account_identities,
         generated_only_account_identities,
-        unavailable_semantic_fields,
+        compared_fields,
+        not_compared_fields,
     }
 }
 
@@ -749,9 +775,21 @@ fn projection_overlap<K: Ord>(
         .sum()
 }
 
-fn multiset(
-    values: impl IntoIterator<Item = GeneralLedgerPostingIdentity>,
-) -> BTreeMap<GeneralLedgerPostingIdentity, usize> {
+fn normalized_comparison_type(value: &str) -> String {
+    let normalized = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "journal" | "general journal" => "general journal".to_owned(),
+        "vendor credit" | "credit" => "credit".to_owned(),
+        "bill payment check" | "bill pmt-check" | "bill pmt -check" => "bill pmt-check".to_owned(),
+        _ => normalized,
+    }
+}
+
+fn multiset<K: Ord>(values: impl IntoIterator<Item = K>) -> BTreeMap<K, usize> {
     let mut counts = BTreeMap::new();
     for value in values {
         *counts.entry(value).or_default() += 1;
@@ -1033,14 +1071,151 @@ mod tests {
                 transaction_number: Some("SAMPLE-2".into()),
             },
         ];
-        let result = reconcile_general_ledger_postings(&native, [identity], false, false);
+        let result = reconcile_general_ledger_postings(
+            &native,
+            [GeneratedGeneralLedgerPosting {
+                identity,
+                transaction_type: None,
+            }],
+        );
         assert!(!result.passes_posting_multiset());
         assert_eq!(result.matching_postings, 1);
         assert_eq!(result.missing_postings, 1);
         assert_eq!(
-            result.unavailable_semantic_fields,
+            result.not_compared_fields,
             ["transaction_type", "transaction_number"]
         );
+    }
+
+    #[test]
+    fn serialized_transaction_type_changes_fail_reconciliation() {
+        let native_csv =
+            b"Account,Type,Date,Num,Debit,Credit\nSAMPLE Cash,,,,,\n,Check,8/1/26,SAMPLE-1,1.00,\n";
+        let native =
+            parse_quickbooks_general_ledger_csv(native_csv, date("2026-08-01"), date("2026-08-31"))
+                .unwrap();
+        for (kind, passes) in [
+            ("Check", true),
+            ("Deposit", false),
+            ("Bill Pmt-Check", false),
+        ] {
+            let generated_csv = format!(
+                "posting_day,account_full_name,net_cents,transaction_type\n{},SAMPLE Cash,100,{kind}\n",
+                date("2026-08-01")
+            );
+            let generated = parse_generated_general_ledger_csv(
+                generated_csv.as_bytes(),
+                date("2026-08-01"),
+                date("2026-08-31"),
+            )
+            .unwrap();
+            let result = reconcile_general_ledger_postings(&native.postings, generated.postings);
+            assert_eq!(result.passes_posting_multiset(), passes);
+            assert!(result.compared_fields.contains(&"transaction_type"));
+            assert_eq!(result.not_compared_fields, ["transaction_number"]);
+        }
+    }
+
+    fn sample_comparison_row(kind: Option<&str>) -> NativeGeneralLedgerPosting {
+        NativeGeneralLedgerPosting {
+            identity: GeneralLedgerPostingIdentity {
+                date: date("2026-08-01"),
+                account_full_name: "SAMPLE Cash".into(),
+                signed_cents: 100,
+            },
+            transaction_type: kind.map(str::to_owned),
+            transaction_number: Some("SAMPLE-1".into()),
+        }
+    }
+
+    fn generated_row(native: &NativeGeneralLedgerPosting) -> GeneratedGeneralLedgerPosting {
+        GeneratedGeneralLedgerPosting {
+            identity: native.identity.clone(),
+            transaction_type: native.transaction_type.clone(),
+        }
+    }
+
+    #[test]
+    fn comparison_preserves_type_multiplicity_and_detects_date_and_amount_changes() {
+        let native = vec![
+            sample_comparison_row(Some("Check")),
+            sample_comparison_row(Some("Check")),
+            sample_comparison_row(Some("Deposit")),
+        ];
+        let mut actual = native.iter().map(generated_row).collect::<Vec<_>>();
+        actual[1].transaction_type = Some("Deposit".into());
+        let result = reconcile_general_ledger_postings(&native, actual);
+        assert_eq!(
+            (
+                result.matching_postings,
+                result.missing_postings,
+                result.extra_postings
+            ),
+            (2, 1, 1)
+        );
+        assert!(!result.passes_posting_multiset());
+        let row = sample_comparison_row(Some("Check"));
+        let mut changed_date = generated_row(&row);
+        changed_date.identity.date += 1;
+        let mut changed_amount = generated_row(&row);
+        changed_amount.identity.signed_cents += 1;
+        for actual in [changed_date, changed_amount] {
+            assert!(
+                !reconcile_general_ledger_postings(std::slice::from_ref(&row), [actual])
+                    .passes_posting_multiset()
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_types_and_document_numbers_are_explicitly_not_compared() {
+        for (native_kind, generated_kind) in [
+            (None, Some("Check")),
+            (Some("Check"), None),
+            (Some("  "), Some("Check")),
+        ] {
+            let native = sample_comparison_row(native_kind);
+            let actual = generated_row(&sample_comparison_row(generated_kind));
+            let result = reconcile_general_ledger_postings(&[native], [actual]);
+            assert!(result.passes_posting_multiset());
+            assert_eq!(
+                result.not_compared_fields,
+                ["transaction_type", "transaction_number"]
+            );
+            assert!(!result.compared_fields.contains(&"transaction_type"));
+        }
+        let mut native = sample_comparison_row(Some("Check"));
+        let actual = generated_row(&native);
+        native.transaction_number = Some("SAMPLE-CHANGED".into());
+        let result = reconcile_general_ledger_postings(&[native], [actual]);
+        assert!(result.passes_posting_multiset());
+        assert_eq!(result.not_compared_fields, ["transaction_number"]);
+    }
+
+    #[test]
+    fn comparison_type_aliases_preserve_distinct_payment_and_unknown_types() {
+        for (left, right) in [
+            (" Journal ", "General Journal"),
+            ("Vendor Credit", "Credit"),
+            ("bill payment check", "Bill Pmt-Check"),
+            ("Bill Pmt -Check", "Bill Pmt-Check"),
+            ("  GENERAL  JOURNAL ", "General Journal"),
+        ] {
+            assert_eq!(
+                normalized_comparison_type(left),
+                normalized_comparison_type(right)
+            );
+        }
+        for (left, right) in [
+            ("Bill", "Bill Pmt-Check"),
+            ("Check", "Bill Pmt-Check"),
+            ("SAMPLE-A", "SAMPLEA"),
+        ] {
+            assert_ne!(
+                normalized_comparison_type(left),
+                normalized_comparison_type(right)
+            );
+        }
     }
 
     #[test]
