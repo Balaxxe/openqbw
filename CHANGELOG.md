@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Optional `--include-zero-activity` on General Ledger exports retains
+  validated current zero-dollar lines for supported transaction families in
+  CSV, JSON and SQLite. An optional `--from` date limits this view to an
+  inclusive period. Default GL output and financial balances are unchanged.
 - Accrual Profit & Loss and Balance Sheet reports derived from the validated
   GL/TB, with inclusive period selection, explicit fiscal policy, source
   account hierarchy, separate subtotal rows, and CSV/JSON/SQLite output.

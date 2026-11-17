@@ -113,24 +113,59 @@ pub enum PostingExclusionReason {
 /// Auditable disposition of a recognized physical posting candidate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PostingExclusion {
-    provenance: crate::PostingProvenance,
-    reason: PostingExclusionReason,
+    details: PostingExclusionDetails,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PostingExclusionDetails {
+    Ordinary {
+        provenance: crate::PostingProvenance,
+        reason: PostingExclusionReason,
+    },
+    CanonicalZero(Box<crate::ZeroActivity>),
 }
 
 impl PostingExclusion {
     /// Records a proven non-posting disposition for a recognized row.
     pub fn new(provenance: crate::PostingProvenance, reason: PostingExclusionReason) -> Self {
-        Self { provenance, reason }
+        Self {
+            details: PostingExclusionDetails::Ordinary { provenance, reason },
+        }
+    }
+
+    /// Retains the account, date and identity of a validated canonical-zero line.
+    /// The decoder must establish the row's current state and complete family
+    /// before using this constructor.
+    pub fn canonical_zero(activity: crate::ZeroActivity) -> Self {
+        Self {
+            details: PostingExclusionDetails::CanonicalZero(Box::new(activity)),
+        }
+    }
+
+    /// Returns reportable zero-line details when the decoder established them.
+    pub fn zero_activity(&self) -> Option<&crate::ZeroActivity> {
+        match &self.details {
+            PostingExclusionDetails::CanonicalZero(activity) => Some(activity),
+            PostingExclusionDetails::Ordinary { .. } => None,
+        }
     }
 
     /// Returns the physical/source evidence for the handled row.
     pub fn provenance(&self) -> &crate::PostingProvenance {
-        &self.provenance
+        match &self.details {
+            PostingExclusionDetails::Ordinary { provenance, .. } => provenance,
+            PostingExclusionDetails::CanonicalZero(activity) => &activity.provenance,
+        }
     }
 
     /// Returns the closed, decoder-proven exclusion reason.
     pub const fn reason(&self) -> PostingExclusionReason {
-        self.reason
+        match &self.details {
+            PostingExclusionDetails::Ordinary { reason, .. } => *reason,
+            PostingExclusionDetails::CanonicalZero(_) => {
+                PostingExclusionReason::CanonicalZeroAmount
+            }
+        }
     }
 }
 
@@ -262,15 +297,13 @@ impl DecodedPostings {
             })
     }
 
-    /// Consumes this hand-off and returns the normalized candidates that may
-    /// enter a ledger. Explicit exclusions remain inspectable through
-    /// [`Self::dispositions`] until this conversion is requested.
-    fn into_postings(self) -> impl Iterator<Item = Posting> {
+    /// Returns validated canonical-zero activity before ledger construction.
+    pub fn zero_activity(&self) -> impl Iterator<Item = &crate::ZeroActivity> {
         self.dispositions
-            .into_iter()
+            .iter()
             .filter_map(|disposition| match disposition {
-                PostingDisposition::Posting(posting) => Some(posting),
-                PostingDisposition::Excluded(_) => None,
+                PostingDisposition::Excluded(exclusion) => exclusion.zero_activity(),
+                PostingDisposition::Posting(_) => None,
             })
     }
 }
@@ -323,9 +356,22 @@ impl LedgerAdapter {
                 postings_snapshot: postings.snapshot.0,
             });
         }
-        Ledger::new(
+        let mut monetary = Vec::new();
+        let mut zero_activity = Vec::new();
+        for disposition in postings.dispositions {
+            match disposition {
+                PostingDisposition::Posting(posting) => monetary.push(posting),
+                PostingDisposition::Excluded(exclusion) => {
+                    if let PostingExclusionDetails::CanonicalZero(activity) = exclusion.details {
+                        zero_activity.push(*activity);
+                    }
+                }
+            }
+        }
+        Ledger::new_with_zero_activity(
             accounts.accounts,
-            postings.into_postings(),
+            monetary,
+            zero_activity,
             LedgerCompleteness::Complete,
         )
         .map_err(DecoderContractError::InvalidNormalizedLedger)
@@ -471,6 +517,196 @@ mod tests {
         .unwrap();
         let ledger = LedgerAdapter::build(accounts, postings).unwrap();
         assert_eq!(ledger.general_ledger_as_of(5).unwrap().entries.len(), 2);
+    }
+
+    fn zero_activity(
+        id: &str,
+        account_id: &str,
+        date: crate::AccountingDate,
+    ) -> crate::ZeroActivity {
+        crate::ZeroActivity {
+            transaction_id: TransactionId::new("zero-transaction").unwrap(),
+            id: PostingId::new(id).unwrap(),
+            account_id: AccountId::new(account_id).unwrap(),
+            date,
+            current_state: CurrentState::Current,
+            provenance: PostingProvenance::new(
+                format!("source-{id}"),
+                Some(10),
+                Some(2),
+                "zero-test",
+            )
+            .unwrap(),
+            transaction_type: Some("Check".to_owned()),
+            memo: Some("Synthetic activity".to_owned()),
+        }
+    }
+
+    #[test]
+    fn canonical_zero_details_survive_handoff_without_changing_financial_reports() {
+        let ordinary = [
+            posting("debit", "asset", DebitCredit::Debit),
+            posting("credit", "equity", DebitCredit::Credit),
+        ];
+        let chart = [account("asset"), account("equity")];
+        let default = Ledger::new(
+            chart.clone(),
+            ordinary.clone(),
+            LedgerCompleteness::Complete,
+        )
+        .unwrap();
+        let zero = zero_activity("zero", "asset", 5);
+        let exclusion = PostingExclusion::canonical_zero(zero.clone());
+        assert_eq!(
+            exclusion.reason(),
+            PostingExclusionReason::CanonicalZeroAmount
+        );
+        assert_eq!(exclusion.zero_activity(), Some(&zero));
+        assert_eq!(exclusion.provenance(), &zero.provenance);
+        let mut dispositions = ordinary
+            .into_iter()
+            .map(PostingDisposition::from)
+            .collect::<Vec<_>>();
+        dispositions.push(exclusion.into());
+        for reason in [
+            PostingExclusionReason::SourceOrLinkRow,
+            PostingExclusionReason::DeletionTombstone,
+            PostingExclusionReason::CanonicalZeroVoidedRow,
+            PostingExclusionReason::CanonicalZeroAmount,
+        ] {
+            let provenance =
+                PostingProvenance::new(format!("metadata-{reason:?}"), None, None, "test").unwrap();
+            dispositions.push(PostingExclusion::new(provenance, reason).into());
+        }
+        let count = dispositions.len() as u64;
+        let decoded = DecodedPostings::new(
+            snapshot("s"),
+            decoder("p"),
+            dispositions,
+            CompleteCoverage::new(count, count).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded.zero_activity().collect::<Vec<_>>(), [&zero]);
+        assert_eq!(decoded.postings().count(), 2);
+        let accounts = DecodedAccounts::new(
+            snapshot("s"),
+            decoder("a"),
+            chart,
+            CompleteCoverage::new(2, 2).unwrap(),
+        )
+        .unwrap();
+        let ledger = LedgerAdapter::build(accounts, decoded).unwrap();
+        assert_eq!(ledger.postings().count(), 2);
+        assert_eq!(ledger.zero_activity().collect::<Vec<_>>(), [&zero]);
+        assert_eq!(
+            ledger.general_ledger_as_of(5).unwrap(),
+            default.general_ledger_as_of(5).unwrap()
+        );
+        assert_eq!(
+            ledger
+                .trial_balance_as_of(5, crate::TrialBalanceOptions::default())
+                .unwrap(),
+            default
+                .trial_balance_as_of(5, crate::TrialBalanceOptions::default())
+                .unwrap()
+        );
+        assert!(ledger.zero_activity_as_of(4).unwrap().is_empty());
+        let included = ledger.zero_activity_as_of(5).unwrap();
+        assert_eq!(included.len(), 1);
+        assert_eq!(included[0].activity, zero);
+        assert_eq!(included[0].account.id.as_str(), "asset");
+    }
+
+    #[test]
+    fn optional_zero_view_checks_identities_state_and_cutoff_without_altering_default() {
+        let make_ledger = |zeros: Vec<crate::ZeroActivity>| {
+            Ledger::new_with_zero_activity(
+                [account("asset"), account("equity")],
+                [
+                    posting("debit", "asset", DebitCredit::Debit),
+                    posting("credit", "equity", DebitCredit::Credit),
+                ],
+                zeros,
+                LedgerCompleteness::Complete,
+            )
+            .unwrap()
+        };
+        let mut future = zero_activity("future", "missing", 6);
+        future.current_state = CurrentState::Ambiguous;
+        let ambiguous_only = make_ledger(vec![future.clone()]);
+        assert!(ambiguous_only.zero_activity_as_of(5).unwrap().is_empty());
+        assert!(matches!(
+            ambiguous_only.zero_activity_as_of(6),
+            Err(AccountingError::AmbiguousCurrentState { .. })
+        ));
+        let mut superseded = zero_activity("old", "asset", 5);
+        superseded.current_state = CurrentState::Superseded;
+        let mut deleted = zero_activity("deleted", "asset", 5);
+        deleted.current_state = CurrentState::Deleted;
+        assert!(
+            make_ledger(vec![deleted.clone(), superseded.clone()])
+                .zero_activity_as_of(5)
+                .unwrap()
+                .is_empty()
+        );
+        let ledger = make_ledger(vec![
+            zero_activity("b", "equity", 5),
+            future,
+            deleted,
+            superseded,
+            zero_activity("a", "asset", 5),
+        ]);
+        assert_eq!(
+            ledger
+                .zero_activity_as_of(5)
+                .unwrap()
+                .iter()
+                .map(|entry| entry.activity.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(matches!(
+            ledger.zero_activity_as_of(6),
+            Err(AccountingError::AmbiguousCurrentState { .. })
+        ));
+        assert_eq!(ledger.general_ledger_as_of(6).unwrap().entries.len(), 2);
+        let bad_account = make_ledger(vec![zero_activity("missing", "missing", 5)]);
+        assert!(matches!(
+            bad_account.zero_activity_as_of(5),
+            Err(AccountingError::UnknownAccount { .. })
+        ));
+        assert!(bad_account.general_ledger_as_of(5).is_ok());
+        for zeros in [
+            vec![zero_activity("debit", "asset", 5)],
+            vec![
+                zero_activity("z", "asset", 5),
+                zero_activity("z", "equity", 5),
+            ],
+        ] {
+            assert!(matches!(
+                make_ledger(zeros).zero_activity_as_of(5),
+                Err(AccountingError::DuplicatePosting { .. })
+            ));
+        }
+        let mut repeated = zero_activity("other", "asset", 5);
+        repeated.provenance = zero_activity("first", "asset", 5).provenance;
+        assert!(matches!(
+            make_ledger(vec![zero_activity("first", "asset", 5), repeated]).zero_activity_as_of(5),
+            Err(AccountingError::DuplicateProvenance { .. })
+        ));
+        let incomplete = Ledger::new_with_zero_activity(
+            [account("asset")],
+            [],
+            [zero_activity("z", "asset", 5)],
+            LedgerCompleteness::Incomplete {
+                reason: "synthetic coverage gap".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            incomplete.zero_activity_as_of(5),
+            Err(AccountingError::IncompleteData { .. })
+        ));
     }
 
     #[test]

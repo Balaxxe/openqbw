@@ -358,6 +358,31 @@ $ openqbw accounting-report SAMPLE_COMPANY.qbw --report general-ledger \
     --format sqlite --out general-ledger.sqlite
 ```
 
+For a Desktop-compatible view of zero-dollar activity, add
+`--include-zero-activity` to a General Ledger export. In this mode you can
+supply an inclusive `--from` date. Without it, the report includes history
+through `--as-of`.
+
+```console
+$ openqbw accounting-report SAMPLE_COMPANY.qbw --report general-ledger \
+    --include-zero-activity --from 2026-01-01 --as-of 2026-12-31 \
+    --entity-id SAMPLE_ENTITY --source-label local-copy \
+    --generated-at 2026-12-31T00:00:00Z --snapshot-id SNAPSHOT_ID \
+    --format csv --out general-ledger-with-zero-activity.csv
+```
+
+Current, validated zero-amount Bill (including Vendor Credit), Bill Payment
+Check, Check and Deposit lines retain their account, date, transaction type
+and source identifiers. The export displays a zero debit and net, with an
+empty credit. The zero debit is a display convention. Structural links,
+deletion records and excluded non-posting or memorized transactions remain
+outside this view. A zero amount alone does not establish a void or a payment
+stub. The normalized export has the same columns as the ordinary GL and
+supplies only the transaction metadata established by the decoder.
+
+The default GL continues to show nonzero financial postings. Trial balances
+and financial statements use those postings in both workflows.
+
 Writes a new CSV, JSON, or SQLite report through a same-directory staged file;
 partial reports are never published. It refuses to overwrite the output unless
 `--force` is explicit, in which case an existing report is preserved until the
@@ -407,10 +432,12 @@ $ openqbw reconcile-qbw-general-ledger --qbw SAMPLE_COMPANY.qbw \
 Builds a direct-QBW General Ledger through `--through`, filters the inclusive
 `--from`/`--through` range, resolves native account sections against the
 complete decoded chart, and compares the dated debit/credit posting multiset.
-It exits nonzero on an unsupported decode, unresolved/ambiguous account
-section, or missing/extra movement. Transaction type and number are reported
-as unavailable rather than guessed until their physical fields are separately
-established.
+It exits nonzero on an unsupported decode, an unresolved or ambiguous account
+section, or a missing or extra movement. Transaction types are also compared
+when both inputs provide them throughout the period. Document numbers are
+outside the comparison. This monetary reconciliation reports the number of
+dated zero-movement rows in the native CSV separately. Use the optional GL
+export described above to inspect individual zero-activity rows.
 
 ### `batch-extract <INPUTS...> [--workers N]`
 
