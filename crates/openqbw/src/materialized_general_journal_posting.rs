@@ -541,7 +541,15 @@ impl MaterializedGeneralJournalPostingRow {
             );
         }
         let is_e4_prebase_variant = family == 0xe4 && link_class == 0x03;
-        if link_class != 0x13 && !(family == 0xe8 && link_class == 0x17) && !is_e4_prebase_variant {
+        let is_e0_e4_link_class_17 = matches!(
+            input.get(4..11),
+            Some([0xe0 | 0xe4, 0x97, 0xff, 0xc0, 0x60, 0x80, 0x20])
+        );
+        let supported_link = link_class == 0x13
+            || (family == 0xe8 && link_class == 0x17)
+            || is_e4_prebase_variant
+            || is_e0_e4_link_class_17;
+        if !supported_link {
             return Err(
                 MaterializedGeneralJournalProductionRowError::UnexpectedLinkMarker {
                     actual: link_marker,
@@ -568,6 +576,9 @@ impl MaterializedGeneralJournalPostingRow {
         // metadata rather than rejecting an otherwise fully attested row.
         let base = PRODUCTION_AMOUNT_BASE
             + family_shift
+            // The 0x04 presence bit in the linked 0x97 map adds one
+            // four-byte fixed field before the variable amount envelope.
+            + if is_e0_e4_link_class_17 { 4 } else { 0 }
             + if linked {
                 PRODUCTION_AMOUNT_LINKED_SHIFT
             } else {
@@ -1331,6 +1342,21 @@ fn select_main_amount(
     // observed e0-linked two-token shape, the earlier token is selected by a
     // fixed discriminator even when the later candidate is also duplicated.
     let selected = match candidates.as_slice() {
+        [
+            (outer_offset, outer_len, outer_amount),
+            (inner_offset, inner_len, _),
+        ] if family == 0xe0
+            && !linked
+            && input.get(4..11) == Some(&[0xe0, 0x13, 0xff, 0xc0, 0x60, 0x80, 0x20])
+            && *outer_offset + 3 == base
+            && *inner_offset + 1 == base
+            && outer_offset + outer_len == inner_offset + inner_len =>
+        {
+            // The terminal nullable field starts at base - 3. Its digit bytes
+            // can themselves look like a shorter token with the same end.
+            // Attest the complete field before considering duplicate suffixes.
+            Some((*outer_offset, *outer_len, *outer_amount))
+        }
         [(offset, len, amount)] => Some((*offset, *len, *amount)),
         _ if copied_candidates.len() == 1 => Some(copied_candidates[0]),
         _ if candidates.len() == 2
@@ -1598,7 +1624,7 @@ fn parse_source_link(
     validate_production_header(input)?;
     let allowed = ((input.len() == 142 || input.len() == 143)
         && input.get(4..11) == Some(&[0x60, 0x93, 0xff, 0x80, 0x40, 0x00, 0x20][..]))
-        || (input.len() == 147
+        || ((input.len() == 147 || is_three_digit_source_link(input))
             && input.get(4..11) == Some(&[0x60, 0x93, 0xff, 0xc0, 0x40, 0x80, 0x20][..]))
         || (input.len() == 151
             && input.get(4..11) == Some(&[0x64, 0x93, 0xff, 0xc0, 0x40, 0x80, 0x20][..]))
@@ -1626,6 +1652,21 @@ fn parse_source_link(
         view_type: u16_at(input, SOURCE_VIEW),
         next_target_record_number,
     }))
+}
+
+/// The longer source envelope adds one byte to the counted document number.
+/// Its padded sort value, two zero amount fields and trailing framing must
+/// agree before the ordinary same-master topology validation can accept it.
+fn is_three_digit_source_link(input: &[u8]) -> bool {
+    input.len() == 148
+        && input[47] == 3
+        && input[48..51].iter().all(u8::is_ascii_digit)
+        && input[51] == 20
+        && input[52..69].iter().all(|byte| *byte == b'0')
+        && input[69..72] == input[48..51]
+        && input[97..99] == [0, 0x81]
+        && input[99] == 16
+        && input[136..144] == [0, 0, 0x80, 0x3f, 0, 0x81, 0, 0]
 }
 
 fn classify_auxiliary_link_chain(
@@ -2386,6 +2427,60 @@ mod tests {
         );
     }
 
+    fn terminal_nested_amount_row(marker: u8) -> Vec<u8> {
+        let mut row = production_row(&[]);
+        row.resize(160, 0);
+        row[..2].copy_from_slice(&160_u16.to_le_bytes());
+        row[4..11].copy_from_slice(&[0xe0, 0x13, 0xff, 0xc0, 0x60, 0x80, 0x20]);
+        // The last three bytes are also a syntactically valid amount token.
+        let amount = [3, marker, 1, 0x3f, 9];
+        row[96..101].copy_from_slice(&amount);
+        row[140..145].copy_from_slice(&amount);
+        row
+    }
+
+    #[test]
+    fn terminal_nested_amount_uses_the_complete_count_prefixed_field() {
+        for (marker, expected) in [(0xbf, 96_301), (0x3f, -96_301)] {
+            let row = terminal_nested_amount_row(marker);
+            let posting = MaterializedGeneralJournalPostingRow::parse(&row).unwrap();
+            assert_eq!(posting.signed_cents(), expected);
+            assert_eq!(
+                posting.amount_position(),
+                MaterializedGeneralJournalAmountPosition::MainPrebase
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_nested_amount_requires_the_complete_copy_and_bounded_shape() {
+        let row = terminal_nested_amount_row(0x3f);
+        let mut suffix_copy_only = row.clone();
+        suffix_copy_only[140] = 0;
+        assert!(matches!(
+            MaterializedGeneralJournalPostingRow::parse(&suffix_copy_only),
+            Err(MaterializedGeneralJournalProductionRowError::MissingAmountCopy)
+        ));
+
+        let mut unsupported_prefix = row.clone();
+        unsupported_prefix[7] ^= 1;
+        assert!(matches!(
+            MaterializedGeneralJournalPostingRow::parse(&unsupported_prefix),
+            Err(MaterializedGeneralJournalProductionRowError::AmbiguousAmountToken { .. })
+        ));
+
+        let mut different_end = row;
+        // Separate complete copies support both candidates, so an overlapping
+        // token extending outside the earlier field must remain ambiguous.
+        different_end[96..101].copy_from_slice(&[2, 0x3f, 1, 0x3f, 9]);
+        different_end[140..144].copy_from_slice(&[2, 0x3f, 1, 0x3f]);
+        different_end[150..153].copy_from_slice(&[1, 0x3f, 9]);
+        assert!(matches!(
+            MaterializedGeneralJournalPostingRow::parse(&different_end),
+            Err(MaterializedGeneralJournalProductionRowError::AmbiguousAmountToken { .. })
+        ));
+    }
+
     #[test]
     fn main_prebase_ambiguity_requires_one_uniquely_duplicated_candidate() {
         let e4_base = PRODUCTION_AMOUNT_BASE + 4 + PRODUCTION_AMOUNT_LINKED_SHIFT;
@@ -2486,6 +2581,122 @@ mod tests {
 
         row[base + 20] ^= 1;
         assert!(MaterializedGeneralJournalPostingRow::parse(&row).is_err());
+    }
+
+    fn e0_e4_link_class_17_row(family: u8, amount_offset: usize, token: &[u8]) -> Vec<u8> {
+        let mut row = production_row(&[]);
+        row.resize(192, 0);
+        row[..2].copy_from_slice(&192_u16.to_le_bytes());
+        row[4..11].copy_from_slice(&[family, 0x97, 0xff, 0xc0, 0x60, 0x80, 0x20]);
+        row[PRODUCTION_NEXT_TARGET..PRODUCTION_NEXT_TARGET + 4]
+            .copy_from_slice(&0x0100_0004_u32.to_le_bytes());
+        row[amount_offset..amount_offset + token.len()].copy_from_slice(token);
+        row[160..160 + token.len()].copy_from_slice(token);
+        row
+    }
+
+    #[test]
+    fn e0_e4_link_class_17_preserves_posting_fields_and_nullable_lifecycle() {
+        // Independently specified offsets for the two linked nullable maps.
+        for (family, amount_offset, lifecycle_offset, position) in [
+            (
+                0xe0,
+                104,
+                53,
+                MaterializedGeneralJournalAmountPosition::MainPrebase,
+            ),
+            (
+                0xe0,
+                109,
+                53,
+                MaterializedGeneralJournalAmountPosition::MainDirect,
+            ),
+            (
+                0xe4,
+                109,
+                57,
+                MaterializedGeneralJournalAmountPosition::MainPrebase,
+            ),
+            (
+                0xe4,
+                112,
+                57,
+                MaterializedGeneralJournalAmountPosition::MainDirect,
+            ),
+        ] {
+            for (marker, expected) in [(0xbf, 7), (0x3f, -7)] {
+                let mut row = e0_e4_link_class_17_row(family, amount_offset, &[1, marker, 7]);
+                let posting = MaterializedGeneralJournalPostingRow::parse(&row).unwrap();
+                assert_eq!(posting.target_record_number(), 0x0100_0001);
+                assert_eq!(posting.master_record_number(), 0x0100_0002);
+                assert_eq!(posting.account_record_number(), 0x0100_0003);
+                assert_eq!(
+                    posting.posting_date().unwrap(),
+                    crate::MaterializedPostingDate::from_ymd(2026, 8, 27).unwrap()
+                );
+                assert_eq!(posting.view_type(), 9);
+                assert_eq!(posting.next_target_record_number(), Some(0x0100_0004));
+                assert_eq!(posting.family(), family);
+                assert_eq!(posting.signed_cents(), expected);
+                assert_eq!(posting.amount_position(), position);
+                assert!(!posting.is_no_post());
+                assert!(!posting.is_memorized_transaction());
+
+                for (flags, no_post, memorized) in [([0, 1], false, true), ([1, 0], true, false)] {
+                    row[lifecycle_offset..lifecycle_offset + 2].copy_from_slice(&flags);
+                    let posting = MaterializedGeneralJournalPostingRow::parse(&row).unwrap();
+                    assert_eq!(posting.is_no_post(), no_post);
+                    assert_eq!(posting.is_memorized_transaction(), memorized);
+                }
+                row[lifecycle_offset] = 2;
+                assert_eq!(
+                    MaterializedGeneralJournalPostingRow::parse(&row),
+                    Err(MaterializedGeneralJournalProductionRowError::InvalidLifecycle)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn e0_e4_link_class_17_rejects_unattested_prefixes() {
+        for (family, amount_offset) in [(0xe0, 104), (0xe4, 108)] {
+            let row = e0_e4_link_class_17_row(family, amount_offset, &[1, 0xbf, 7]);
+            for (offset, value) in [(5, 0x17), (7, 0x80), (8, 0x40), (9, 0), (10, 0)] {
+                let mut changed = row.clone();
+                changed[offset] = value;
+                assert!(matches!(
+                    MaterializedGeneralJournalPostingRow::parse(&changed),
+                    Err(MaterializedGeneralJournalProductionRowError::UnexpectedLinkMarker { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn e0_e4_link_class_17_keeps_amount_bounds_and_duplicate_proof() {
+        for (family, amount_offset) in [(0xe0, 104), (0xe0, 109), (0xe4, 109), (0xe4, 112)] {
+            for marker in [0xbf, 0x3f] {
+                let mut row = e0_e4_link_class_17_row(family, amount_offset, &[1, marker, 7]);
+                row[162] = 8;
+                assert_eq!(
+                    MaterializedGeneralJournalPostingRow::parse(&row),
+                    Err(MaterializedGeneralJournalProductionRowError::MissingAmountCopy)
+                );
+            }
+
+            let outside = e0_e4_link_class_17_row(family, 120, &[1, 0xbf, 7]);
+            assert!(matches!(
+                MaterializedGeneralJournalPostingRow::parse(&outside),
+                Err(MaterializedGeneralJournalProductionRowError::NoBoundedAmountToken { .. })
+            ));
+
+            let zero = e0_e4_link_class_17_row(family, amount_offset, &[0, 0x81]);
+            assert_eq!(
+                MaterializedGeneralJournalPostingRow::parse(&zero),
+                Err(MaterializedGeneralJournalProductionRowError::CanonicalZeroPosting)
+            );
+            assert!(classify_materialized_general_journal_rows(&[zero]).is_err());
+        }
     }
 
     #[test]
@@ -2650,6 +2861,128 @@ mod tests {
         auxiliary[4..11].copy_from_slice(&[0xe0, 0x83, 0xff, 0xc0, 0x60, 0x80, 0x20]);
         assert_eq!(parse_special_posting(&auxiliary), Ok(None));
         assert!(special_primary_offset(&auxiliary).is_some());
+    }
+
+    #[test]
+    fn linked_class_17_accounts_for_the_additional_nullable_fixed_field() {
+        for (family, old_offset) in [(0xe0, 101), (0xe4, 105)] {
+            for token in [[2, 0xbf, 23, 4], [2, 0x3f, 23, 4]] {
+                let mut previous = e0_e4_link_class_17_row(family, old_offset, &token);
+                previous[5] = 0x93;
+                let original = MaterializedGeneralJournalPostingRow::parse(&previous).unwrap();
+                let mut extended = previous.clone();
+                extended.splice(41..41, [0, 0, 0, 0]);
+                extended[5] = 0x97;
+                let len = extended.len() as u16;
+                extended[..2].copy_from_slice(&len.to_le_bytes());
+                let actual = MaterializedGeneralJournalPostingRow::parse(&extended).unwrap();
+                assert_eq!(actual.signed_cents(), original.signed_cents());
+                assert_eq!(
+                    actual.target_record_number(),
+                    original.target_record_number()
+                );
+                assert_eq!(
+                    actual.master_record_number(),
+                    original.master_record_number()
+                );
+                assert_eq!(
+                    actual.account_record_number(),
+                    original.account_record_number()
+                );
+                assert_eq!(
+                    actual.posting_date().unwrap(),
+                    original.posting_date().unwrap()
+                );
+
+                extended[164 + 2] ^= 1;
+                assert!(MaterializedGeneralJournalPostingRow::parse(&extended).is_err());
+            }
+        }
+    }
+
+    fn three_digit_production_source(next: u32) -> Vec<u8> {
+        let mut source = production_source(0x0100_0100, next);
+        source.resize(148, 0);
+        source[..2].copy_from_slice(&148_u16.to_le_bytes());
+        source[4..11].copy_from_slice(&[0x60, 0x93, 0xff, 0xc0, 0x40, 0x80, 0x20]);
+        source[47..52].copy_from_slice(&[3, b'1', b'2', b'3', 20]);
+        source[52..69].fill(b'0');
+        source[69..72].copy_from_slice(b"123");
+        source[97..100].copy_from_slice(&[0, 0x81, 16]);
+        source[136..144].copy_from_slice(&[0, 0, 0x80, 0x3f, 0, 0x81, 0, 0]);
+        source
+    }
+
+    #[test]
+    fn three_digit_source_link_requires_counted_fields_and_zero_amount_framing() {
+        let source = three_digit_production_source(0);
+        assert!(parse_source_link(&source).unwrap().is_some());
+        for (offset, value) in [
+            (47, 2),
+            (48, b'x'),
+            (51, 19),
+            (52, b'1'),
+            (71, b'4'),
+            (97, 1),
+            (98, 0xbf),
+            (99, 15),
+            (138, 0),
+            (140, 1),
+            (141, 0xbf),
+        ] {
+            let mut changed = source.clone();
+            changed[offset] = value;
+            assert!(parse_source_link(&changed).unwrap().is_none());
+        }
+        let mut extra = source.clone();
+        extra.push(0);
+        extra[..2].copy_from_slice(&149_u16.to_le_bytes());
+        assert!(parse_source_link(&extra).unwrap().is_none());
+        let mut wrong_prefix = source;
+        wrong_prefix[4] = 0x64;
+        assert!(parse_source_link(&wrong_prefix).unwrap().is_none());
+    }
+
+    #[test]
+    fn three_digit_source_link_retains_same_master_and_unique_terminal_checks() {
+        for next in [0, 0x0100_0001] {
+            let source = three_digit_production_source(next);
+            let posting = production_row(&[1, 0xbf, 7]);
+            let result =
+                classify_materialized_general_journal_rows(&[posting.clone(), source.clone()])
+                    .unwrap();
+            assert!(matches!(
+                result[1],
+                MaterializedGeneralJournalDisposition::SourceOrLink(_)
+            ));
+            assert!(
+                classify_materialized_general_journal_rows(std::slice::from_ref(&source)).is_err()
+            );
+
+            let mut wrong_master = source.clone();
+            wrong_master[SOURCE_MASTER..SOURCE_MASTER + 4].copy_from_slice(&7_u32.to_le_bytes());
+            assert!(
+                classify_materialized_general_journal_rows(&[posting.clone(), wrong_master])
+                    .is_err()
+            );
+
+            let mut wrong_date = source.clone();
+            let other_date = crate::MaterializedPostingDate::from_ymd(2026, 8, 28).unwrap();
+            wrong_date[SOURCE_DATE..SOURCE_DATE + 4]
+                .copy_from_slice(&other_date.raw_bits().to_le_bytes());
+            assert!(classify_materialized_general_journal_rows(&[posting, wrong_date]).is_err());
+        }
+        let mut second = production_row(&[1, 0x3f, 7]);
+        second[PRODUCTION_TARGET..PRODUCTION_TARGET + 4]
+            .copy_from_slice(&0x0100_0004_u32.to_le_bytes());
+        assert!(
+            classify_materialized_general_journal_rows(&[
+                production_row(&[1, 0xbf, 7]),
+                second,
+                three_digit_production_source(0),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

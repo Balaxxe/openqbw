@@ -306,7 +306,8 @@ impl Enterprise24PartialTableCoverage {
             && (self.logical_non_row_carriers == 0
                 || self.table_id == Enterprise24AccountingTable::BillLine.id())
             && (self.certified_empty_surplus_page_groups == 0
-                || (self.table_id == Enterprise24AccountingTable::GeneralJournalLine.id()
+                || ((self.table_id == Enterprise24AccountingTable::GeneralJournalLine.id()
+                    || self.table_id == Enterprise24AccountingTable::CheckLine.id())
                     && self.certified_empty_surplus_page_groups == 1
                     && self.resolved_records > 0))
             && self.expected_table_pages.is_none_or(|primary| {
@@ -690,8 +691,8 @@ fn collect_bill_table_rows(
 
 /// Collects Bill lines with the complete Bill schema and consensus-resolved
 /// table-3040 master witnesses. This additionally recognizes the narrow
-/// non-posting kind-64 split/link carrier chain; it never adapts a carrier into a
-/// posting or monetary amount.
+/// non-posting kind-64 split/link carrier chain and terminal carriers for a
+/// proven canonical-zero source/split pair. Carriers never become postings.
 pub fn collect_enterprise24_bill_table_rows_with_context(
     scan: &EnterpriseTableScan,
     schema: &RowSchema,
@@ -784,7 +785,11 @@ pub fn collect_enterprise24_bill_table_rows_with_context(
                     bytes: first.bytes,
                     partial: first.partial,
                 });
-            } else if is_bill_kind64_framing(&first.bytes) {
+            } else if parsed.iter().all(Result::is_err)
+                && decoded
+                    .iter()
+                    .all(|candidate| is_bill_kind64_framing(&candidate.bytes))
+            {
                 pending_carriers.push(first);
             } else {
                 coverage.decode_failures += 1;
@@ -978,6 +983,80 @@ struct BillCarrierNode {
     context: (Value, Value),
 }
 
+/// A terminal carrier can close a source/split pair whose amounts are both
+/// canonical zero. The directed links and reciprocal account references prove
+/// its role independently of the zero family balance.
+fn is_bill_zero_terminal_carrier(
+    carrier: &Enterprise24PartialRecordCandidate,
+    family: &[&Enterprise24PartialRecord],
+    schema: &RowSchema,
+) -> bool {
+    let [first, second] = family else {
+        return false;
+    };
+    let amount_is_empty = match prefix_value_by_column_name(schema, &carrier.partial, "amount_amt")
+    {
+        Ok(Some(Value::Null)) => true,
+        Ok(Some(Value::EnterpriseNumeric(token))) => {
+            token.marker == 0x81 && token.digits.is_empty()
+        }
+        _ => false,
+    };
+    if !is_bill_kind64_framing(&carrier.bytes)
+        || !amount_is_empty
+        || !named_null(schema, &carrier.partial, "account_id")
+        || !named_null(schema, &carrier.partial, "next_target_id")
+        || named_bool(schema, &carrier.partial, "is_source_bool") != Some(false)
+    {
+        return false;
+    }
+    let Some(context) = bill_carrier_context(schema, &carrier.partial) else {
+        return false;
+    };
+    for partial in family
+        .iter()
+        .map(|record| &record.partial)
+        .chain(std::iter::once(&carrier.partial))
+    {
+        if bill_carrier_context(schema, partial).as_ref() != Some(&context)
+            || named_bool(schema, partial, "is_no_post_bool") != Some(false)
+            || named_bool(schema, partial, "is_memorized_transaction_bool") != Some(false)
+            || named_bool(schema, partial, "is_split_bool") != Some(true)
+            || named_bool(schema, partial, "is_arap_bool") != Some(true)
+        {
+            return false;
+        }
+    }
+    let (source, split) = match (
+        named_bool(schema, &first.partial, "is_source_bool"),
+        named_bool(schema, &second.partial, "is_source_bool"),
+    ) {
+        (Some(true), Some(false)) => (first, second),
+        (Some(false), Some(true)) => (second, first),
+        _ => return false,
+    };
+    let (Ok(source_row), Ok(split_row)) = (
+        MaterializedBillPostingRow::parse(&source.bytes),
+        MaterializedBillPostingRow::parse(&split.bytes),
+    ) else {
+        return false;
+    };
+    source_row.has_canonical_zero_amount()
+        && split_row.has_canonical_zero_amount()
+        && source_row.account_record_number() != split_row.account_record_number()
+        && source_row.target_record_number() != split_row.target_record_number()
+        && named_u32(schema, &source.partial, "next_target_id")
+            == Some(split_row.target_record_number())
+        && named_u32(schema, &split.partial, "next_target_id")
+            == named_u32(schema, &carrier.partial, "target_id")
+        && named_u32(schema, &source.partial, "sibling_account_id")
+            == Some(split_row.account_record_number())
+        && named_u32(schema, &split.partial, "sibling_account_id")
+            == Some(source_row.account_record_number())
+        && named_u32(schema, &carrier.partial, "sibling_account_id")
+            == Some(source_row.account_record_number())
+}
+
 enum BillCarrierLink {
     Monetary,
     Carrier(u32),
@@ -1004,17 +1083,21 @@ fn attested_bill_carrier_targets(
         }
     }
     let families = by_master
-        .into_iter()
-        .filter_map(|(master, family)| {
+        .iter()
+        .filter_map(|(&master, family)| {
             headers
                 .contains(&master)
-                .then(|| attested_bill_carrier_family(&family, schema))
+                .then(|| attested_bill_carrier_family(family, schema))
                 .flatten()
                 .map(|family| (master, family))
         })
         .collect::<BTreeMap<_, _>>();
     let mut indexed = BTreeMap::<u32, Option<&Enterprise24PartialRecordCandidate>>::new();
+    let mut carrier_counts = BTreeMap::<u32, usize>::new();
     for carrier in carriers {
+        if let Some(master) = named_u32(schema, &carrier.partial, "transaction_id") {
+            *carrier_counts.entry(master).or_default() += 1;
+        }
         if let Some(target) = named_u32(schema, &carrier.partial, "target_id") {
             indexed
                 .entry(target)
@@ -1022,14 +1105,28 @@ fn attested_bill_carrier_targets(
                 .or_insert(Some(carrier));
         }
     }
+    let mut terminal_targets = BTreeSet::new();
     let nodes = indexed
         .into_iter()
         .filter_map(|(target, carrier)| {
             let carrier = carrier?;
-            let (_, master, next, sibling) = bill_nonposting_carrier_identity(carrier, schema)?;
             if record_targets.contains_key(&target) {
                 return None;
             }
+            let master = named_u32(schema, &carrier.partial, "transaction_id")?;
+            if headers.contains(&master)
+                && carrier_counts.get(&master) == Some(&1)
+                && by_master.get(&master).is_some_and(|family| {
+                    family.iter().all(|record| {
+                        named_u32(schema, &record.partial, "target_id")
+                            .is_some_and(|id| record_targets.get(&id) == Some(&1))
+                    }) && is_bill_zero_terminal_carrier(carrier, family, schema)
+                })
+            {
+                terminal_targets.insert(target);
+                return None;
+            }
+            let (_, master, next, sibling) = bill_nonposting_carrier_identity(carrier, schema)?;
             Some((
                 target,
                 BillCarrierNode {
@@ -1096,6 +1193,7 @@ fn attested_bill_carrier_targets(
     classified
         .into_iter()
         .filter_map(|(target, valid)| valid.then_some(target))
+        .chain(terminal_targets)
         .collect()
 }
 
@@ -1224,12 +1322,21 @@ pub fn collect_enterprise24_check_prefix_table_rows(
         ..Enterprise24PartialTableCoverage::default()
     };
     let mut records = Vec::new();
+    let mut empty_groups = 0_u64;
     for group in &scan.candidate_groups {
+        if group.candidates.is_empty() {
+            coverage.unresolved_records += 1;
+            continue;
+        }
         let record_counts: Vec<_> = group
             .candidates
             .iter()
             .map(|candidate| candidate.table_page().record_count())
             .collect();
+        if record_counts.iter().all(|&count| count == 0) {
+            empty_groups += 1;
+            continue;
+        }
         let directory =
             candidate_directory_consensus(&record_counts, |candidate_index, record_id| {
                 group.candidates[candidate_index]
@@ -1306,6 +1413,21 @@ pub fn collect_enterprise24_check_prefix_table_rows(
                 partial: first.partial,
             });
         }
+    }
+    // A unanimously empty directory contributes no logical rows. Keep its
+    // observed page count and certify only one surplus, with every expected
+    // row resolved on exactly the catalogued number of nonempty pages.
+    let expected_pages =
+        u64::from(expectation.table_pages) + u64::from(expectation.external_table_pages);
+    if empty_groups == 1
+        && coverage.candidate_page_groups == expected_pages + empty_groups
+        && coverage.resolved_records > 0
+        && coverage.resolved_records == expectation.logical_records
+        && coverage.unresolved_records == 0
+        && coverage.decode_failures == 0
+        && coverage.candidate_directory_disagreements == 0
+    {
+        coverage.certified_empty_surplus_page_groups = 1;
     }
     Ok(Enterprise24PartialTableRows {
         policy,
@@ -4995,6 +5117,281 @@ mod tests {
     }
 
     #[test]
+    fn bill_zero_terminal_requires_the_complete_reciprocal_source_split_chain() {
+        let schema = bill_carrier_schema();
+        let headers = BTreeSet::from([100]);
+        let mut source = bill_family_record(101, 7, &[0, 0x81]);
+        source.partial =
+            bill_carrier_partial(101, 100, Some(7), Some(102), Some(8), Value::Integer(0));
+        source.partial.boolean_values[0].value = Value::Boolean(true);
+        let mut split = bill_family_record(102, 8, &[0, 0x81]);
+        split.partial =
+            bill_carrier_partial(102, 100, Some(8), Some(200), Some(7), Value::Integer(0));
+        let records = vec![source, split];
+        let mut bytes = vec![0; 16];
+        bytes[..2].copy_from_slice(&16_u16.to_le_bytes());
+        bytes[2..5].copy_from_slice(&[0x40, 0x02, 0x64]);
+        let carrier = Enterprise24PartialRecordCandidate {
+            bytes,
+            partial: bill_carrier_partial(200, 100, None, None, Some(7), Value::Null),
+        };
+        let accepts = |candidate: &Enterprise24PartialRecordCandidate,
+                       family: &[Enterprise24PartialRecord]| {
+            is_attested_bill_nonposting_carrier(
+                candidate,
+                family,
+                &schema,
+                &headers,
+                std::slice::from_ref(candidate),
+            )
+        };
+        assert!(accepts(&carrier, &records));
+        assert!(accepts(&carrier, &[records[1].clone(), records[0].clone()]));
+        let mut zero_amount = carrier.clone();
+        zero_amount.partial.prefix_values[7].value =
+            Value::EnterpriseNumeric(opensqlany::EnterpriseNumericToken {
+                marker: 0x81,
+                digits: Vec::new(),
+            });
+        assert!(accepts(&zero_amount, &records));
+        for (index, value) in [
+            (0, Value::Integer(101)),
+            (1, Value::Integer(999)),
+            (2, Value::Integer(7)),
+            (3, Value::Integer(78)),
+            (4, Value::Integer(12)),
+            (5, Value::Integer(101)),
+            (6, Value::Integer(8)),
+            (7, Value::Integer(0)),
+            (
+                7,
+                Value::EnterpriseNumeric(opensqlany::EnterpriseNumericToken {
+                    marker: 0x80,
+                    digits: Vec::new(),
+                }),
+            ),
+            (
+                7,
+                Value::EnterpriseNumeric(opensqlany::EnterpriseNumericToken {
+                    marker: 0x81,
+                    digits: vec![1],
+                }),
+            ),
+        ] {
+            let mut invalid = carrier.clone();
+            invalid.partial.prefix_values[index].value = value;
+            assert!(!accepts(&invalid, &records));
+        }
+        for row in 0..3 {
+            for flag in 0..5 {
+                let mut invalid_carrier = carrier.clone();
+                let mut invalid_records = records.clone();
+                let partial = if row == 2 {
+                    &mut invalid_carrier.partial
+                } else {
+                    &mut invalid_records[row].partial
+                };
+                let Value::Boolean(value) = &mut partial.boolean_values[flag].value else {
+                    panic!()
+                };
+                *value = !*value;
+                assert!(!accepts(&invalid_carrier, &invalid_records));
+            }
+        }
+        for (row, column, value) in [
+            (0, 5, Value::Integer(200)),
+            (1, 5, Value::Integer(101)),
+            (0, 6, Value::Integer(7)),
+            (1, 6, Value::Integer(8)),
+            (0, 1, Value::Integer(999)),
+            (1, 3, Value::Integer(78)),
+            (1, 4, Value::Integer(12)),
+        ] {
+            let mut invalid = records.clone();
+            invalid[row].partial.prefix_values[column].value = value;
+            assert!(!accepts(&carrier, &invalid));
+        }
+        assert!(!accepts(&carrier, &records[..1]));
+        let mut extra = records.clone();
+        extra.push(records[1].clone());
+        assert!(!accepts(&carrier, &extra));
+        for row in 0..2 {
+            let mut invalid = records.clone();
+            invalid[row].bytes =
+                bill_family_record(101 + row as u32, 7 + row as u32, &[1, 0xbf, 1]).bytes;
+            assert!(!accepts(&carrier, &invalid));
+        }
+        assert!(!is_attested_bill_nonposting_carrier(
+            &carrier,
+            &records,
+            &schema,
+            &BTreeSet::new(),
+            std::slice::from_ref(&carrier),
+        ));
+        assert!(!is_attested_bill_nonposting_carrier(
+            &carrier,
+            &records,
+            &schema,
+            &headers,
+            &[carrier.clone(), carrier.clone()],
+        ));
+        let mut another_terminal = carrier.clone();
+        another_terminal.partial.prefix_values[0].value = Value::Integer(201);
+        assert!(!is_attested_bill_nonposting_carrier(
+            &carrier,
+            &records,
+            &schema,
+            &headers,
+            &[carrier.clone(), another_terminal],
+        ));
+    }
+
+    #[test]
+    fn bill_zero_terminal_collector_requires_consensus_framing_and_exact_family() {
+        // Eight nullable-map bytes put the fixed posting identities at +12.
+        // Unused nullable fields remain absent, while the accounting fields
+        // and lifecycle flags are decoded from the generated physical bytes.
+        let mut columns = vec![
+            ColumnDef::new(1, "target_id", ColumnType::Integer, 4, false),
+            ColumnDef::new(2, "transaction_id", ColumnType::Integer, 4, false),
+            ColumnDef::new(3, "account_id", ColumnType::Integer, 4, true),
+            ColumnDef::new(4, "transaction_date", ColumnType::Date, 4, true),
+            ColumnDef::new(5, "transaction_view_type", ColumnType::SmallInt, 2, true),
+            ColumnDef::new(6, "absent_a", ColumnType::Integer, 4, true),
+            ColumnDef::new(7, "absent_b", ColumnType::Integer, 4, true),
+            ColumnDef::new(8, "is_split_bool", ColumnType::Boolean, 1, true),
+            ColumnDef::new(9, "absent_c", ColumnType::Integer, 4, true),
+            ColumnDef::new(10, "absent_d", ColumnType::Integer, 4, true),
+            ColumnDef::new(11, "next_target_id", ColumnType::Integer, 4, true),
+            ColumnDef::new(12, "sibling_account_id", ColumnType::Integer, 4, true),
+            ColumnDef::new(13, "amount_amt", ColumnType::Numeric, 20, true),
+            ColumnDef::new(14, "is_source_bool", ColumnType::Boolean, 1, false),
+            ColumnDef::new(15, "is_no_post_bool", ColumnType::Boolean, 1, false),
+            ColumnDef::new(
+                16,
+                "is_memorized_transaction_bool",
+                ColumnType::Boolean,
+                1,
+                false,
+            ),
+            ColumnDef::new(17, "is_arap_bool", ColumnType::Boolean, 1, false),
+        ];
+        columns
+            .extend((18..=70).map(|id| {
+                ColumnDef::new(id, format!("absent_{id}"), ColumnType::Integer, 4, true)
+            }));
+        let mut schema = RowSchema::new(columns);
+        schema.boolean_tail = PREFIX_TWO_U8.boolean_tail;
+        schema.numeric_layout = PREFIX_TWO_U8.numeric_layout;
+        schema.enum_layout = PREFIX_TWO_U8.enum_layout;
+        schema.variable_overflow_layout = PREFIX_TWO_U8.variable_overflow_layout;
+        schema.variable_length_layout = PREFIX_TWO_U8.variable_length_layout;
+        schema.null_bitmap_layout = PREFIX_TWO_U8.null_bitmap_layout;
+        schema.null_bitmap_coverage = PREFIX_TWO_U8.null_bitmap_coverage;
+        schema.row_prefix_layout = PREFIX_TWO_U8.row_prefix_layout;
+        assert_eq!(schema.nullable_count(), 64);
+        let make_row = |target: u32,
+                        account: Option<u32>,
+                        next: Option<u32>,
+                        sibling: u32,
+                        source: bool,
+                        amount_present: bool| {
+            let mut bytes = vec![0_u8; 64];
+            bytes[..2].copy_from_slice(&64_u16.to_le_bytes());
+            bytes[2..4].copy_from_slice(&[0x40, 0x02]);
+            bytes[4] = if account.is_some() { 0xe4 } else { 0x64 };
+            bytes[5] = 0x40
+                | if next.is_some() { 0x80 } else { 0 }
+                | if amount_present { 0x20 } else { 0 };
+            let mut fields = Vec::new();
+            fields.extend(target.to_le_bytes());
+            fields.extend(100_u32.to_le_bytes());
+            if let Some(account) = account {
+                fields.extend(account.to_le_bytes());
+            }
+            fields.extend(194_516_640_u32.to_le_bytes());
+            fields.extend(9_u16.to_le_bytes());
+            fields.push(1); // is_split_bool
+            if let Some(next) = next {
+                fields.extend(next.to_le_bytes());
+            }
+            fields.extend(sibling.to_le_bytes());
+            if amount_present {
+                fields.extend([0, 0x81]);
+            }
+            fields.extend([u8::from(source), 0, 0, 1]);
+            bytes[12..12 + fields.len()].copy_from_slice(&fields);
+            bytes[54..56].copy_from_slice(&[0, 0x81]);
+            bytes[59..64].copy_from_slice(&[0, 0, 0, 0, 0x81]);
+            bytes
+        };
+        let source = make_row(101, Some(7), Some(102), 8, true, true);
+        let split = make_row(102, Some(8), Some(200), 7, false, true);
+        let terminal = make_row(200, None, None, 7, false, false);
+        let table_id = Enterprise24AccountingTable::BillLine.id();
+        let mut scan = EnterpriseTableScan {
+            target_table_id: table_id,
+            candidate_groups: vec![accounting_coverage_page(
+                1,
+                table_id,
+                &[source.clone(), split.clone(), terminal.clone()],
+            )],
+            table_id_conflicts: Vec::new(),
+            census: crate::EnterpriseTableScanCensus::default(),
+        };
+        let expectation = Enterprise24TableCoverageExpectation {
+            logical_records: 3,
+            table_pages: 1,
+            external_table_pages: 0,
+        };
+        let collect = |scan: &EnterpriseTableScan| {
+            collect_enterprise24_bill_table_rows_with_context(
+                scan,
+                &schema,
+                &BTreeSet::from([100]),
+                expectation,
+            )
+            .unwrap()
+        };
+        let result = collect(&scan);
+        assert!(result.coverage.is_complete(), "{:?}", result.coverage);
+        assert_eq!(result.coverage.logical_non_row_carriers, 1);
+        assert_eq!(result.records.len(), 2);
+        assert_eq!(result.records[0].bytes, source);
+        assert_eq!(result.records[1].bytes, split);
+        for row in &result.records {
+            assert!(
+                MaterializedBillPostingRow::parse(&row.bytes)
+                    .unwrap()
+                    .has_canonical_zero_amount()
+            );
+        }
+        let mut broken_link = split.clone();
+        broken_link[31..35].copy_from_slice(&201_u32.to_le_bytes());
+        let invalid = accounting_coverage_page(
+            1,
+            table_id,
+            &[source.clone(), broken_link, terminal.clone()],
+        );
+        scan.candidate_groups = vec![invalid];
+        assert!(!collect(&scan).coverage.is_complete());
+        // Both candidates have equal decoded values. Their carrier framing
+        // differs in an otherwise opaque byte, so neither ordering may pass.
+        let mut suspect = terminal.clone();
+        suspect[2] = 0x41;
+        let good =
+            accounting_coverage_page(1, table_id, &[source.clone(), split.clone(), terminal]);
+        let bad = accounting_coverage_page(1, table_id, &[source, split, suspect]);
+        for (mut first, second) in [(good.clone(), bad.clone()), (bad, good)] {
+            first.candidates.extend(second.candidates);
+            scan.candidate_groups = vec![first];
+            let result = collect(&scan);
+            assert!(!result.coverage.is_complete());
+            assert_eq!(result.coverage.logical_non_row_carriers, 0);
+        }
+    }
+
+    #[test]
     fn bill_lifecycle_requires_explicit_consistent_flags_for_the_whole_master() {
         let schema = bill_carrier_schema();
         let mut records = vec![
@@ -5167,6 +5564,224 @@ mod tests {
             &[((6, 0), (17, 2))],
             is_bill
         ));
+    }
+
+    fn accounting_coverage_page(
+        page_number: u32,
+        table_id: u32,
+        records: &[Vec<u8>],
+    ) -> crate::EnterpriseTablePageCandidateGroup {
+        let mut page = [0_u8; opensqlany::MATERIALIZED_TABLE_PAGE_LEN];
+        page[..4].copy_from_slice(&page_number.to_le_bytes());
+        page[0x10] = 4;
+        page[0x18..0x1c].copy_from_slice(&table_id.to_le_bytes());
+        page[0x16..0x18].copy_from_slice(&(records.len() as u16).to_le_bytes());
+        let mut offset = 0x300_usize;
+        for (slot, record) in records.iter().enumerate() {
+            if offset % 512 + record.len() > 512 {
+                offset = offset.next_multiple_of(512);
+            }
+            let entry = 0x1c + slot * 2;
+            page[entry..entry + 2].copy_from_slice(&((offset - 0x1c) as u16).to_le_bytes());
+            page[offset..offset + record.len()].copy_from_slice(record);
+            offset += record.len();
+        }
+        let trailer: [u8; 12] = page[0xff0..0xffc].try_into().unwrap();
+        let header_06: [u8; 6] = page[0x06..0x0c].try_into().unwrap();
+        let header_0c: [u8; 4] = page[0x0c..0x10].try_into().unwrap();
+        let header_12: [u8; 2] = page[0x12..0x14].try_into().unwrap();
+        page[0x06..0x0c].copy_from_slice(&trailer[2..8]);
+        page[0x0c..0x10].copy_from_slice(&trailer[8..12]);
+        page[0x12..0x14].copy_from_slice(&trailer[0..2]);
+        page[0xff0..0xff2].copy_from_slice(&header_12);
+        page[0xff2..0xff8].copy_from_slice(&header_06);
+        page[0xff8..0xffc].copy_from_slice(&header_0c);
+        let key = 0x019f_5a00_u32 + page_number;
+        for sector in 0..8 {
+            let start = sector * 512;
+            opensqlany::permute_sector_in_place(
+                &mut page[start..start + 512],
+                0,
+                if sector == 7 { 16 } else { 0 },
+                -(key.wrapping_sub(sector as u32) as i32),
+            )
+            .unwrap();
+        }
+        let candidates = crate::materialize_enterprise_table_page_candidates_with_key(
+            &page,
+            u64::from(page_number),
+            crate::EnterprisePageTransformKey::from_high_word(0x019f),
+        )
+        .unwrap();
+        crate::EnterpriseTablePageCandidateGroup {
+            raw_page_number: u64::from(page_number),
+            candidates,
+            directory_counts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn check_empty_surplus_preserves_records_and_requires_complete_coverage() {
+        let storage = CHECK_PREFIX_ONE_DECLARED_4096_POINTER_16;
+        let mut schema = RowSchema::new(vec![
+            ColumnDef::new(1, "reserved", ColumnType::Integer, 8, false),
+            ColumnDef::new(2, "target_id", ColumnType::Integer, 4, true),
+            ColumnDef::new(3, "transaction_id", ColumnType::Integer, 4, true),
+            ColumnDef::new(4, "account_id", ColumnType::Integer, 4, true),
+            ColumnDef::new(5, "transaction_date", ColumnType::Date, 4, false),
+            ColumnDef::new(6, "transaction_view_type", ColumnType::SmallInt, 2, false),
+            ColumnDef::new(7, "source_account", ColumnType::Integer, 4, false),
+            ColumnDef::new(8, "absent_first", ColumnType::Integer, 4, true),
+            ColumnDef::new(9, "absent_second", ColumnType::Integer, 4, true),
+        ]);
+        // Explicit synthetic columns span the fixed Check envelope up to
+        // its amount at +0x53, using the same nullable map as the carrier.
+        for id in 10..=32 {
+            let width = match id {
+                10..=29 => 2,
+                30..=31 => 4,
+                _ => 1,
+            };
+            schema.columns.push(ColumnDef::new(
+                id,
+                format!("unused_{id}"),
+                ColumnType::Integer,
+                width,
+                false,
+            ));
+        }
+        schema.columns.push(ColumnDef::new(
+            33,
+            "amount_amt",
+            ColumnType::Numeric,
+            20,
+            true,
+        ));
+        schema.boolean_tail = storage.boolean_tail;
+        schema.numeric_layout = storage.numeric_layout;
+        schema.enum_layout = storage.enum_layout;
+        schema.variable_overflow_layout = storage.variable_overflow_layout;
+        schema.variable_length_layout = storage.variable_length_layout;
+        schema.null_bitmap_layout = storage.null_bitmap_layout;
+        schema.null_bitmap_coverage = storage.null_bitmap_coverage;
+        schema.row_prefix_layout = storage.row_prefix_layout;
+        let companion =
+            check_companion_record(103, 100, crate::MATERIALIZED_CHECK_VOID_COMPANION_LONG_LEN);
+        let mut monetary = check_record(101, 100, 7, [2, 0xbf, 0, 1]).bytes;
+        monetary[0x18..0x1c].copy_from_slice(&194_516_640_u32.to_le_bytes());
+        monetary[0x1c..0x1e].copy_from_slice(&3_u16.to_le_bytes());
+        let table_id = Enterprise24AccountingTable::CheckLine.id();
+        let live = accounting_coverage_page(1, table_id, &[companion.bytes, monetary]);
+        let empty = accounting_coverage_page(2, table_id, &[]);
+        let scan = EnterpriseTableScan {
+            target_table_id: Enterprise24AccountingTable::CheckLine.id(),
+            candidate_groups: vec![live.clone()],
+            table_id_conflicts: Vec::new(),
+            census: crate::EnterpriseTableScanCensus::default(),
+        };
+        let expectation = Enterprise24TableCoverageExpectation {
+            logical_records: 2,
+            table_pages: 1,
+            external_table_pages: 0,
+        };
+        let collect = |scan: &EnterpriseTableScan, expectation| {
+            collect_enterprise24_check_prefix_table_rows(scan, &schema, expectation).unwrap()
+        };
+        let ordinary = collect(&scan, expectation);
+        assert!(ordinary.coverage.is_complete(), "{:?}", ordinary.coverage);
+        assert_eq!(ordinary.coverage.certified_empty_surplus_page_groups, 0);
+        let mut surplus = scan.clone();
+        surplus.candidate_groups.push(empty.clone());
+        let certified = collect(&surplus, expectation);
+        assert!(certified.coverage.is_complete());
+        assert_eq!(certified.coverage.candidate_page_groups, 2);
+        assert_eq!(certified.coverage.expected_table_pages, Some(1));
+        assert_eq!(certified.coverage.certified_empty_surplus_page_groups, 1);
+        assert_eq!(certified.records, ordinary.records);
+        let posting = &certified.records[1];
+        assert_eq!(posting.record_id, 1);
+        let physical = MaterializedCheckPostingRow::parse(&posting.bytes).unwrap();
+        assert_eq!(physical.target_record_number(), 101);
+        assert_eq!(physical.account_record_number(), 7);
+        assert_eq!(physical.signed_cents(), 100);
+        assert_eq!(
+            prefix_value_by_column_name(&schema, &posting.partial, "target_id").unwrap(),
+            Some(&Value::Integer(101))
+        );
+        assert_eq!(
+            prefix_value_by_column_name(&schema, &posting.partial, "account_id").unwrap(),
+            Some(&Value::Integer(7))
+        );
+        assert_eq!(
+            prefix_value_by_column_name(&schema, &posting.partial, "amount_amt").unwrap(),
+            Some(&Value::EnterpriseNumeric(EnterpriseNumericToken {
+                marker: 0xbf,
+                digits: vec![0, 1],
+            }))
+        );
+
+        let mut duplicate_empty = surplus.clone();
+        duplicate_empty.candidate_groups.push(empty.clone());
+        let mut missing_live = surplus.clone();
+        missing_live.candidate_groups.remove(0);
+        let mut nonempty_surplus = scan.clone();
+        nonempty_surplus.candidate_groups.push(live.clone());
+        let mut conflicting_directory = surplus.clone();
+        conflicting_directory.candidate_groups[1]
+            .candidates
+            .extend(live.candidates);
+        let mut unavailable_candidates = surplus.clone();
+        unavailable_candidates.candidate_groups[1]
+            .candidates
+            .clear();
+        let mut malformed_row = surplus.clone();
+        malformed_row.candidate_groups[0] =
+            accounting_coverage_page(1, table_id, &[vec![4, 0, 0x40, 0]]);
+        for altered in [
+            duplicate_empty,
+            missing_live,
+            nonempty_surplus,
+            conflicting_directory,
+            unavailable_candidates,
+            malformed_row,
+        ] {
+            let rejected = collect(&altered, expectation);
+            assert!(!rejected.coverage.is_complete());
+            assert_eq!(rejected.coverage.certified_empty_surplus_page_groups, 0);
+        }
+        for altered in [
+            Enterprise24TableCoverageExpectation {
+                logical_records: 3,
+                ..expectation
+            },
+            Enterprise24TableCoverageExpectation {
+                table_pages: 3,
+                ..expectation
+            },
+        ] {
+            assert!(!collect(&surplus, altered).coverage.is_complete());
+        }
+
+        // An unavailable page cannot count as an observed nonempty page,
+        // even when all claimed rows are present on another page.
+        let mut unavailable = empty;
+        unavailable.candidates.clear();
+        let two_pages = Enterprise24TableCoverageExpectation {
+            table_pages: 2,
+            ..expectation
+        };
+        let mut exact_with_unavailable = scan;
+        exact_with_unavailable
+            .candidate_groups
+            .push(unavailable.clone());
+        let mut surplus_with_unavailable = surplus;
+        surplus_with_unavailable.candidate_groups.push(unavailable);
+        for altered in [exact_with_unavailable, surplus_with_unavailable] {
+            let rejected = collect(&altered, two_pages);
+            assert!(!rejected.coverage.is_complete());
+            assert_eq!(rejected.coverage.unresolved_records, 1);
+            assert_eq!(rejected.coverage.certified_empty_surplus_page_groups, 0);
+        }
     }
 
     #[test]

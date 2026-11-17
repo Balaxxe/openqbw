@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Check extraction accounts for one extra empty page when all catalogued
+  pages and rows are present and every candidate agrees on its directory.
+- General Journal extraction reads linked rows with an additional nullable
+  field, recognizes a counted three-digit document number on source links,
+  and verifies the full duplicated amount on a terminal row whose digits
+  also encode a shorter token.
+- Bill extraction recognizes a terminal split link with no posting account
+  when a header and a pair of reciprocal zero-amount lines establish its role.
 - Native General Ledger reconciliation retains serialized transaction types
   and compares their multiplicity when both inputs provide complete types.
   Output lists fields actually compared and fields excluded from comparison.
