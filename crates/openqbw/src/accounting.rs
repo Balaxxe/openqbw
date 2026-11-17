@@ -421,6 +421,39 @@ impl Posting {
     }
 }
 
+/// A validated current-state activity row with a canonical zero amount.
+///
+/// This record retains reportable source details without constructing a
+/// debit or credit posting. Its presence has no effect on financial balances.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZeroActivity {
+    /// Logical transaction containing this activity.
+    pub transaction_id: TransactionId,
+    /// Unique logical line identifier within the extracted snapshot.
+    pub id: PostingId,
+    /// Account under which the activity is reported.
+    pub account_id: AccountId,
+    /// Effective accounting date.
+    pub date: AccountingDate,
+    /// Whether the candidate is current, obsolete, or unresolved.
+    pub current_state: CurrentState,
+    /// Physical/source evidence for auditing and duplicate detection.
+    pub provenance: PostingProvenance,
+    /// Source transaction type, when established by the decoder.
+    pub transaction_type: Option<String>,
+    /// Source memo, when established by the decoder.
+    pub memo: Option<String>,
+}
+
+/// A zero-amount activity entry paired with its normalized account.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZeroActivityEntry {
+    /// Account under which the activity is reported.
+    pub account: Account,
+    /// Zero-amount activity and source provenance.
+    pub activity: ZeroActivity,
+}
+
 /// Whether the decoder has enough supported data for financial reporting.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LedgerCompleteness {
@@ -443,6 +476,7 @@ pub enum LedgerCompleteness {
 pub struct Ledger {
     accounts: BTreeMap<AccountId, Account>,
     postings: Vec<Posting>,
+    zero_activity: Vec<ZeroActivity>,
     completeness: LedgerCompleteness,
 }
 
@@ -452,6 +486,18 @@ impl Ledger {
     pub fn new(
         accounts: impl IntoIterator<Item = Account>,
         postings: impl IntoIterator<Item = Posting>,
+        completeness: LedgerCompleteness,
+    ) -> Result<Self, AccountingError> {
+        Self::new_with_zero_activity(accounts, postings, [], completeness)
+    }
+
+    /// Builds a ledger and retains separately decoded zero-amount activity.
+    /// Activity identities are checked when the optional view is requested,
+    /// so presentation-only ambiguity cannot alter financial reporting.
+    pub fn new_with_zero_activity(
+        accounts: impl IntoIterator<Item = Account>,
+        postings: impl IntoIterator<Item = Posting>,
+        zero_activity: impl IntoIterator<Item = ZeroActivity>,
         completeness: LedgerCompleteness,
     ) -> Result<Self, AccountingError> {
         let mut account_map = BTreeMap::new();
@@ -497,9 +543,11 @@ impl Ledger {
             }
         }
 
+        let zero_activity: Vec<_> = zero_activity.into_iter().collect();
         Ok(Self {
             accounts: account_map,
             postings,
+            zero_activity,
             completeness,
         })
     }
@@ -512,6 +560,97 @@ impl Ledger {
     /// Returns all candidates, including deleted and superseded rows.
     pub fn postings(&self) -> impl Iterator<Item = &Posting> {
         self.postings.iter()
+    }
+
+    /// Returns decoded zero-amount candidates, including their current state.
+    pub fn zero_activity(&self) -> impl Iterator<Item = &ZeroActivity> {
+        self.zero_activity.iter()
+    }
+
+    /// Returns reportable zero-amount activity through the inclusive cutoff.
+    /// Financial completeness and balance checks also apply to this view.
+    pub fn zero_activity_as_of(
+        &self,
+        as_of: AccountingDate,
+    ) -> Result<Vec<ZeroActivityEntry>, AccountingError> {
+        self.general_ledger_with_zero_activity_as_of(as_of)
+            .map(|(_, activity)| activity)
+    }
+
+    /// Produces the financial General Ledger and its optional zero activity
+    /// with one shared completeness and financial-balance check.
+    pub fn general_ledger_with_zero_activity_as_of(
+        &self,
+        as_of: AccountingDate,
+    ) -> Result<(GeneralLedger, Vec<ZeroActivityEntry>), AccountingError> {
+        let report = self.general_ledger_as_of(as_of)?;
+        if !self.zero_activity.iter().any(|activity| {
+            activity.date <= as_of
+                && matches!(
+                    activity.current_state,
+                    CurrentState::Current | CurrentState::Ambiguous
+                )
+        }) {
+            return Ok((report, Vec::new()));
+        }
+        let mut entries = Vec::new();
+        let mut posting_ids = self
+            .postings
+            .iter()
+            .map(|row| &row.id)
+            .collect::<BTreeSet<_>>();
+        let mut source_rows = self
+            .postings
+            .iter()
+            .map(|row| row.provenance.source_row.as_str())
+            .collect::<BTreeSet<_>>();
+        for activity in &self.zero_activity {
+            match activity.current_state {
+                CurrentState::Current if activity.date <= as_of => {
+                    let account = self.accounts.get(&activity.account_id).ok_or_else(|| {
+                        AccountingError::UnknownAccount {
+                            posting_id: activity.id.clone(),
+                            account_id: activity.account_id.clone(),
+                        }
+                    })?;
+                    if !posting_ids.insert(&activity.id) {
+                        return Err(AccountingError::DuplicatePosting {
+                            posting_id: activity.id.clone(),
+                        });
+                    }
+                    if !source_rows.insert(activity.provenance.source_row.as_str()) {
+                        return Err(AccountingError::DuplicateProvenance {
+                            source_row: activity.provenance.source_row.clone(),
+                        });
+                    }
+                    entries.push(ZeroActivityEntry {
+                        account: account.clone(),
+                        activity: activity.clone(),
+                    });
+                }
+                CurrentState::Ambiguous if activity.date <= as_of => {
+                    return Err(AccountingError::AmbiguousCurrentState {
+                        posting_id: activity.id.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        entries.sort_by(|left, right| {
+            (
+                left.activity.date,
+                &left.account.id,
+                &left.activity.transaction_id,
+                &left.activity.id,
+            )
+                .cmp(&(
+                    right.activity.date,
+                    &right.account.id,
+                    &right.activity.transaction_id,
+                    &right.activity.id,
+                ))
+        });
+        Ok((report, entries))
     }
 
     /// Produces a deterministic current-state General Ledger through `as_of`.

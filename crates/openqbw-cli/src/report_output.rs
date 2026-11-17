@@ -377,31 +377,61 @@ pub fn general_ledger_csv_with_account_catalog(
     metadata: &ReportMetadata,
     account_catalog: &[Account],
 ) -> Result<String, ReportOutputError> {
-    validate_general_ledger(report)?;
+    general_ledger_csv_output(report, metadata, account_catalog, &[])
+}
+
+/// Includes validated zero activity in the General Ledger presentation.
+pub fn general_ledger_csv_with_zero_activity(
+    report: &GeneralLedger,
+    metadata: &ReportMetadata,
+    account_catalog: &[Account],
+    zero_activity: &[openqbw::ZeroActivityEntry],
+) -> Result<String, ReportOutputError> {
+    if zero_activity.is_empty() {
+        return general_ledger_csv_with_account_catalog(report, metadata, account_catalog);
+    }
+    general_ledger_csv_output(report, metadata, account_catalog, zero_activity)
+}
+
+fn general_ledger_csv_output(
+    report: &GeneralLedger,
+    metadata: &ReportMetadata,
+    account_catalog: &[Account],
+    zero_activity: &[openqbw::ZeroActivityEntry],
+) -> Result<String, ReportOutputError> {
+    validate_general_ledger_output(report, zero_activity)?;
     metadata.validate()?;
     let mut out = String::from(
         "entity_id,as_of_day,posting_day,transaction_id,posting_id,account_id,account_number,account_name,account_full_name,account_display_name,parent_account_id,account_type,quickbooks_classification,active,activity,debit_cents,debit,credit_cents,credit,net_cents,net,transaction_type,memo,source_row,page_number,slot_number,decoder,source_file,parser_version,generated_at\n",
     );
     let account_full_names = account_full_names_with_catalog(
         account_catalog,
-        report.entries.iter().map(|entry| &entry.account),
+        report
+            .entries
+            .iter()
+            .map(|entry| &entry.account)
+            .chain(zero_activity.iter().map(|entry| &entry.account)),
     )?;
     let account_display_names = account_display_names_with_catalog(
         account_catalog,
-        report.entries.iter().map(|entry| &entry.account),
+        report
+            .entries
+            .iter()
+            .map(|entry| &entry.account)
+            .chain(zero_activity.iter().map(|entry| &entry.account)),
         &account_full_names,
     )?;
-    for entry in sorted_entries(report) {
+    for entry in sorted_entries(report, zero_activity) {
         let posting = &entry.posting;
         let as_of_day = report.as_of.to_string();
         let posting_day = posting.date.to_string();
-        let debit_cents = posting.debit_minor_units().map(|value| value.to_string());
-        let debit = posting.debit_minor_units().map(format_cents);
+        let debit_cents = display_debit_minor_units(posting).map(|value| value.to_string());
+        let debit = display_debit_minor_units(posting).map(format_cents);
         let credit_cents = posting.credit_minor_units().map(|value| value.to_string());
         let credit = posting.credit_minor_units().map(format_cents);
         let net_cents = posting.signed_minor_units.to_string();
         let net = format_cents(posting.signed_minor_units);
-        let account_display_name = account_display_name(&account_display_names, &entry.account)?;
+        let account_display_name = account_display_name(&account_display_names, entry.account)?;
         let page_number = posting
             .provenance
             .page_number
@@ -421,7 +451,7 @@ pub fn general_ledger_csv_with_account_catalog(
                 Some(entry.account.id.as_str()),
                 entry.account.account_number.as_deref(),
                 Some(entry.account.name.as_str()),
-                Some(account_full_name(&account_full_names, &entry.account)?),
+                Some(account_full_name(&account_full_names, entry.account)?),
                 Some(&account_display_name),
                 entry
                     .account
@@ -527,18 +557,48 @@ pub fn general_ledger_json_with_account_catalog(
     metadata: &ReportMetadata,
     account_catalog: &[Account],
 ) -> Result<String, ReportOutputError> {
-    validate_general_ledger(report)?;
+    general_ledger_json_output(report, metadata, account_catalog, &[])
+}
+
+/// Includes validated zero activity in the General Ledger presentation.
+pub fn general_ledger_json_with_zero_activity(
+    report: &GeneralLedger,
+    metadata: &ReportMetadata,
+    account_catalog: &[Account],
+    zero_activity: &[openqbw::ZeroActivityEntry],
+) -> Result<String, ReportOutputError> {
+    if zero_activity.is_empty() {
+        return general_ledger_json_with_account_catalog(report, metadata, account_catalog);
+    }
+    general_ledger_json_output(report, metadata, account_catalog, zero_activity)
+}
+
+fn general_ledger_json_output(
+    report: &GeneralLedger,
+    metadata: &ReportMetadata,
+    account_catalog: &[Account],
+    zero_activity: &[openqbw::ZeroActivityEntry],
+) -> Result<String, ReportOutputError> {
+    validate_general_ledger_output(report, zero_activity)?;
     metadata.validate()?;
     let account_full_names = account_full_names_with_catalog(
         account_catalog,
-        report.entries.iter().map(|entry| &entry.account),
+        report
+            .entries
+            .iter()
+            .map(|entry| &entry.account)
+            .chain(zero_activity.iter().map(|entry| &entry.account)),
     )?;
     let account_display_names = account_display_names_with_catalog(
         account_catalog,
-        report.entries.iter().map(|entry| &entry.account),
+        report
+            .entries
+            .iter()
+            .map(|entry| &entry.account)
+            .chain(zero_activity.iter().map(|entry| &entry.account)),
         &account_full_names,
     )?;
-    let entries = sorted_entries(report);
+    let entries = sorted_entries(report, zero_activity);
     let mut out = format!(
         "{{\"report_type\":\"general_ledger\",\"metadata\":{},\"as_of_day\":{},\"entries\":[",
         json_metadata(metadata, false),
@@ -552,7 +612,7 @@ pub fn general_ledger_json_with_account_catalog(
         out.push_str("{\"account\":");
         json_account(
             &mut out,
-            &entry.account,
+            entry.account,
             &account_full_names,
             &account_display_names,
         )?;
@@ -562,7 +622,7 @@ pub fn general_ledger_json_with_account_catalog(
         json_key_string(&mut out, "posting_id", posting.id.as_str());
         json_amounts(
             &mut out,
-            posting.debit_minor_units(),
+            display_debit_minor_units(posting),
             posting.credit_minor_units(),
             posting.signed_minor_units,
         );
@@ -611,13 +671,42 @@ pub fn write_sqlite_with_account_catalog(
     bundle: ReportBundle<'_>,
     account_catalog: &[Account],
 ) -> Result<(), ReportOutputError> {
+    write_sqlite_output(connection, metadata, bundle, account_catalog, &[])
+}
+
+/// Writes an optional zero-activity General Ledger using the same atomic schema.
+pub fn write_sqlite_with_zero_activity(
+    connection: &mut Connection,
+    metadata: &ReportMetadata,
+    bundle: ReportBundle<'_>,
+    account_catalog: &[Account],
+    zero_activity: &[openqbw::ZeroActivityEntry],
+) -> Result<(), ReportOutputError> {
+    if zero_activity.is_empty() {
+        return write_sqlite_with_account_catalog(connection, metadata, bundle, account_catalog);
+    }
+    if bundle.general_ledger.is_none() {
+        return Err(ReportOutputError::EmptyBundle);
+    }
+    write_sqlite_output(connection, metadata, bundle, account_catalog, zero_activity)
+}
+
+fn write_sqlite_output(
+    connection: &mut Connection,
+    metadata: &ReportMetadata,
+    bundle: ReportBundle<'_>,
+    account_catalog: &[Account],
+    zero_activity: &[openqbw::ZeroActivityEntry],
+) -> Result<(), ReportOutputError> {
     metadata.validate()?;
-    validate_bundle(bundle)?;
-    let account_full_names = account_full_names_for_bundle_with_catalog(bundle, account_catalog)?;
+    validate_bundle_output(bundle, zero_activity)?;
+    let account_full_names =
+        account_full_names_for_bundle_with_catalog(bundle, account_catalog, zero_activity)?;
     let account_display_names = account_display_names_for_bundle_with_catalog(
         bundle,
         account_catalog,
         &account_full_names,
+        zero_activity,
     )?;
     let transaction = connection.transaction()?;
     create_schema(&transaction)?;
@@ -637,13 +726,17 @@ pub fn write_sqlite_with_account_catalog(
             report,
             &account_full_names,
             &account_display_names,
+            zero_activity,
         )?;
     }
     transaction.commit()?;
     Ok(())
 }
 
-fn validate_bundle(bundle: ReportBundle<'_>) -> Result<(), ReportOutputError> {
+fn validate_bundle_output(
+    bundle: ReportBundle<'_>,
+    zero_activity: &[openqbw::ZeroActivityEntry],
+) -> Result<(), ReportOutputError> {
     if bundle.trial_balance.is_none() && bundle.general_ledger.is_none() {
         return Err(ReportOutputError::EmptyBundle);
     }
@@ -651,7 +744,7 @@ fn validate_bundle(bundle: ReportBundle<'_>) -> Result<(), ReportOutputError> {
         validate_trial_balance(report)?;
     }
     if let Some(report) = bundle.general_ledger {
-        validate_general_ledger(report)?;
+        validate_general_ledger_output(report, zero_activity)?;
     }
     if let (Some(trial_balance), Some(general_ledger)) =
         (bundle.trial_balance, bundle.general_ledger)
@@ -710,11 +803,14 @@ fn validate_trial_balance(report: &TrialBalance) -> Result<(), ReportOutputError
     Ok(())
 }
 
-fn validate_general_ledger(report: &GeneralLedger) -> Result<(), ReportOutputError> {
+fn validate_general_ledger_output(
+    report: &GeneralLedger,
+    zero_activity: &[openqbw::ZeroActivityEntry],
+) -> Result<(), ReportOutputError> {
     let mut posting_ids = BTreeSet::new();
     let mut source_rows = BTreeSet::new();
     let mut transaction_totals: BTreeMap<&str, i128> = BTreeMap::new();
-    for entry in &report.entries {
+    for entry in report_rows(report, zero_activity) {
         let posting = &entry.posting;
         if !posting_ids.insert(posting.id.as_str()) {
             return Err(ReportOutputError::DuplicatePostingId(
@@ -726,19 +822,19 @@ fn validate_general_ledger(report: &GeneralLedger) -> Result<(), ReportOutputErr
                 posting.provenance.source_row.clone(),
             ));
         }
-        if posting.account_id != entry.account.id {
+        if posting.account_id != &entry.account.id {
             return Err(ReportOutputError::PostingAccountMismatch {
                 posting_id: posting.id.as_str().to_owned(),
                 posting_account_id: posting.account_id.as_str().to_owned(),
                 entry_account_id: entry.account.id.as_str().to_owned(),
             });
         }
-        if posting.current_state != CurrentState::Current {
+        if posting.current_state != &CurrentState::Current {
             return Err(ReportOutputError::NonCurrentPosting {
                 posting_id: posting.id.as_str().to_owned(),
             });
         }
-        if posting.signed_minor_units == 0 {
+        if posting.signed_minor_units == 0 && !posting.zero_activity {
             return Err(ReportOutputError::ZeroPosting(
                 posting.id.as_str().to_owned(),
             ));
@@ -896,8 +992,9 @@ pub(crate) fn account_full_names_with_catalog<'a>(
 fn account_full_names_for_bundle_with_catalog(
     bundle: ReportBundle<'_>,
     account_catalog: &[Account],
+    zero_activity: &[openqbw::ZeroActivityEntry],
 ) -> Result<BTreeMap<String, String>, ReportOutputError> {
-    let mut accounts = Vec::new();
+    let mut accounts: Vec<_> = zero_activity.iter().map(|entry| &entry.account).collect();
     if let Some(report) = bundle.trial_balance {
         accounts.extend(report.rows.iter().map(|row| &row.account));
     }
@@ -922,8 +1019,9 @@ fn account_display_names_for_bundle_with_catalog(
     bundle: ReportBundle<'_>,
     account_catalog: &[Account],
     full_names: &BTreeMap<String, String>,
+    zero_activity: &[openqbw::ZeroActivityEntry],
 ) -> Result<BTreeMap<String, String>, ReportOutputError> {
-    let mut accounts = Vec::new();
+    let mut accounts: Vec<_> = zero_activity.iter().map(|entry| &entry.account).collect();
     if let Some(report) = bundle.trial_balance {
         accounts.extend(report.rows.iter().map(|row| &row.account));
     }
@@ -1172,22 +1270,23 @@ fn write_general_ledger(
     report: &GeneralLedger,
     account_full_names: &BTreeMap<String, String>,
     account_display_names: &BTreeMap<String, String>,
+    zero_activity: &[openqbw::ZeroActivityEntry],
 ) -> Result<(), ReportOutputError> {
     transaction.execute(
         "DELETE FROM general_ledger_entries WHERE entity_id=?1 AND as_of_day=?2",
         params![metadata.entity_id, report.as_of],
     )?;
     upsert_metadata(transaction, metadata, "general_ledger", report.as_of)?;
-    for entry in sorted_entries(report) {
+    for entry in sorted_entries(report, zero_activity) {
         let posting = &entry.posting;
         upsert_account(
             transaction,
             &metadata.entity_id,
-            &entry.account,
-            account_full_name(account_full_names, &entry.account)?,
-            &account_display_name(account_display_names, &entry.account)?,
+            entry.account,
+            account_full_name(account_full_names, entry.account)?,
+            &account_display_name(account_display_names, entry.account)?,
         )?;
-        transaction.execute("INSERT INTO general_ledger_entries(entity_id,as_of_day,posting_id,transaction_id,posting_day,account_id,debit_cents,credit_cents,net_cents,transaction_type,memo,source_row,page_number,slot_number,decoder) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", params![metadata.entity_id, report.as_of, posting.id.as_str(), posting.transaction_id.as_str(), posting.date, entry.account.id.as_str(), posting.debit_minor_units(), posting.credit_minor_units(), posting.signed_minor_units, posting.transaction_type, posting.memo, posting.provenance.source_row, posting.provenance.page_number, posting.provenance.slot_number, posting.provenance.decoder])?;
+        transaction.execute("INSERT INTO general_ledger_entries(entity_id,as_of_day,posting_id,transaction_id,posting_day,account_id,debit_cents,credit_cents,net_cents,transaction_type,memo,source_row,page_number,slot_number,decoder) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", params![metadata.entity_id, report.as_of, posting.id.as_str(), posting.transaction_id.as_str(), posting.date, entry.account.id.as_str(), display_debit_minor_units(posting), posting.credit_minor_units(), posting.signed_minor_units, posting.transaction_type, posting.memo, posting.provenance.source_row, posting.provenance.page_number, posting.provenance.slot_number, posting.provenance.decoder])?;
     }
     Ok(())
 }
@@ -1213,17 +1312,89 @@ fn upsert_account(
     Ok(())
 }
 
-fn sorted_entries(report: &GeneralLedger) -> Vec<&openqbw::GeneralLedgerEntry> {
-    let mut entries: Vec<_> = report.entries.iter().collect();
+// Borrowed presentation fields keep zero activity outside the monetary Posting model.
+struct DisplayPosting<'a> {
+    transaction_id: &'a openqbw::TransactionId,
+    id: &'a openqbw::PostingId,
+    account_id: &'a openqbw::AccountId,
+    date: i32,
+    signed_minor_units: i64,
+    current_state: &'a CurrentState,
+    provenance: &'a openqbw::PostingProvenance,
+    transaction_type: &'a Option<String>,
+    memo: &'a Option<String>,
+    zero_activity: bool,
+}
+impl DisplayPosting<'_> {
+    fn credit_minor_units(&self) -> Option<i64> {
+        (self.signed_minor_units < 0).then_some(-self.signed_minor_units)
+    }
+}
+struct DisplayEntry<'a> {
+    account: &'a Account,
+    posting: DisplayPosting<'a>,
+}
+fn report_rows<'a>(
+    report: &'a GeneralLedger,
+    zero_activity: &'a [openqbw::ZeroActivityEntry],
+) -> impl Iterator<Item = DisplayEntry<'a>> {
+    report
+        .entries
+        .iter()
+        .map(|entry| {
+            let p = &entry.posting;
+            DisplayEntry {
+                account: &entry.account,
+                posting: DisplayPosting {
+                    transaction_id: &p.transaction_id,
+                    id: &p.id,
+                    account_id: &p.account_id,
+                    date: p.date,
+                    signed_minor_units: p.signed_minor_units,
+                    current_state: &p.current_state,
+                    provenance: &p.provenance,
+                    transaction_type: &p.transaction_type,
+                    memo: &p.memo,
+                    zero_activity: false,
+                },
+            }
+        })
+        .chain(zero_activity.iter().map(|entry| {
+            let p = &entry.activity;
+            DisplayEntry {
+                account: &entry.account,
+                posting: DisplayPosting {
+                    transaction_id: &p.transaction_id,
+                    id: &p.id,
+                    account_id: &p.account_id,
+                    date: p.date,
+                    signed_minor_units: 0,
+                    current_state: &p.current_state,
+                    provenance: &p.provenance,
+                    transaction_type: &p.transaction_type,
+                    memo: &p.memo,
+                    zero_activity: true,
+                },
+            }
+        }))
+}
+fn display_debit_minor_units(posting: &DisplayPosting<'_>) -> Option<i64> {
+    (posting.signed_minor_units >= 0).then_some(posting.signed_minor_units)
+}
+fn sorted_entries<'a>(
+    report: &'a GeneralLedger,
+    zero_activity: &'a [openqbw::ZeroActivityEntry],
+) -> Vec<DisplayEntry<'a>> {
+    let mut entries: Vec<_> = report_rows(report, zero_activity).collect();
     entries.sort_by(|left, right| {
         (
-            &left.posting.date,
+            left.posting.date,
             left.account.id.as_str(),
             left.posting.transaction_id.as_str(),
             left.posting.id.as_str(),
         )
             .cmp(&(
-                &right.posting.date,
+                right.posting.date,
                 right.account.id.as_str(),
                 right.posting.transaction_id.as_str(),
                 right.posting.id.as_str(),
@@ -1520,6 +1691,228 @@ mod tests {
             },
         )
     }
+    fn zero_entry(report: &GeneralLedger) -> openqbw::ZeroActivityEntry {
+        let entry = &report.entries[0];
+        openqbw::ZeroActivityEntry {
+            account: entry.account.clone(),
+            activity: openqbw::ZeroActivity {
+                transaction_id: TransactionId::new("zero-txn").unwrap(),
+                id: PostingId::new("zero-line").unwrap(),
+                account_id: entry.account.id.clone(),
+                date: report.as_of,
+                current_state: CurrentState::Current,
+                provenance: PostingProvenance::new("zero-source", Some(9), Some(2), "decoder")
+                    .unwrap(),
+                transaction_type: Some("Check".into()),
+                memo: Some("SAMPLE zero activity".into()),
+            },
+        }
+    }
+
+    #[test]
+    fn optional_zero_activity_preserves_default_and_all_output_formats() {
+        let (tb, gl) = reports();
+        let zero = zero_entry(&gl);
+        let csv = general_ledger_csv(&gl, &metadata()).unwrap();
+        assert_eq!(
+            csv,
+            general_ledger_csv_with_zero_activity(&gl, &metadata(), &[], &[]).unwrap()
+        );
+        let json = general_ledger_json(&gl, &metadata()).unwrap();
+        assert_eq!(
+            json,
+            general_ledger_json_with_zero_activity(&gl, &metadata(), &[], &[]).unwrap()
+        );
+        let displayed = general_ledger_csv_with_zero_activity(
+            &gl,
+            &metadata(),
+            &[],
+            std::slice::from_ref(&zero),
+        )
+        .unwrap();
+        assert!(displayed.contains("zero-line"));
+        assert!(displayed.contains("zero-source"));
+        assert!(displayed.contains(",0,0.00,,,0,0.00,Check,SAMPLE zero activity"));
+        let displayed = general_ledger_json_with_zero_activity(
+            &gl,
+            &metadata(),
+            &[],
+            std::slice::from_ref(&zero),
+        )
+        .unwrap();
+        assert!(displayed.contains("\"posting_id\":\"zero-line\""));
+        assert!(displayed.contains("\"debit_cents\":0"));
+        assert!(displayed.contains("\"credit_cents\":null"));
+        assert!(displayed.contains("\"net_cents\":0"));
+        let mut db = Connection::open_in_memory().unwrap();
+        write_sqlite_with_zero_activity(
+            &mut db,
+            &metadata(),
+            ReportBundle {
+                trial_balance: Some(&tb),
+                general_ledger: None,
+            },
+            &[],
+            &[],
+        )
+        .unwrap();
+        let bundle = ReportBundle {
+            trial_balance: Some(&tb),
+            general_ledger: Some(&gl),
+        };
+        write_sqlite_with_zero_activity(
+            &mut db,
+            &metadata(),
+            bundle,
+            &[],
+            std::slice::from_ref(&zero),
+        )
+        .unwrap();
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM general_ledger_entries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 3);
+        let zero_values: (Option<i64>, Option<i64>, i64) = db.query_row(
+            "SELECT debit_cents,credit_cents,net_cents FROM general_ledger_entries WHERE posting_id='zero-line'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(zero_values, (Some(0), None, 0));
+        write_sqlite_with_account_catalog(&mut db, &metadata(), bundle, &[]).unwrap();
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM general_ledger_entries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn zero_only_subaccount_uses_catalog_parent_in_every_format() {
+        let (_, gl) = reports();
+        let empty = GeneralLedger {
+            as_of: gl.as_of,
+            entries: Vec::new(),
+        };
+        let parent = account("zero-parent", "SAMPLE Parent", AccountType::Asset);
+        let mut zero = zero_entry(&gl);
+        zero.account = account("zero-child", "SAMPLE Child", AccountType::Asset)
+            .with_hierarchy(None, Some(parent.id.clone()))
+            .unwrap();
+        zero.activity.account_id = zero.account.id.clone();
+        let catalog = [parent];
+        let zeros = [zero.clone()];
+        let csv =
+            general_ledger_csv_with_zero_activity(&empty, &metadata(), &catalog, &zeros).unwrap();
+        assert!(csv.contains("SAMPLE Parent:SAMPLE Child"));
+        assert!(csv.contains(",0,0.00,,,0,0.00,Check,"));
+        let json =
+            general_ledger_json_with_zero_activity(&empty, &metadata(), &catalog, &zeros).unwrap();
+        assert!(json.contains("SAMPLE Parent:SAMPLE Child"));
+        assert!(json.contains("\"posting_id\":\"zero-line\""));
+        assert!(json.contains("\"posting_day\":20"));
+        let mut db = Connection::open_in_memory().unwrap();
+        let bundle = ReportBundle {
+            trial_balance: None,
+            general_ledger: Some(&empty),
+        };
+        write_sqlite_with_zero_activity(&mut db, &metadata(), bundle, &catalog, &zeros).unwrap();
+        let value: (String, i64, i64, Option<i64>, i64) = db.query_row(
+            "SELECT a.account_full_name,g.posting_day,g.debit_cents,g.credit_cents,g.net_cents FROM general_ledger_entries g JOIN accounts a ON g.account_id=a.account_id AND g.entity_id=a.entity_id WHERE g.posting_id='zero-line'",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+        ).unwrap();
+        assert_eq!(value, ("SAMPLE Parent:SAMPLE Child".into(), 20, 0, None, 0));
+        let mut conflict = zero.account;
+        conflict.name = "SAMPLE conflicting name".into();
+        let bad_catalog = [catalog[0].clone(), conflict];
+        assert!(
+            general_ledger_csv_with_zero_activity(&empty, &metadata(), &bad_catalog, &zeros)
+                .is_err()
+        );
+        assert!(
+            general_ledger_json_with_zero_activity(&empty, &metadata(), &bad_catalog, &zeros)
+                .is_err()
+        );
+        assert!(
+            write_sqlite_with_zero_activity(&mut db, &metadata(), bundle, &bad_catalog, &zeros)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn optional_zero_activity_rejects_collisions_and_invalid_rows_before_sqlite_replacement() {
+        let (_, gl) = reports();
+        let mut db = Connection::open_in_memory().unwrap();
+        let bundle = ReportBundle {
+            trial_balance: None,
+            general_ledger: Some(&gl),
+        };
+        write_sqlite_with_account_catalog(&mut db, &metadata(), bundle, &[]).unwrap();
+        let zero = zero_entry(&gl);
+        let mut collision = zero.clone();
+        collision.activity.id = gl.entries[0].posting.id.clone();
+        let mut source_collision = zero.clone();
+        source_collision.activity.provenance = gl.entries[0].posting.provenance.clone();
+        let mut future = zero.clone();
+        future.activity.date = gl.as_of + 1;
+        let mut deleted = zero.clone();
+        deleted.activity.current_state = CurrentState::Deleted;
+        let mut wrong_account = zero;
+        wrong_account.activity.account_id = gl.entries[1].account.id.clone();
+        for invalid in [collision, source_collision, future, deleted, wrong_account] {
+            assert!(
+                general_ledger_csv_with_zero_activity(
+                    &gl,
+                    &metadata(),
+                    &[],
+                    std::slice::from_ref(&invalid)
+                )
+                .is_err()
+            );
+            assert!(
+                general_ledger_json_with_zero_activity(
+                    &gl,
+                    &metadata(),
+                    &[],
+                    std::slice::from_ref(&invalid)
+                )
+                .is_err()
+            );
+            assert!(
+                write_sqlite_with_zero_activity(&mut db, &metadata(), bundle, &[], &[invalid])
+                    .is_err()
+            );
+            let count: i64 = db
+                .query_row("SELECT COUNT(*) FROM general_ledger_entries", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 2);
+        }
+        let empty = GeneralLedger {
+            as_of: gl.as_of,
+            entries: Vec::new(),
+        };
+        write_sqlite_with_zero_activity(
+            &mut db,
+            &metadata(),
+            ReportBundle {
+                trial_balance: None,
+                general_ledger: Some(&empty),
+            },
+            &[],
+            &[],
+        )
+        .unwrap();
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM general_ledger_entries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
     #[test]
     fn csv_is_sorted_escaped_and_uses_fixed_cents() {
         let (tb, _) = reports();

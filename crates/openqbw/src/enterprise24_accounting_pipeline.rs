@@ -3439,17 +3439,51 @@ fn normalized_disposition(
                 EnterprisePostingExclusion::CanonicalZeroVoided { .. } => {
                     PostingExclusionReason::CanonicalZeroVoidedRow
                 }
-                EnterprisePostingExclusion::CanonicalZeroAmount { account_id, .. } => {
+                EnterprisePostingExclusion::CanonicalZeroAmount {
+                    target_id,
+                    transaction_id,
+                    account_id,
+                    transaction_date,
+                    transaction_type,
+                } => {
                     // The adapter established all required monetary fields before
                     // this branch. Resolve the account here as well, so a zero
                     // row cannot bypass the same account-identity contract.
-                    identity_map
+                    let account_id = identity_map
                         .get(
                             &u32::try_from(account_id)
                                 .map_err(|_| NormalizationFailure::MissingAccountIdentity)?,
                         )
+                        .cloned()
                         .ok_or(NormalizationFailure::MissingAccountIdentity)?;
-                    PostingExclusionReason::CanonicalZeroAmount
+                    if !matches!(
+                        table,
+                        Enterprise24AccountingTable::BillLine
+                            | Enterprise24AccountingTable::BillPaymentCheckLine
+                            | Enterprise24AccountingTable::CheckLine
+                            | Enterprise24AccountingTable::DepositLine
+                    ) {
+                        return Ok(PostingExclusion::new(
+                            provenance,
+                            PostingExclusionReason::CanonicalZeroAmount,
+                        )
+                        .into());
+                    }
+                    return Ok(PostingExclusion::canonical_zero(crate::ZeroActivity {
+                        transaction_id: TransactionId::new(format!(
+                            "enterprise24-txn-{transaction_id}"
+                        ))
+                        .map_err(|_| NormalizationFailure::Other)?,
+                        id: PostingId::new(format!("enterprise24-line-{}-{target_id}", table.id()))
+                            .map_err(|_| NormalizationFailure::Other)?,
+                        account_id,
+                        date: transaction_date,
+                        current_state: CurrentState::Current,
+                        provenance,
+                        transaction_type: Some(transaction_type.source_label().to_owned()),
+                        memo: None,
+                    })
+                    .into());
                 }
             };
             Ok(PostingExclusion::new(provenance, reason).into())
@@ -4754,6 +4788,84 @@ mod tests {
                 ),
                 Err(NormalizationFailure::MissingAccountIdentity)
             ));
+        }
+    }
+
+    #[test]
+    fn canonical_zero_report_metadata_requires_a_supported_line_and_account() {
+        use crate::EnterprisePostingTransactionType as Kind;
+        let accounts = BTreeMap::from([(7, AccountId::new("sample-account").unwrap())]);
+        let record = schema_check_record(101, 100, 7, true);
+        for (table, kind) in [
+            (Enterprise24AccountingTable::BillLine, Kind::Bill),
+            (Enterprise24AccountingTable::BillLine, Kind::VendorCredit),
+            (
+                Enterprise24AccountingTable::BillPaymentCheckLine,
+                Kind::BillPaymentCheck,
+            ),
+            (Enterprise24AccountingTable::CheckLine, Kind::Check),
+            (Enterprise24AccountingTable::DepositLine, Kind::Deposit),
+        ] {
+            let adaptation = EnterprisePostingAdaptation::Excluded(
+                EnterprisePostingExclusion::CanonicalZeroAmount {
+                    target_id: 101,
+                    transaction_id: 100,
+                    account_id: 7,
+                    transaction_date: 155_000,
+                    transaction_type: kind,
+                },
+            );
+            let disposition =
+                normalized_disposition(table, &record, adaptation, &accounts, "sample-decoder")
+                    .unwrap();
+            let PostingDisposition::Excluded(exclusion) = disposition else {
+                panic!("zero activity became a financial posting")
+            };
+            let activity = exclusion.zero_activity().unwrap();
+            assert_eq!(activity.transaction_id.as_str(), "enterprise24-txn-100");
+            assert_eq!(
+                activity.id.as_str(),
+                format!("enterprise24-line-{}-101", table.id())
+            );
+            assert_eq!(activity.account_id.as_str(), "sample-account");
+            assert_eq!(activity.date, 155_000);
+            assert_eq!(
+                activity.transaction_type.as_deref(),
+                Some(kind.source_label())
+            );
+            assert_eq!(activity.current_state, CurrentState::Current);
+            assert_eq!(activity.provenance, *exclusion.provenance());
+        }
+        for exclusion in [
+            EnterprisePostingExclusion::NoPost {
+                target_id: 101,
+                transaction_id: 100,
+            },
+            EnterprisePostingExclusion::MemorizedTransaction {
+                target_id: 101,
+                transaction_id: 100,
+            },
+            EnterprisePostingExclusion::SourceOrLink {
+                target_id: 101,
+                transaction_id: 100,
+            },
+            EnterprisePostingExclusion::CanonicalZeroVoided {
+                target_id: 101,
+                transaction_id: 100,
+            },
+        ] {
+            let disposition = normalized_disposition(
+                Enterprise24AccountingTable::BillLine,
+                &record,
+                EnterprisePostingAdaptation::Excluded(exclusion),
+                &accounts,
+                "sample-decoder",
+            )
+            .unwrap();
+            let PostingDisposition::Excluded(exclusion) = disposition else {
+                panic!()
+            };
+            assert!(exclusion.zero_activity().is_none());
         }
     }
 

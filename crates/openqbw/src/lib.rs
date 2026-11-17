@@ -73,7 +73,7 @@ pub use accounting::{
     CurrentState, DebitCredit, DebitCreditAmount, GeneralLedger, GeneralLedgerEntry, Ledger,
     LedgerCompleteness, NormalBalance, Posting, PostingId, PostingProvenance,
     QuickBooksAccrualTrialBalancePolicy, TransactionId, TrialBalance, TrialBalanceOptions,
-    TrialBalanceRow,
+    TrialBalanceRow, ZeroActivity, ZeroActivityEntry,
 };
 pub use attribution_content::{AttributionAgreement, ContentAttribution, RowSignature, SIG_LEN};
 pub use attribution_schema::{

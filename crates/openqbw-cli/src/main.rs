@@ -99,8 +99,9 @@ use report_output::statements::{statement_csv, statement_json, write_statement_s
 use report_output::{
     ReportBundle, ReportMetadata, TrialBalancePolicyProvenance, account_display_names_with_catalog,
     account_full_names_with_catalog, general_ledger_csv_with_account_catalog,
-    general_ledger_json_with_account_catalog, trial_balance_csv_with_account_catalog,
-    trial_balance_json_with_account_catalog, write_sqlite_with_account_catalog,
+    general_ledger_csv_with_zero_activity, general_ledger_json_with_zero_activity,
+    trial_balance_csv_with_account_catalog, trial_balance_json_with_account_catalog,
+    write_sqlite_with_zero_activity,
 };
 use rusqlite::{Connection, MAIN_DB, Transaction, params};
 #[cfg(feature = "research-tools")]
@@ -402,7 +403,8 @@ enum Cmd {
         /// Inclusive report end date as strict ISO `YYYY-MM-DD`.
         #[arg(long)]
         as_of: String,
-        /// Required only for Profit & Loss: inclusive period start, YYYY-MM-DD.
+        /// Inclusive period start, YYYY-MM-DD. Required for Profit & Loss and
+        /// optional for General Ledger with --include-zero-activity.
         #[arg(long)]
         from: Option<String>,
         /// Required for Trial Balance and Balance Sheet: first day of
@@ -417,9 +419,8 @@ enum Cmd {
         /// Earnings account. Applies to Trial Balance and Balance Sheet.
         #[arg(long)]
         retained_earnings_report_name: Option<String>,
-        /// Include zero-balance accounts in TB, P&L, or Balance Sheet output.
-        #[arg(long)]
-        include_zero_balance_accounts: bool,
+        #[command(flatten)]
+        row_options: ReportRowOptions,
         /// Caller-controlled, non-secret entity label stored in the output.
         #[arg(long)]
         entity_id: String,
@@ -690,6 +691,16 @@ enum MigrateFormat {
     Iif,
 }
 
+#[derive(Debug, Default, clap::Args)]
+struct ReportRowOptions {
+    /// Include zero-balance accounts in TB, P&L, or Balance Sheet output.
+    #[arg(long)]
+    include_zero_balance_accounts: bool,
+    /// Include validated, current zero-dollar activity in the General Ledger.
+    #[arg(long, conflicts_with = "include_zero_balance_accounts")]
+    include_zero_activity: bool,
+}
+
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum AccountingReportKind {
     /// QuickBooks-style accrual Trial Balance, including prior-period P&L
@@ -782,7 +793,7 @@ fn main() -> Result<()> {
             fiscal_year_start,
             retained_earnings_account_id,
             retained_earnings_report_name,
-            include_zero_balance_accounts,
+            row_options,
             entity_id,
             source_label,
             generated_at,
@@ -798,7 +809,7 @@ fn main() -> Result<()> {
             fiscal_year_start,
             retained_earnings_account_id,
             retained_earnings_report_name,
-            include_zero_balance_accounts,
+            row_options,
             entity_id,
             source_label,
             generated_at,
@@ -1000,7 +1011,7 @@ fn run_accounting_report(
     fiscal_year_start: Option<String>,
     retained_earnings_account_id: Option<String>,
     retained_earnings_report_name: Option<String>,
-    include_zero_balance_accounts: bool,
+    row_options: ReportRowOptions,
     entity_id: String,
     source_label: String,
     generated_at: String,
@@ -1019,8 +1030,9 @@ fn run_accounting_report(
         fiscal_year_start.as_deref(),
         retained_earnings_account_id.as_deref(),
         retained_earnings_report_name.as_deref(),
-        include_zero_balance_accounts,
+        &row_options,
     )?;
+    let include_zero_balance_accounts = row_options.include_zero_balance_accounts;
     let metadata = ReportMetadata {
         entity_id,
         source_file: source_label,
@@ -1076,22 +1088,35 @@ fn run_accounting_report(
                         general_ledger: None,
                     },
                     &account_catalog,
+                    &[],
                     force,
                     &input,
                 )?,
             }
         }
         AccountingReportKind::GeneralLedger => {
-            let general_ledger = ledger
-                .general_ledger_as_of(as_of_day)
-                .context("building validated General Ledger")?;
+            let (mut general_ledger, mut zero_activity) = if row_options.include_zero_activity {
+                ledger.general_ledger_with_zero_activity_as_of(as_of_day)
+            } else {
+                ledger
+                    .general_ledger_as_of(as_of_day)
+                    .map(|gl| (gl, Vec::new()))
+            }
+            .context("building validated General Ledger")?;
+            if let Some(start) = report_policy.from {
+                general_ledger
+                    .entries
+                    .retain(|entry| entry.posting.date >= start);
+                zero_activity.retain(|entry| entry.activity.date >= start);
+            }
             match format {
                 AccountingReportFormat::Csv => write_new_report(
                     &out,
-                    &general_ledger_csv_with_account_catalog(
+                    &general_ledger_csv_with_zero_activity(
                         &general_ledger,
                         &metadata,
                         &account_catalog,
+                        &zero_activity,
                     )
                     .map_err(anyhow::Error::msg)?,
                     force,
@@ -1099,10 +1124,11 @@ fn run_accounting_report(
                 )?,
                 AccountingReportFormat::Json => write_new_report(
                     &out,
-                    &general_ledger_json_with_account_catalog(
+                    &general_ledger_json_with_zero_activity(
                         &general_ledger,
                         &metadata,
                         &account_catalog,
+                        &zero_activity,
                     )
                     .map_err(anyhow::Error::msg)?,
                     force,
@@ -1116,6 +1142,7 @@ fn run_accounting_report(
                         general_ledger: Some(&general_ledger),
                     },
                     &account_catalog,
+                    &zero_activity,
                     force,
                     &input,
                 )?,
@@ -1162,24 +1189,32 @@ fn parse_accounting_report_policy(
     fiscal_year_start: Option<&str>,
     retained_earnings_account_id: Option<&str>,
     retained_earnings_report_name: Option<&str>,
-    include_zero_balance_accounts: bool,
+    row_options: &ReportRowOptions,
 ) -> Result<AccountingReportPolicy> {
     let mut result = AccountingReportPolicy {
         from: None,
         fiscal: None,
         provenance: None,
     };
-    if matches!(kind, AccountingReportKind::ProfitAndLoss) {
-        let from = MaterializedPostingDate::parse_iso_date(
-            from.context("--from is required for Profit & Loss")?,
-        )
-        .context("parsing --from as strict ISO YYYY-MM-DD")?;
+    if row_options.include_zero_activity && !matches!(kind, AccountingReportKind::GeneralLedger) {
+        anyhow::bail!("--include-zero-activity applies only to General Ledger");
+    }
+    let profit_and_loss = matches!(kind, AccountingReportKind::ProfitAndLoss);
+    if profit_and_loss && from.is_none() {
+        anyhow::bail!("--from is required for Profit & Loss");
+    }
+    if let Some(from) = from {
+        if !profit_and_loss && !row_options.include_zero_activity {
+            anyhow::bail!(
+                "--from requires Profit & Loss or General Ledger with --include-zero-activity"
+            );
+        }
+        let from = MaterializedPostingDate::parse_iso_date(from)
+            .context("parsing --from as strict ISO YYYY-MM-DD")?;
         if from.accounting_date() > as_of.accounting_date() {
             anyhow::bail!("--from must not be after --as-of");
         }
         result.from = Some(from.accounting_date());
-    } else if from.is_some() {
-        anyhow::bail!("--from applies only to --report profit-and-loss");
     }
     if matches!(
         kind,
@@ -1217,7 +1252,9 @@ fn parse_accounting_report_policy(
     {
         anyhow::bail!("fiscal policy options apply only to Trial Balance and Balance Sheet");
     }
-    if matches!(kind, AccountingReportKind::GeneralLedger) && include_zero_balance_accounts {
+    if matches!(kind, AccountingReportKind::GeneralLedger)
+        && row_options.include_zero_balance_accounts
+    {
         anyhow::bail!("--include-zero-balance-accounts does not apply to General Ledger");
     }
     Ok(result)
@@ -1272,6 +1309,11 @@ mod financial_statement_cli_tests {
     #[test]
     fn report_options_require_exact_period_and_fiscal_policy_inputs() {
         let end = day("2026-01-31");
+        let standard = ReportRowOptions::default();
+        let with_zero_balances = ReportRowOptions {
+            include_zero_balance_accounts: true,
+            ..standard
+        };
         assert!(
             parse_accounting_report_policy(
                 AccountingReportKind::ProfitAndLoss,
@@ -1280,7 +1322,7 @@ mod financial_statement_cli_tests {
                 None,
                 None,
                 None,
-                false
+                &standard
             )
             .is_err()
         );
@@ -1293,7 +1335,7 @@ mod financial_statement_cli_tests {
                     None,
                     None,
                     None,
-                    false
+                    &standard
                 )
                 .is_err()
             );
@@ -1306,7 +1348,7 @@ mod financial_statement_cli_tests {
                 Some("2026-01-01"),
                 None,
                 None,
-                false
+                &standard
             )
             .is_err()
         );
@@ -1318,7 +1360,7 @@ mod financial_statement_cli_tests {
                 None,
                 Some("retained"),
                 None,
-                false
+                &standard
             )
             .is_err()
         );
@@ -1330,7 +1372,7 @@ mod financial_statement_cli_tests {
                 Some("2026-01-01"),
                 None,
                 None,
-                false
+                &standard
             )
             .is_err()
         );
@@ -1342,7 +1384,7 @@ mod financial_statement_cli_tests {
                 Some("2026-01-01"),
                 Some("retained"),
                 None,
-                false
+                &standard
             )
             .is_err()
         );
@@ -1354,7 +1396,7 @@ mod financial_statement_cli_tests {
                 Some("2026-01-01"),
                 Some("retained"),
                 Some(" "),
-                false
+                &standard
             )
             .is_err()
         );
@@ -1366,7 +1408,7 @@ mod financial_statement_cli_tests {
                 None,
                 None,
                 None,
-                true
+                &with_zero_balances
             )
             .is_err()
         );
@@ -1377,7 +1419,7 @@ mod financial_statement_cli_tests {
             None,
             None,
             None,
-            true,
+            &with_zero_balances,
         )
         .unwrap();
         assert_eq!(pnl.from, Some(day("2025-12-01").accounting_date()));
@@ -1392,7 +1434,7 @@ mod financial_statement_cli_tests {
                 Some("2026-01-01"),
                 Some("retained"),
                 Some("SAMPLE Label"),
-                true,
+                &with_zero_balances,
             )
             .unwrap();
             assert_eq!(
@@ -1408,6 +1450,84 @@ mod financial_statement_cli_tests {
                 Some("SAMPLE Label")
             );
         }
+    }
+
+    #[test]
+    fn zero_activity_is_gl_only_and_its_period_is_inclusive() {
+        let end = day("2026-01-31");
+        let activity = ReportRowOptions {
+            include_zero_activity: true,
+            ..ReportRowOptions::default()
+        };
+        let gl = AccountingReportKind::GeneralLedger;
+        let parse = |kind, start| {
+            parse_accounting_report_policy(kind, end, start, None, None, None, &activity)
+        };
+        assert_eq!(parse(gl, None).unwrap().from, None);
+        assert_eq!(
+            parse(gl, Some("2026-01-31")).unwrap().from,
+            Some(end.accounting_date())
+        );
+        assert!(parse(gl, Some("2026-02-01")).is_err());
+        assert!(parse(gl, Some("2026-02-30")).is_err());
+        for kind in [
+            AccountingReportKind::TrialBalance,
+            AccountingReportKind::BalanceSheet,
+            AccountingReportKind::ProfitAndLoss,
+        ] {
+            let error = parse(kind, Some("2026-01-01")).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("--include-zero-activity applies only to General Ledger")
+            );
+        }
+        assert!(
+            parse_accounting_report_policy(
+                gl,
+                end,
+                Some("2026-01-01"),
+                None,
+                None,
+                None,
+                &ReportRowOptions::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn clap_exposes_zero_activity_as_a_distinct_opt_in() {
+        let mut args = vec![
+            "openqbw",
+            "accounting-report",
+            "SAMPLE.qbw",
+            "--report",
+            "general-ledger",
+            "--as-of",
+            "2026-01-31",
+            "--entity-id",
+            "SAMPLE",
+            "--source-label",
+            "sample",
+            "--generated-at",
+            "2026-01-31T00:00:00Z",
+            "--snapshot-id",
+            "sample",
+            "--format",
+            "csv",
+            "--out",
+            "sample.csv",
+        ];
+        let options = |args: &[&str]| match Cli::try_parse_from(args).unwrap().cmd {
+            Cmd::AccountingReport { row_options, .. } => row_options,
+            _ => unreachable!(),
+        };
+        assert!(!options(&args).include_zero_activity);
+        args.push("--include-zero-activity");
+        assert!(options(&args).include_zero_activity);
+        args.push("--include-zero-balance-accounts");
+        assert!(Cli::try_parse_from(args).is_err());
     }
 
     #[test]
@@ -1504,14 +1624,21 @@ fn write_report_sqlite(
     metadata: &ReportMetadata,
     bundle: ReportBundle<'_>,
     account_catalog: &[openqbw::Account],
+    zero_activity: &[openqbw::ZeroActivityEntry],
     force: bool,
     input: &Path,
 ) -> Result<()> {
     write_staged_file(path, force, Some(input), |_staged_path, mut file| {
         let mut connection =
             Connection::open_in_memory().context("opening in-memory SQLite report")?;
-        write_sqlite_with_account_catalog(&mut connection, metadata, bundle, account_catalog)
-            .map_err(anyhow::Error::msg)?;
+        write_sqlite_with_zero_activity(
+            &mut connection,
+            metadata,
+            bundle,
+            account_catalog,
+            zero_activity,
+        )
+        .map_err(anyhow::Error::msg)?;
         let serialized = connection
             .serialize(MAIN_DB)
             .context("serializing staged SQLite report")?;
