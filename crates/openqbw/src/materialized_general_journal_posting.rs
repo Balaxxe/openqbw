@@ -676,9 +676,7 @@ impl MaterializedGeneralJournalPostingRow {
 /// A fully attested General Journal main-envelope row whose selected amount
 /// is the canonical zero token.
 ///
-/// This carries physical identifiers for audit and complete-coverage
-/// accounting, but deliberately makes no lifecycle assertion (for example,
-/// it does not call the row a void).
+/// The amount and the no-post and memorized flags are decoded independently.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedGeneralJournalCanonicalZeroAmount {
     target_record_number: u32,
@@ -688,9 +686,14 @@ pub struct MaterializedGeneralJournalCanonicalZeroAmount {
     view_type: u16,
     family: u8,
     amount_position: MaterializedGeneralJournalAmountPosition,
+    lifecycle: (bool, bool),
 }
 
 impl MaterializedGeneralJournalCanonicalZeroAmount {
+    pub(crate) fn belongs_to_posting_transaction(&self) -> bool {
+        self.lifecycle == (false, false)
+    }
+
     /// Returns the physical General Journal target-line record number.
     #[must_use]
     pub const fn target_record_number(&self) -> u32 {
@@ -1148,10 +1151,16 @@ pub fn classify_materialized_general_journal_rows_with_header_witnesses(
         result[index] = Some(MaterializedGeneralJournalDisposition::SourceOrLink(source));
     }
     let mut lifecycle_by_master = std::collections::BTreeMap::new();
-    for posting in postings.values() {
+    let monetary_states = postings
+        .values()
+        .map(|row| (row.master_record_number, row.lifecycle));
+    let zero_states = canonical_zeroes
+        .values()
+        .map(|row| (row.master_record_number, row.lifecycle));
+    for (master, lifecycle) in monetary_states.chain(zero_states) {
         if lifecycle_by_master
-            .insert(posting.master_record_number, posting.lifecycle)
-            .is_some_and(|prior| prior != posting.lifecycle)
+            .insert(master, lifecycle)
+            .is_some_and(|prior| prior != lifecycle)
         {
             return Err(MaterializedGeneralJournalProductionRowError::ConflictingLifecycle);
         }
@@ -1528,6 +1537,7 @@ fn parse_main_canonical_zero(
         view_type: u16_at(input, PRODUCTION_VIEW),
         family,
         amount_position,
+        lifecycle: parse_posting_lifecycle(input)?,
     }))
 }
 
@@ -2342,20 +2352,22 @@ mod tests {
 
     #[test]
     fn lifecycle_rejects_invalid_bytes_and_disagreement_within_master() {
-        for offset in [45, 46] {
-            let mut bad = production_row(&[1, 0xbf, 7]);
-            bad[offset] = 2;
-            assert!(MaterializedGeneralJournalPostingRow::parse(&bad).is_err());
-            assert!(classify_materialized_general_journal_rows(&[bad]).is_err());
+        for amount in [&[1, 0x3f, 7][..], &[0, 0x81]] {
+            for offset in [45, 46] {
+                let mut bad = production_row(amount);
+                bad[offset] = 2;
+                assert!(MaterializedGeneralJournalPostingRow::parse(&bad).is_err());
+                assert!(classify_materialized_general_journal_rows(&[bad]).is_err());
+            }
+            let first = production_row(&[1, 0xbf, 7]);
+            let mut second = production_row(amount);
+            second[PRODUCTION_TARGET..PRODUCTION_TARGET + 4].copy_from_slice(&71_u32.to_le_bytes());
+            second[46] = 1;
+            assert_eq!(
+                classify_materialized_general_journal_rows(&[first, second]),
+                Err(MaterializedGeneralJournalProductionRowError::ConflictingLifecycle)
+            );
         }
-        let first = production_row(&[1, 0xbf, 7]);
-        let mut second = production_row(&[1, 0x3f, 7]);
-        second[PRODUCTION_TARGET..PRODUCTION_TARGET + 4].copy_from_slice(&71_u32.to_le_bytes());
-        second[46] = 1;
-        assert_eq!(
-            classify_materialized_general_journal_rows(&[first, second]),
-            Err(MaterializedGeneralJournalProductionRowError::ConflictingLifecycle)
-        );
     }
 
     #[test]

@@ -1903,59 +1903,14 @@ pub fn build_enterprise24_accounting_pipeline_with_general_journal_header_witnes
                     },
                 );
             }
-            for (record, carrier) in rows.records.iter().zip(carriers) {
+            for (record, carrier) in rows.records.iter().zip(&carriers) {
                 diagnostics.posting_candidates += 1;
-                let adaptation = match carrier {
-                    MaterializedGeneralJournalDisposition::Posting(row) => {
-                        adapt_materialized_general_journal_posting_row(&row)
-                    }
-                    MaterializedGeneralJournalDisposition::SourceOrLink(_)
-                    | MaterializedGeneralJournalDisposition::AuxiliaryLinkChain { .. }
-                    | MaterializedGeneralJournalDisposition::TerminalMetadataCarrier { .. }
-                    | MaterializedGeneralJournalDisposition::HeaderMetadataCarrier { .. }
-                    | MaterializedGeneralJournalDisposition::CanonicalZeroAmount(_) => {
-                        let provenance = match PostingProvenance::new(
-                            format!(
-                                "enterprise24:{}:{}:{}",
-                                table.id(),
-                                record.raw_page_number,
-                                record.record_id
-                            ),
-                            u32::try_from(record.raw_page_number).ok(),
-                            Some(record.record_id),
-                            rows.policy.version,
-                        ) {
-                            Ok(value) => value,
-                            Err(_) => {
-                                diagnostics.blockers.push(Enterprise24AccountingPipelineBlocker::PostingAdaptationFailed { table_id: table.id(), page: record.raw_page_number, record: record.record_id });
-                                continue;
-                            }
-                        };
-                        diagnostics.excluded_postings += 1;
-                        let reason = match carrier {
-                            MaterializedGeneralJournalDisposition::CanonicalZeroAmount(_) => {
-                                PostingExclusionReason::CanonicalZeroAmount
-                            }
-                            _ => PostingExclusionReason::SourceOrLinkRow,
-                        };
-                        dispositions.push(PostingExclusion::new(provenance, reason).into());
-                        continue;
-                    }
-                };
-                match adaptation.and_then(|adaptation| {
-                    normalized_disposition(
-                        table,
-                        record,
-                        adaptation,
-                        &identity_map,
-                        rows.policy.version,
-                    )
-                    .map_err(|_| {
-                        crate::EnterprisePostingAdapterError::InvalidPostingAmount {
-                            name: "normalization".to_owned(),
-                        }
-                    })
-                }) {
+                match normalized_general_journal_disposition(
+                    carrier,
+                    record,
+                    &identity_map,
+                    rows.policy.version,
+                ) {
                     Ok(PostingDisposition::Posting(posting)) => {
                         diagnostics.normalized_postings += 1;
                         dispositions.push(PostingDisposition::Posting(posting));
@@ -3370,14 +3325,58 @@ enum NormalizationFailure {
     Other,
 }
 
-fn normalized_disposition(
-    table: Enterprise24AccountingTable,
+fn normalized_general_journal_disposition(
+    carrier: &MaterializedGeneralJournalDisposition,
     record: &Enterprise24PartialRecord,
-    adaptation: EnterprisePostingAdaptation,
     identity_map: &BTreeMap<u32, AccountId>,
     decoder: &str,
 ) -> Result<PostingDisposition, NormalizationFailure> {
-    let provenance = PostingProvenance::new(
+    let table = Enterprise24AccountingTable::GeneralJournalLine;
+    let adaptation = match carrier {
+        MaterializedGeneralJournalDisposition::Posting(row) => {
+            adapt_materialized_general_journal_posting_row(row)
+                .map_err(|_| NormalizationFailure::Other)?
+        }
+        MaterializedGeneralJournalDisposition::CanonicalZeroAmount(row)
+            if row.belongs_to_posting_transaction() =>
+        {
+            let date = crate::MaterializedPostingDate::from_raw_bits(row.date_raw())
+                .map_err(|_| NormalizationFailure::Other)?;
+            EnterprisePostingAdaptation::Excluded(EnterprisePostingExclusion::CanonicalZeroAmount {
+                target_id: u64::from(row.target_record_number()),
+                transaction_id: u64::from(row.master_record_number()),
+                account_id: u64::from(row.account_record_number()),
+                transaction_date: date.accounting_date(),
+                transaction_type: crate::EnterprisePostingTransactionType::GeneralJournal,
+            })
+        }
+        MaterializedGeneralJournalDisposition::CanonicalZeroAmount(_) => {
+            return Ok(PostingExclusion::new(
+                posting_provenance(table, record, decoder)?,
+                PostingExclusionReason::CanonicalZeroAmount,
+            )
+            .into());
+        }
+        MaterializedGeneralJournalDisposition::SourceOrLink(_)
+        | MaterializedGeneralJournalDisposition::AuxiliaryLinkChain { .. }
+        | MaterializedGeneralJournalDisposition::TerminalMetadataCarrier { .. }
+        | MaterializedGeneralJournalDisposition::HeaderMetadataCarrier { .. } => {
+            return Ok(PostingExclusion::new(
+                posting_provenance(table, record, decoder)?,
+                PostingExclusionReason::SourceOrLinkRow,
+            )
+            .into());
+        }
+    };
+    normalized_disposition(table, record, adaptation, identity_map, decoder)
+}
+
+fn posting_provenance(
+    table: Enterprise24AccountingTable,
+    record: &Enterprise24PartialRecord,
+    decoder: &str,
+) -> Result<PostingProvenance, NormalizationFailure> {
+    PostingProvenance::new(
         format!(
             "enterprise24:{}:{}:{}",
             table.id(),
@@ -3388,7 +3387,17 @@ fn normalized_disposition(
         Some(record.record_id),
         decoder,
     )
-    .map_err(|_| NormalizationFailure::Other)?;
+    .map_err(|_| NormalizationFailure::Other)
+}
+
+fn normalized_disposition(
+    table: Enterprise24AccountingTable,
+    record: &Enterprise24PartialRecord,
+    adaptation: EnterprisePostingAdaptation,
+    identity_map: &BTreeMap<u32, AccountId>,
+    decoder: &str,
+) -> Result<PostingDisposition, NormalizationFailure> {
+    let provenance = posting_provenance(table, record, decoder)?;
     match adaptation {
         EnterprisePostingAdaptation::Posting(row) => {
             let account_id = identity_map
@@ -3462,6 +3471,7 @@ fn normalized_disposition(
                             | Enterprise24AccountingTable::BillPaymentCheckLine
                             | Enterprise24AccountingTable::CheckLine
                             | Enterprise24AccountingTable::DepositLine
+                            | Enterprise24AccountingTable::GeneralJournalLine
                     ) {
                         return Ok(PostingExclusion::new(
                             provenance,
@@ -4866,6 +4876,148 @@ mod tests {
                 panic!()
             };
             assert!(exclusion.zero_activity().is_none());
+        }
+    }
+
+    #[test]
+    fn general_journal_zero_activity_uses_pipeline_normalization_and_lifecycle() {
+        let date = crate::MaterializedPostingDate::from_ymd(2001, 1, 2).unwrap();
+        let day = date.accounting_date();
+        let chart = vec![
+            Account::new(
+                AccountId::new("sample-asset").unwrap(),
+                "SAMPLE Asset",
+                AccountType::Asset,
+                true,
+            )
+            .unwrap(),
+            Account::new(
+                AccountId::new("sample-equity").unwrap(),
+                "SAMPLE Equity",
+                AccountType::Equity,
+                true,
+            )
+            .unwrap(),
+        ];
+        let identities = BTreeMap::from([(7, chart[0].id.clone()), (8, chart[1].id.clone())]);
+        let baseline = Ledger::new(chart.clone(), [], crate::LedgerCompleteness::Complete).unwrap();
+        let default_gl = baseline.general_ledger_as_of(day).unwrap();
+        let default_tb = baseline
+            .trial_balance_as_of(day, crate::TrialBalanceOptions::default())
+            .unwrap();
+
+        for lifecycle in [[0, 0], [1, 0], [0, 1]] {
+            let mut records = Vec::new();
+            for (slot, (target, account)) in [(101_u32, 7_u32), (102, 8)].into_iter().enumerate() {
+                let mut bytes = vec![0_u8; 117];
+                bytes[..2].copy_from_slice(&117_u16.to_le_bytes());
+                bytes[2] = crate::MATERIALIZED_GENERAL_JOURNAL_FLAGS;
+                bytes[3] = crate::MATERIALIZED_GENERAL_JOURNAL_ROW_KIND;
+                bytes[4..7].copy_from_slice(&[0xe0, 0x93, 0xff]);
+                bytes[0x0b..0x0f].copy_from_slice(&target.to_le_bytes());
+                bytes[0x0f..0x13].copy_from_slice(&100_u32.to_le_bytes());
+                bytes[0x13..0x17].copy_from_slice(&account.to_le_bytes());
+                bytes[0x17..0x1b].copy_from_slice(&date.raw_bits().to_le_bytes());
+                bytes[0x1b..0x1d].copy_from_slice(&9_u16.to_le_bytes());
+                if slot == 0 {
+                    bytes[0x1d..0x21].copy_from_slice(&102_u32.to_le_bytes());
+                }
+                bytes[49..51].copy_from_slice(&lifecycle);
+                bytes[99..101].copy_from_slice(&[0, 0x81]);
+                bytes[106..108].copy_from_slice(&[0, 0x81]);
+                records.push(Enterprise24PartialRecord {
+                    raw_page_number: 17,
+                    record_id: slot as u16,
+                    partial: partial(1),
+                    bytes,
+                });
+            }
+            let rows = records
+                .iter()
+                .map(|record| record.bytes.clone())
+                .collect::<Vec<_>>();
+            let carriers =
+                classify_materialized_general_journal_rows_with_header_witnesses(&rows, &[])
+                    .unwrap();
+            assert_eq!(carriers.len(), 2);
+            let dispositions = records
+                .iter()
+                .zip(&carriers)
+                .map(|(record, carrier)| {
+                    normalized_general_journal_disposition(
+                        carrier,
+                        record,
+                        &identities,
+                        "sample-journal-decoder",
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            for disposition in &dispositions {
+                let PostingDisposition::Excluded(exclusion) = disposition else {
+                    panic!("zero journal row became a monetary posting");
+                };
+                assert_eq!(exclusion.zero_activity().is_some(), lifecycle == [0, 0]);
+            }
+            let snapshot = SourceSnapshotId::new("synthetic-journal-snapshot").unwrap();
+            let decoded_accounts = DecodedAccounts::new(
+                snapshot.clone(),
+                DecoderIdentity::new("sample-account-decoder").unwrap(),
+                chart.clone(),
+                CompleteCoverage::new(2, 2).unwrap(),
+            )
+            .unwrap();
+            let decoded_postings = DecodedPostings::new(
+                snapshot,
+                DecoderIdentity::new("sample-journal-decoder").unwrap(),
+                dispositions,
+                CompleteCoverage::new(2, 2).unwrap(),
+            )
+            .unwrap();
+            let ledger = LedgerAdapter::build(decoded_accounts, decoded_postings).unwrap();
+            assert_eq!(ledger.general_ledger_as_of(day).unwrap(), default_gl);
+            assert_eq!(
+                ledger
+                    .trial_balance_as_of(day, crate::TrialBalanceOptions::default())
+                    .unwrap(),
+                default_tb
+            );
+            let (gl, activity) = ledger.general_ledger_with_zero_activity_as_of(day).unwrap();
+            assert_eq!(gl, default_gl);
+            if lifecycle != [0, 0] {
+                assert!(activity.is_empty());
+                continue;
+            }
+            assert_eq!(activity.len(), 2);
+            for (entry, (target, account, slot)) in activity
+                .iter()
+                .zip([(101, "sample-asset", 0), (102, "sample-equity", 1)])
+            {
+                assert_eq!(entry.account.id.as_str(), account);
+                assert_eq!(entry.activity.account_id, entry.account.id);
+                assert_eq!(
+                    entry.activity.transaction_id.as_str(),
+                    "enterprise24-txn-100"
+                );
+                assert_eq!(
+                    entry.activity.id.as_str(),
+                    format!("enterprise24-line-3078-{target}")
+                );
+                assert_eq!(entry.activity.date, day);
+                assert_eq!(
+                    entry.activity.transaction_type.as_deref(),
+                    Some("General Journal")
+                );
+                assert_eq!(entry.activity.current_state, CurrentState::Current);
+                assert_eq!(
+                    entry.activity.provenance.source_row,
+                    format!("enterprise24:3078:17:{slot}")
+                );
+                assert_eq!(entry.activity.provenance.page_number, Some(17));
+                assert_eq!(entry.activity.provenance.slot_number, Some(slot));
+                assert_eq!(entry.activity.provenance.decoder, "sample-journal-decoder");
+            }
+            assert!(ledger.zero_activity_as_of(day - 1).unwrap().is_empty());
         }
     }
 

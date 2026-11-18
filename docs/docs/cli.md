@@ -372,7 +372,7 @@ $ openqbw accounting-report SAMPLE_COMPANY.qbw --report general-ledger \
 ```
 
 Current, validated zero-amount Bill (including Vendor Credit), Bill Payment
-Check, Check and Deposit lines retain their account, date, transaction type
+Check, Check, Deposit and General Journal lines retain their account, date, transaction type
 and source identifiers. The export displays a zero debit and net, with an
 empty credit. The zero debit is a display convention. Structural links,
 deletion records and excluded non-posting or memorized transactions remain
